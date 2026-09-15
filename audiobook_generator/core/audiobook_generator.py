@@ -68,6 +68,12 @@ class AudiobookGenerator:
             )
             output_file = os.path.join(self.config.output_folder, safe_audio_name)
 
+            if self.config.skip_existing and os.path.isfile(output_file):
+                logger.info(
+                    f"⏭️  Skipping chapter {idx}: {title}, output file already exists: {output_file}"
+                )
+                return True
+
             audio_tags = AudioTags(
                 title, book_author, book_title, idx
             )

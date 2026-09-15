@@ -47,7 +47,7 @@ def get_piper_supported_speakers_gui(language, voice, quality):
     return gr.Dropdown(speakers_list, value=speakers_list[0], label="Speaker", interactive=True, info="Select the speaker")
 
 
-def process_ui_form(input_file, output_dir, worker_count, log_level, output_text, preview,
+def process_ui_form(input_file, output_dir, worker_count, log_level, output_text, preview, skip_existing,
                     search_and_replace_file, title_mode, new_line_mode, chapter_start, chapter_end, remove_endnotes, remove_reference_numbers,
                     model, voices, speed, openai_output_format, instructions,
                     azure_language, azure_voice, azure_output_format, azure_break_duration,
@@ -60,6 +60,7 @@ def process_ui_form(input_file, output_dir, worker_count, log_level, output_text
     config.output_folder = output_dir
     config.preview = preview
     config.output_text = output_text
+    config.skip_existing = skip_existing
     config.log = log_level
     config.worker_count = worker_count
     config.no_prompt = True
@@ -159,6 +160,8 @@ def host_ui(config):
                                       info="Export a plain text file for each chapter.")
                 preview = gr.Checkbox(label="Enable Preview Mode", value=False,
                                   info="It will not convert the to audio, only prepare chapters and cost. Recommended to toggle on when testing book parsing ***without*** audio generation.")
+                skip_existing = gr.Checkbox(label="Skip Existing Files", value=False,
+                                  info="Skip generating audio for a chapter if its output mp3 file already exists in the output folder. Useful for resuming interrupted conversions.")
 
         gr.Markdown("---")
         with gr.Row(equal_height=True):
@@ -305,7 +308,7 @@ def host_ui(config):
             gr.Button("Start", variant="primary").click(
                 fn=process_ui_form,
                 inputs=[
-                    input_file, output_dir, worker_count, log_level, output_text, preview,
+                    input_file, output_dir, worker_count, log_level, output_text, preview, skip_existing,
                     search_and_replace_file, title_mode, new_line_mode, chapter_start, chapter_end, remove_endnotes, remove_reference_numbers,
                     model, voices, speed, openai_output_format, instructions,
                     azure_language, azure_voice, azure_output_format, azure_break_duration,
