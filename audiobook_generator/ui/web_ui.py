@@ -118,6 +118,12 @@ def launch_audiobook_generator(config):
         print("Audiobook generator already running")
         return
 
+    # Reap the previous (finished) process before dropping our reference to it,
+    # otherwise it lingers as a zombie in this long-running server process.
+    if running_process is not None:
+        running_process.join()
+        running_process.close()
+
     running_process = Process(target=main, args=(config, str(webui_log_file.absolute())))
     running_process.start()
 
@@ -126,6 +132,8 @@ def terminate_audiobook_generator():
     global running_process
     if running_process and running_process.is_alive():
         running_process.terminate()
+        running_process.join()
+        running_process.close()
         running_process = None
         print("Audiobook generator terminated manually")
 
