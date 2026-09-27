@@ -31,6 +31,25 @@ class TestOutputDir(unittest.TestCase):
         self.assertEqual(safe_folder_name('Book: One / Two? "Three"'), "Book One Two Three")
         self.assertEqual(safe_folder_name("  The Book That Wouldn’t Burn.  "), "The Book That Wouldn’t Burn")
 
+    def test_safe_folder_name_truncation_does_not_reintroduce_a_trailing_space(self):
+        # F-34: shared with safe_book_file_name; truncating must happen before stripping
+        # a trailing space/dot, or the cut can reintroduce one.
+        title = "A" * 149 + " " + "B" * 10
+        result = safe_folder_name(title)
+        self.assertEqual(result, "A" * 149)
+        self.assertFalse(result.endswith(" "))
+
+    def test_safe_folder_name_avoids_windows_reserved_device_names(self):
+        # F-34: CON, NUL, COM1, ... cannot be created as a real folder on Windows.
+        self.assertEqual(safe_folder_name("con"), "con_")
+        self.assertEqual(safe_folder_name("NUL"), "NUL_")
+        self.assertEqual(safe_folder_name("Conquest"), "Conquest")
+
+    def test_safe_folder_name_empty_input_has_no_fallback(self):
+        # Unlike safe_book_file_name, callers rely on "" being falsy to fall back to the
+        # EPUB filename (see suggest_output_dir).
+        self.assertEqual(safe_folder_name(""), "")
+
     def test_upload_suggests_folder_named_after_epub_title(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "whatever.epub")

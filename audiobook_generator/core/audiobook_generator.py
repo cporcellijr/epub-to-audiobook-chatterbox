@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import mimetypes
 import multiprocessing
@@ -7,7 +9,7 @@ import shutil
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core.audio_tags import AudioTags
-from audiobook_generator.core.m4b import build_m4b, safe_book_file_name
+from audiobook_generator.core.m4b import BadChapterFileError, build_m4b, safe_book_file_name
 from audiobook_generator.tts_providers.base_tts_provider import get_tts_provider
 from audiobook_generator.utils.log_handler import setup_logging
 from audiobook_generator.utils.filename_sanitizer import make_safe_filename
@@ -15,6 +17,10 @@ from audiobook_generator.utils.filename_sanitizer import make_safe_filename
 logger = logging.getLogger(__name__)
 
 CHAPTER_WORK_FOLDER = ".chapters"
+# Chapter work folder manifest (F-11): output file name -> the original chapter number
+# and a hash of the text that produced it, so a later run with a changed chapter
+# selection can tell a same-named leftover file apart from the chapter it now names.
+CHAPTER_MANIFEST_FILENAME = ".manifest.json"
 
 
 _MIME_TO_EXT = {
@@ -62,6 +68,9 @@ class AudiobookGenerator:
         self.cover = None
         self.book_title = None
         self.book_author = None
+        # Final chapter idx -> original chapter number, set by run() (F-11). Direct
+        # callers of process_chapter (tests, previews) get idx == original number.
+        self.original_numbers = {}
 
     def __str__(self) -> str:
         return f"{self.config}"
@@ -80,6 +89,36 @@ class AudiobookGenerator:
         folder = self.chapter_folder()
         name = make_safe_filename(title=title, idx=idx, output_dir=folder, ext=extension, collision_check=False)
         return os.path.join(folder, name)
+
+    def _manifest_path(self) -> str:
+        return os.path.join(self.chapter_folder(), CHAPTER_MANIFEST_FILENAME)
+
+    def _load_manifest(self) -> dict:
+        """The chapter work folder's manifest: output file name -> the original chapter
+        number and a hash of the text that produced it (F-11).
+
+        A missing or unreadable manifest means a book started before this manifest
+        existed, or a file this book never recorded; callers treat that as "trust the
+        existing file" rather than forcing a full regeneration of an in-flight book on
+        every upgrade.
+        """
+        try:
+            with open(self._manifest_path(), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _update_manifest(self, filename: str, chapter_number: int, text_hash: str) -> None:
+        """Record which original chapter number and text produced `filename`, written
+        atomically so a crash mid-write can't corrupt the manifest (F-11)."""
+        manifest = self._load_manifest()
+        manifest[filename] = {"chapter_number": chapter_number, "text_hash": text_hash}
+        folder = self.chapter_folder()
+        os.makedirs(folder, exist_ok=True)
+        tmp_path = os.path.join(folder, f"{CHAPTER_MANIFEST_FILENAME}.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+        os.replace(tmp_path, self._manifest_path())
 
     def process_chapter(self, idx, title, text):
         """Process a single chapter: write text (if needed) and convert to audio."""
@@ -107,12 +146,23 @@ class AudiobookGenerator:
             # Generate audio file (safe, length-limited, cross-platform)
             output_file = self.chapter_audio_path(idx, title, "." + tts_provider.get_output_file_extension())
             safe_audio_name = os.path.basename(output_file)
+            original_chapter_number = self.original_numbers.get(idx, idx)
+            text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
 
             if self.config.skip_existing and os.path.isfile(output_file):
-                logger.info(
-                    f"⏭️  Skipping chapter {idx}: {title}, output file already exists: {output_file}"
+                manifest_entry = self._load_manifest().get(safe_audio_name)
+                if manifest_entry is None or (
+                    manifest_entry.get("chapter_number") == original_chapter_number
+                    and manifest_entry.get("text_hash") == text_hash
+                ):
+                    logger.info(
+                        f"⏭️  Skipping chapter {idx}: {title}, output file already exists: {output_file}"
+                    )
+                    return True
+                logger.warning(
+                    f"Chapter {idx}: {title}: existing file {output_file} was made for a "
+                    f"different chapter selection; regenerating instead of reusing it."
                 )
-                return True
 
             audio_tags = AudioTags(
                 title, self.book_author, self.book_title, idx,
@@ -128,6 +178,7 @@ class AudiobookGenerator:
             finally:
                 if os.path.exists(partial_file):
                     os.remove(partial_file)
+            self._update_manifest(safe_audio_name, original_chapter_number, text_hash)
 
             logger.info(f"✅ Converted chapter {idx}: {title}, output file: {output_file}")
 
@@ -147,6 +198,10 @@ class AudiobookGenerator:
         try:
             logger.info("Starting audiobook generation...")
             book_parser = get_book_parser(self.config)
+            if self.output_m4b() and getattr(self.config, "tts", None) == "openai":
+                # Chapters become AAC (ADTS) so the M4B can be built with a stream copy
+                # instead of a second lossy re-encode (F-06); loose-file output is unaffected.
+                self.config.output_format = "aac"
             tts_provider = get_tts_provider(self.config)
 
             # Preview writes nothing unless chapter text was asked for, so previewing into a
@@ -160,16 +215,23 @@ class AudiobookGenerator:
             logger.info(f"Book title: {self.book_title}")
             logger.info(f"Book author: {self.book_author}")
 
+            if not self.config.preview:
+                os.makedirs(self.chapter_folder(), exist_ok=True)
+
             self.cover = book_parser.get_book_cover()
             cover_path = None
             if self.cover and not self.config.preview:
                 ext = _ext_for_mime(self.cover.mime)
-                cover_path = os.path.join(self.config.output_folder, f"cover.{ext}")
+                # In M4B mode the cover goes into the hidden work folder while the book is
+                # still generating, so a library scanner never sees a cover-only "book"; it
+                # is copied out next to the finished .m4b only once the book completes
+                # (F-23). Loose-file output keeps today's behaviour: straight into the
+                # visible output folder.
+                cover_dir = self.chapter_folder() if self.output_m4b() else self.config.output_folder
+                cover_path = os.path.join(cover_dir, f"cover.{ext}")
                 with open(cover_path, 'wb') as f:
                     f.write(self.cover.data)
                 logger.info(f"Cover saved: {cover_path}")
-            if not self.config.preview:
-                os.makedirs(self.chapter_folder(), exist_ok=True)
 
             chapters = book_parser.get_chapters(tts_provider.get_break_string())
             # Filter out empty or very short chapters
@@ -206,12 +268,20 @@ class AudiobookGenerator:
                 selected = {int(number) for number in self.config.chapter_selection}
                 numbered = [(idx, chapter) for idx, chapter in numbered if idx in selected]
                 logger.info(f"Selected chapters: {[idx for idx, _ in numbered]}")
-                # Number the output 1..n so the finished audiobook's files and tracks have no gaps.
+                # Renumber the output 1..n so the finished audiobook's files and tracks
+                # have no gaps, but remember each position's original chapter number
+                # (F-11): a later run with a changed selection must not trust a same-named
+                # leftover file just because a new chapter landed on the same position.
+                original_by_new_idx = {new_idx: old_idx for new_idx, (old_idx, _) in
+                                       enumerate(numbered, start=1)}
                 numbered = list(enumerate((chapter for _, chapter in numbered), start=1))
                 if not numbered:
                     raise ValueError("None of the selected chapters exist in this book.")
+            else:
+                original_by_new_idx = {idx: idx for idx, _ in numbered}
             tasks = [(idx, title, text) for idx, (title, text) in numbered]
             titles_by_idx = {idx: title for idx, title, _ in tasks}
+            self.original_numbers = original_by_new_idx
 
             total_characters = get_total_chars([(title, text) for _, title, text in tasks])
             logger.info(f"Total characters in selected book chapters: {total_characters}")
@@ -229,19 +299,25 @@ class AudiobookGenerator:
             # Track failed chapters
             failed_chapters = []
 
-            # Use multiprocessing to process chapters in parallel
-            with multiprocessing.Pool(
-                processes=self.config.worker_count,
-                initializer=setup_logging,
-                initargs=(self.config.log, self.config.log_file, True)
-            ) as pool:
-                # Process chapters and collect results
-                results = list(pool.imap_unordered(self.process_chapter_wrapper, tasks))
+            # worker_count == 1 (always true in the UI) processes chapters directly in
+            # this process: terminating this process (e.g. "Stop current book") then has
+            # nothing left running, instead of orphaning a Pool worker that keeps
+            # generating after the job is already reported stopped (F-01). worker_count
+            # > 1 (CLI only) keeps the multiprocessing Pool.
+            if self.config.worker_count == 1:
+                results = [self.process_chapter_wrapper(task) for task in tasks]
+            else:
+                with multiprocessing.Pool(
+                    processes=self.config.worker_count,
+                    initializer=setup_logging,
+                    initargs=(self.config.log, self.config.log_file, True)
+                ) as pool:
+                    results = list(pool.imap_unordered(self.process_chapter_wrapper, tasks))
 
-                # Check for failed chapters
-                for idx, success in results:
-                    if not success:
-                        failed_chapters.append((idx, titles_by_idx[idx]))
+            # Check for failed chapters
+            for idx, success in results:
+                if not success:
+                    failed_chapters.append((idx, titles_by_idx[idx]))
 
             if failed_chapters:
                 logger.warning("The following chapters failed to convert:")
@@ -251,10 +327,20 @@ class AudiobookGenerator:
                 if self.output_m4b() and not self.config.preview:
                     logger.warning("M4B not built because chapters failed. Finished chapters are kept; start the "
                                    "book again with 'Skip chapters already made' to redo only the missing ones.")
+            elif self.output_m4b() and not self.config.preview:
+                logger.info(f"All chapters converted successfully. Check your output directory: {self.config.output_folder}")
+                try:
+                    self._merge_into_m4b(tasks, tts_provider.get_output_file_extension(), cover_path)
+                    succeeded = True
+                except Exception as e:
+                    # Distinguish this from "chapters failed" (above): every chapter is
+                    # fine, only the M4B mux step itself failed (F-04).
+                    logger.error(
+                        f"M4B build failed even though every chapter converted successfully: {e}. "
+                        f"Finished chapters are kept; fix the cause and retry with 'Skip chapters "
+                        f"already made' to rebuild just the M4B.", exc_info=True)
             else:
                 logger.info(f"All chapters converted successfully. Check your output directory: {self.config.output_folder}")
-                if self.output_m4b() and not self.config.preview:
-                    self._merge_into_m4b(tasks, tts_provider.get_output_file_extension(), cover_path)
                 succeeded = True
 
         except KeyboardInterrupt:
@@ -270,7 +356,25 @@ class AudiobookGenerator:
         chapters = [(title.replace("_", " "), self.chapter_audio_path(idx, title, "." + extension))
                     for idx, title, _ in sorted(tasks)]
         output_path = os.path.join(self.config.output_folder, f"{safe_book_file_name(self.book_title)}.m4b")
-        build_m4b(chapters, output_path, self.book_title or "", self.book_author or "", cover_path)
+        try:
+            build_m4b(chapters, output_path, self.book_title or "", self.book_author or "", cover_path)
+        except BadChapterFileError as e:
+            # Name the bad chapter and delete it, so a retry with skip_existing
+            # regenerates just that one instead of failing the same way forever (F-33).
+            if os.path.exists(e.path):
+                os.remove(e.path)
+            logger.error(
+                f"Chapter '{e.title}' audio file ({e.path}) was unreadable or corrupt; "
+                f"deleted it so a retry with 'Skip chapters already made' regenerates "
+                f"just that chapter."
+            )
+            raise
+        if cover_path and os.path.isfile(cover_path):
+            # The owner keeps a folder cover beside the finished M4B, like the rest of
+            # their library (F-23); the working copy is removed below with the rest of
+            # the hidden chapter folder.
+            final_cover = os.path.join(self.config.output_folder, os.path.basename(cover_path))
+            shutil.copyfile(cover_path, final_cover)
         shutil.rmtree(self.chapter_folder(), ignore_errors=True)
         logger.info(f"✅ M4B saved: {output_path}")
 

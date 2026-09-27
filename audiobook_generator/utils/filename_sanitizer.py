@@ -2,6 +2,8 @@ import hashlib
 import os
 import unicodedata
 
+from audiobook_generator.utils.safe_names import FORBIDDEN_CHARS, avoid_reserved_name
+
 
 def _detect_name_max(path):
     """Return NAME_MAX for filesystem containing path, or sane default."""
@@ -23,11 +25,11 @@ def _sanitize_base_name(name):
     # Unicode normalize
     name = unicodedata.normalize("NFKC", name)
 
-    # Replace path separators and control chars
-    forbidden = set('<>:"/\\|?*\n\r\t')
+    # Replace path separators and control chars (shared with safe_book_file_name and
+    # safe_folder_name, F-34)
     sanitized_chars = []
     for ch in name:
-        if ch in forbidden:
+        if ch in FORBIDDEN_CHARS:
             sanitized_chars.append("_")
         else:
             # On Windows, also avoid names ending with space or dot, handle later
@@ -38,6 +40,9 @@ def _sanitize_base_name(name):
     sanitized = " ".join(sanitized.split())
     sanitized = sanitized.replace(" ", "_")
     sanitized = sanitized.strip(" .")
+    # Avoid Windows-reserved device names (CON, NUL, COM1, ...); harmless when idx adds
+    # a numeric prefix, which is the common case (F-34).
+    sanitized = avoid_reserved_name(sanitized)
 
     return sanitized or "untitled"
 

@@ -19,6 +19,7 @@ from audiobook_generator.tts_providers.openai_tts_provider import get_openai_sup
 from audiobook_generator.tts_providers.piper_tts_provider import get_piper_supported_languages, \
     get_piper_supported_voices, get_piper_supported_qualities, get_piper_supported_speakers
 from audiobook_generator.utils.log_handler import generate_unique_log_path
+from audiobook_generator.utils.safe_names import sanitize_display_name
 from main import main
 
 selected_tts = "Edge"
@@ -35,9 +36,7 @@ def timestamped_output_dir() -> str:
 
 def safe_folder_name(name: str, max_length: int = 150) -> str:
     """Make a book title usable as a folder name on Windows and Linux, keeping spaces."""
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name[:max_length].rstrip(" .")
+    return sanitize_display_name(name, max_length=max_length)
 
 
 def suggest_output_dir(input_file) -> dict:
