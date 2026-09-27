@@ -342,7 +342,7 @@ def queue_view(queue: JobQueue) -> tuple:
     elif queue.paused:
         status = f"⏸ **Queue paused** · {to_go} book(s) waiting. Press **Resume queue** to continue."
     elif to_go:
-        status = f"▶ **Working** · {to_go} book(s) to go · about {_duration(left)} of generating left."
+        status = f"▶ **Working** · {to_go} book(s) to go · {_about(left)} of generating left."
     else:
         status = "✓ **All done.** Finished books are in the audiobook library."
     return rows, ids, status
@@ -367,6 +367,10 @@ def _duration(seconds: float) -> str:
     if minutes < 60:
         return f"{minutes} min"
     return f"{minutes // 60} h {minutes % 60} min"
+
+
+def _about(seconds: float) -> str:
+    return "less than a minute" if seconds < 60 else f"about {_duration(seconds)}"
 
 
 def chapter_stats(text: str) -> list:
@@ -413,9 +417,9 @@ def chapter_summary(table, stats: list, speed, sentence_pause, paragraph_pause) 
     speech_seconds = sum(s[0] for s in chosen) / CHARS_PER_AUDIO_SECOND
     skipped = len(rows) - len(picked)
     unticked = f" ({skipped} unticked)" if skipped else ""
-    return (f"**{len(picked)} of {len(rows)} chapters** ticked{unticked} · about "
-            f"**{_duration(audio_seconds)}** of audio at {float(speed or 1.0):g}× · roughly "
-            f"{_duration(speech_seconds / GENERATION_SPEED * PACED_GENERATION_OVERHEAD)} to generate. "
+    return (f"**{len(picked)} of {len(rows)} chapters** ticked{unticked} · "
+            f"**{_about(audio_seconds)}** of audio at {float(speed or 1.0):g}× · "
+            f"{_about(speech_seconds / GENERATION_SPEED * PACED_GENERATION_OVERHEAD)} to generate. "
             f"They'll be numbered 1–{len(picked)} in the finished book.")
 
 
