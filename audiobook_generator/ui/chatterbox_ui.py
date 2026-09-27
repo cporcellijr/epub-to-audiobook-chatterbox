@@ -13,6 +13,7 @@ Environment:
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -27,6 +28,7 @@ from gradio_log import Log
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core.chapter_selection import preselect_chapters
+from audiobook_generator.tts_providers.openai_tts_provider import PARAGRAPH_MARK
 from audiobook_generator.ui import library_index, web_ui
 from audiobook_generator.ui.web_ui import (
     OUTPUT_ROOT,
@@ -202,10 +204,10 @@ def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bo
 # ---- Audiobook generation ----
 
 def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_selection: list,
-                 skip_existing: bool, output_text: bool, title_mode: str, newline_mode: str,
-                 remove_endnotes: bool, remove_reference_numbers: bool, search_and_replace_file,
-                 log_level: str) -> GeneralConfig:
-    """GeneralConfig for the OpenAI provider pointed at Chatterbox."""
+                 sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
+                 output_text: bool, title_mode: str, newline_mode: str, remove_endnotes: bool,
+                 remove_reference_numbers: bool, search_and_replace_file, log_level: str) -> GeneralConfig:
+    """GeneralConfig for the OpenAI provider pointed at Chatterbox (pauses in seconds)."""
     config = GeneralConfig(None)
     config.input_file = input_file.name if hasattr(input_file, "name") else input_file
     config.output_folder = output_dir
@@ -225,11 +227,15 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     config.search_and_replace_file = (search_and_replace_file.name if hasattr(search_and_replace_file, "name")
                                       else search_and_replace_file)
     config.tts = "openai"
+    config.language = "en"
     config.output_format = "mp3"
     config.voice_name = voice
     config.model_name = "chatterbox"
     config.instructions = None
     config.speed = float(speed)
+    config.sentence_pause_ms = int(round(float(sentence_pause) * 1000))
+    config.paragraph_pause_ms = int(round(float(paragraph_pause) * 1000))
+    config.output_m4b = bool(output_m4b)
     return config
 
 
@@ -249,7 +255,7 @@ def selected_chapter_numbers(table) -> list:
 
 
 def start_generation(library_book, input_file, chapter_table, output_dir: str, voice: str, speed: float,
-                     *settings) -> None:
+                     sentence_pause: float, paragraph_pause: float, output_m4b: bool, *settings) -> None:
     book = library_book or input_file
     if not book:
         raise gr.Error("Pick a book from the library or upload an EPUB first.")
@@ -260,17 +266,21 @@ def start_generation(library_book, input_file, chapter_table, output_dir: str, v
         raise gr.Error("Tick at least one chapter.")
     if web_ui.running_process is not None and web_ui.running_process.is_alive():
         raise gr.Error("A book is already being generated. Stop it first or wait for it to finish.")
-    web_ui.launch_audiobook_generator(build_config(book, output_dir, voice, speed, selection, *settings))
+    web_ui.launch_audiobook_generator(build_config(book, output_dir, voice, speed, selection, sentence_pause,
+                                                   paragraph_pause, output_m4b, *settings))
     gr.Info(f"Generating {len(selection)} chapters...")
 
 
 # ---- Chapter list ----
 
-# Measured on a finished book (Elena, speed 1.0): 20.2 characters of text per second of audio,
-# generated at ~1.8x real time. Other voices read at somewhat different paces.
+# Measured on a finished book (Elena, speed 1.0): 20.2 characters of text per second of speech,
+# generated at ~1.8x real time; sentence-sized requests add ~14% generation time (A/B, 2026-09-27).
+# Other voices read at somewhat different paces.
 CHARS_PER_AUDIO_SECOND = 20.2
 GENERATION_SPEED = 1.8
+PACED_GENERATION_OVERHEAD = 1.14
 CHAPTER_COLUMNS = ["#", "Include", "Chapter", "Starts with", "Listening"]
+_SENTENCE_END = re.compile(r"[.!?\u2026]+[\"'\u201d\u2019)\]]*(?=\s|$)")
 
 
 def _duration(seconds: float) -> str:
@@ -282,13 +292,24 @@ def _duration(seconds: float) -> str:
     return f"{minutes // 60} h {minutes % 60} min"
 
 
-def _listening(characters: int, speed) -> str:
-    return _duration(characters / CHARS_PER_AUDIO_SECOND / float(speed or 1.0))
+def chapter_stats(text: str) -> list:
+    """[characters, sentences, paragraphs] of a chapter parsed with paragraph marks."""
+    paragraphs = [p for p in (" ".join(part.split()) for part in text.split(PARAGRAPH_MARK)) if p]
+    plain = " ".join(paragraphs)
+    return [len(plain), max(1, len(_SENTENCE_END.findall(plain))), max(1, len(paragraphs))]
+
+
+def listening_seconds(stats: list, speed, sentence_pause, paragraph_pause) -> float:
+    """Speech plus the inserted pauses (both shrink with speed)."""
+    characters, sentences, paragraphs = stats
+    pauses = (max(0, sentences - paragraphs) * float(sentence_pause or 0)
+              + max(0, paragraphs - 1) * float(paragraph_pause or 0))
+    return (characters / CHARS_PER_AUDIO_SECOND + pauses) / float(speed or 1.0)
 
 
 def book_chapters(book: str, title_mode: str, newline_mode: str, remove_endnotes: bool,
                   remove_reference_numbers: bool, search_and_replace_file) -> list:
-    """(title, text) for each chapter, numbered exactly as the generator will number them."""
+    """(title, text with paragraph marks) per chapter, numbered exactly as the generator numbers them."""
     config = GeneralConfig(None)
     config.input_file = book
     config.title_mode = title_mode
@@ -297,11 +318,11 @@ def book_chapters(book: str, title_mode: str, newline_mode: str, remove_endnotes
     config.remove_reference_numbers = remove_reference_numbers
     config.search_and_replace_file = (search_and_replace_file.name if hasattr(search_and_replace_file, "name")
                                       else search_and_replace_file)
-    chapters = get_book_parser(config).get_chapters(" ")
+    chapters = get_book_parser(config).get_chapters(f" {PARAGRAPH_MARK}")
     return [(title, text) for title, text in chapters if text.strip()]  # same filter as the generator
 
 
-def chapter_summary(table, chapter_lengths: list, speed) -> str:
+def chapter_summary(table, stats: list, speed, sentence_pause, paragraph_pause) -> str:
     """One-line summary of the ticked chapters."""
     rows = _table_rows(table)
     if not rows:
@@ -309,20 +330,21 @@ def chapter_summary(table, chapter_lengths: list, speed) -> str:
     picked = selected_chapter_numbers(rows)
     if not picked:
         return "⚠️ No chapters ticked."
-    speed = float(speed or 1.0)
-    lengths = chapter_lengths or []
-    characters = sum(lengths[n - 1] for n in picked if 0 < n <= len(lengths))
-    audio_seconds = characters / CHARS_PER_AUDIO_SECOND
+    stats = stats or []
+    chosen = [stats[n - 1] for n in picked if 0 < n <= len(stats)]
+    audio_seconds = sum(listening_seconds(s, speed, sentence_pause, paragraph_pause) for s in chosen)
+    speech_seconds = sum(s[0] for s in chosen) / CHARS_PER_AUDIO_SECOND
     skipped = len(rows) - len(picked)
     unticked = f" ({skipped} unticked)" if skipped else ""
     return (f"**{len(picked)} of {len(rows)} chapters** ticked{unticked} · about "
-            f"**{_duration(audio_seconds / speed)}** of audio at {speed:g}× · roughly "
-            f"{_duration(audio_seconds / GENERATION_SPEED)} to generate. "
+            f"**{_duration(audio_seconds)}** of audio at {float(speed or 1.0):g}× · roughly "
+            f"{_duration(speech_seconds / GENERATION_SPEED * PACED_GENERATION_OVERHEAD)} to generate. "
             f"They'll be numbered 1–{len(picked)} in the finished book.")
 
 
-def chapter_overview(library_book, input_file, speed, title_mode: str, newline_mode: str,
-                     remove_endnotes: bool, remove_reference_numbers: bool, search_and_replace_file) -> tuple:
+def chapter_overview(library_book, input_file, speed, sentence_pause, paragraph_pause, title_mode: str,
+                     newline_mode: str, remove_endnotes: bool, remove_reference_numbers: bool,
+                     search_and_replace_file) -> tuple:
     """Chapter table with story chapters pre-ticked and front/back matter unticked."""
     book = library_book if library_book and os.path.isfile(library_book) else input_file
     if not book:
@@ -335,21 +357,24 @@ def chapter_overview(library_book, input_file, speed, title_mode: str, newline_m
         return gr.update(value=None, visible=False), [], f"Could not read chapters from this book: {e}"
     if not chapters:
         return gr.update(value=None, visible=False), [], "No chapters with text found in this book."
-    include = preselect_chapters(chapters)
-    lengths = [len(text) for _, text in chapters]
-    rows = [[number, ticked, title.replace("_", " "), " ".join(text.split())[:70], _listening(len(text), speed)]
-            for number, ((title, text), ticked) in enumerate(zip(chapters, include), start=1)]
-    return gr.update(value=rows, visible=True), lengths, chapter_summary(rows, lengths, speed)
+    plain = [(title, " ".join(text.replace(PARAGRAPH_MARK, " ").split())) for title, text in chapters]
+    include = preselect_chapters(plain)
+    stats = [chapter_stats(text) for _, text in chapters]
+    rows = [[number, ticked, title.replace("_", " "), text[:70],
+             _duration(listening_seconds(stat, speed, sentence_pause, paragraph_pause))]
+            for number, ((title, text), ticked, stat) in enumerate(zip(plain, include, stats), start=1)]
+    return (gr.update(value=rows, visible=True), stats,
+            chapter_summary(rows, stats, speed, sentence_pause, paragraph_pause))
 
 
-def retime_chapters(table, chapter_lengths: list, speed) -> dict:
-    """Speed changed: update the Listening column, keeping the ticks."""
+def retime_chapters(table, stats: list, speed, sentence_pause, paragraph_pause) -> dict:
+    """Speed or pauses changed: update the Listening column, keeping the ticks."""
     rows = _table_rows(table)
-    lengths = chapter_lengths or []
+    stats = stats or []
     for row in rows:
         number = int(row[0])
-        if 0 < number <= len(lengths):
-            row[4] = _listening(lengths[number - 1], speed)
+        if 0 < number <= len(stats):
+            row[4] = _duration(listening_seconds(stats[number - 1], speed, sentence_pause, paragraph_pause))
     return gr.update(value=rows) if rows else gr.update()
 
 
@@ -410,12 +435,17 @@ def build_ui() -> gr.Blocks:
                     voice = gr.Dropdown(choices, value=default_voice, label="Voice", allow_custom_value=True)
                     speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed",
                                       info="1.0 recommended (other speeds are stretched after generation).")
+            with gr.Row(equal_height=True):
+                sentence_pause = gr.Slider(0.0, 1.5, value=0.35, step=0.05, label="Pause after sentences (s)")
+                paragraph_pause = gr.Slider(0.0, 3.0, value=0.9, step=0.1, label="Pause between paragraphs (s)")
+                output_m4b = gr.Checkbox(True, label="Single M4B file (recommended)",
+                                         info="One file with chapter markers and cover, instead of an MP3 per chapter.")
             chapters_info = gr.Markdown()
             chapter_table = gr.Dataframe(headers=CHAPTER_COLUMNS, datatype=["number", "bool", "str", "str", "str"],
                                          interactive=True, static_columns=[0, 2, 3, 4], wrap=True, visible=False,
                                          label="Chapters: untick anything you don't want narrated",
                                          column_widths=["6%", "9%", "30%", "40%", "15%"], max_height=520)
-            chapter_lengths = gr.State([])
+            chapter_stats_state = gr.State([])
             with gr.Row(equal_height=True):
                 tick_all_button = gr.Button("Tick all", size="sm")
                 auto_tick_button = gr.Button("Auto-select (skip front/back matter)", size="sm")
@@ -474,8 +504,9 @@ def build_ui() -> gr.Blocks:
                     add_button = gr.Button("Add voice")
             add_status = gr.Markdown()
 
-        settings = [output_dir, voice, speed, skip_existing, output_text, title_mode, newline_mode,
-                    remove_endnotes, remove_reference_numbers, search_and_replace_file, log_level]
+        settings = [output_dir, voice, speed, sentence_pause, paragraph_pause, output_m4b, skip_existing,
+                    output_text, title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
+                    search_and_replace_file, log_level]
         library_book.change(library_output_dir, inputs=library_book, outputs=output_dir)
         input_file.change(uploaded_book_selected, inputs=input_file, outputs=[output_dir, library_book])
         start_button.click(start_generation, inputs=[library_book, input_file, chapter_table, *settings],
@@ -483,17 +514,21 @@ def build_ui() -> gr.Blocks:
         stop_button.click(stop_generation, inputs=None, outputs=None)
 
         # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
-        # this re-runs the auto-selection. Ticks, speed and "Tick all" only touch the table.
-        overview_inputs = [library_book, input_file, speed, title_mode, newline_mode, remove_endnotes,
+        # this re-runs the auto-selection. Ticks, speed, pauses and "Tick all" only touch the table.
+        timing = [speed, sentence_pause, paragraph_pause]
+        overview_inputs = [library_book, input_file, *timing, title_mode, newline_mode, remove_endnotes,
                            remove_reference_numbers, search_and_replace_file]
-        overview_outputs = [chapter_table, chapter_lengths, chapters_info]
+        overview_outputs = [chapter_table, chapter_stats_state, chapters_info]
         for trigger in (library_book, input_file, title_mode, newline_mode, remove_endnotes,
                         remove_reference_numbers, search_and_replace_file):
             trigger.change(chapter_overview, inputs=overview_inputs, outputs=overview_outputs)
         auto_tick_button.click(chapter_overview, inputs=overview_inputs, outputs=overview_outputs)
         tick_all_button.click(tick_all_chapters, inputs=chapter_table, outputs=chapter_table)
-        speed.change(retime_chapters, inputs=[chapter_table, chapter_lengths, speed], outputs=chapter_table)
-        chapter_table.change(chapter_summary, inputs=[chapter_table, chapter_lengths, speed], outputs=chapters_info)
+        for timing_control in timing:
+            timing_control.change(retime_chapters, inputs=[chapter_table, chapter_stats_state, *timing],
+                                  outputs=chapter_table)
+        chapter_table.change(chapter_summary, inputs=[chapter_table, chapter_stats_state, *timing],
+                             outputs=chapters_info)
 
         voice.input(lambda v: v, inputs=voice, outputs=lab_voice)
         lab_voice.input(lambda v: v, inputs=lab_voice, outputs=voice)

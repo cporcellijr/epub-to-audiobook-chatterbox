@@ -33,6 +33,11 @@ class GeneralConfig:
         # OpenAI specific arguments
         self.instructions = getattr(args, 'instructions', None)
         self.speed = getattr(args, 'speed', None)
+        # Paced narration: speak sentence-sized units and insert these pauses (ms); None = off
+        self.sentence_pause_ms = getattr(args, 'sentence_pause_ms', None)
+        self.paragraph_pause_ms = getattr(args, 'paragraph_pause_ms', None)
+        # Merge finished chapters into one <title>.m4b (chapter markers, cover) instead of loose files
+        self.output_m4b = getattr(args, 'output_m4b', None)
 
         # TTS provider: Azure & Edge TTS specific arguments
         self.break_duration = getattr(args, 'break_duration', None)

@@ -145,7 +145,7 @@ class TestBuildConfig(unittest.TestCase):
 
     def test_config_targets_chatterbox_with_one_worker(self):
         config = chatterbox_ui.build_config(
-            "/tmp/book.epub", "audiobook_output/Book", "Elena.wav", 1.0, [3, 4], True, False,
+            "/tmp/book.epub", "audiobook_output/Book", "Elena.wav", 1.0, [3, 4], 0.35, 0.9, True, True, False,
             "auto", "double", False, False, None, "INFO")
         self.assertEqual((config.tts, config.output_format, config.worker_count), ("openai", "mp3", 1))
         self.assertEqual((config.voice_name, config.speed), ("Elena.wav", 1.0))
@@ -153,11 +153,13 @@ class TestBuildConfig(unittest.TestCase):
         self.assertIsNone(config.instructions)
         self.assertTrue(config.skip_existing)
         self.assertFalse(config.preview)
+        self.assertEqual((config.sentence_pause_ms, config.paragraph_pause_ms, config.output_m4b), (350, 900, True))
+        self.assertEqual(config.language, "en")
 
 
 TABLE = [[1, False, "Title page", "Title", "under 1 min"], [2, True, "One", "It was", "26 min"],
          [3, True, "Two", "It was", "25 min"]]
-SETTINGS = ("out", "Elena.wav", 1.0, False, False, "auto", "double", False, False, None, "INFO")
+SETTINGS = ("out", "Elena.wav", 1.0, 0.35, 0.9, True, False, False, "auto", "double", False, False, None, "INFO")
 
 
 class TestStartGeneration(unittest.TestCase):
@@ -218,30 +220,42 @@ class TestChapterList(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_front_matter_is_unticked_and_story_ticked(self):
-        table, lengths, summary = chatterbox_ui.chapter_overview(
-            self.book, None, 1.0, "auto", "double", False, False, None)
+        table, stats, summary = chatterbox_ui.chapter_overview(
+            self.book, None, 1.0, 0.35, 0.9, "auto", "double", False, False, None)
         rows = table["value"]
         self.assertEqual([row[1] for row in rows], [False, False, True, True])
-        self.assertEqual(len(lengths), 4)
+        self.assertEqual(len(stats), 4)
         self.assertIn("2 of 4 chapters", summary)
         self.assertIn("numbered 1–2", summary)
 
     def test_no_book_hides_the_table(self):
-        table, lengths, summary = chatterbox_ui.chapter_overview(None, None, 1.0, "auto", "double", False, False, None)
+        table, stats, summary = chatterbox_ui.chapter_overview(
+            None, None, 1.0, 0.35, 0.9, "auto", "double", False, False, None)
         self.assertFalse(table["visible"])
-        self.assertEqual((lengths, summary), ([], ""))
+        self.assertEqual((stats, summary), ([], ""))
 
-    def test_summary_follows_ticks_and_speed(self):
-        lengths = [20, 30300, 30300]  # 30,300 chars = 25 min at 1.0x
+    def test_summary_follows_ticks_speed_and_pauses(self):
+        stats = [[20, 1, 1], [30300, 1, 1], [30300, 1, 1]]  # 30,300 chars = 25 min of speech at 1.0x
         rows = [[1, False, "T", "", ""], [2, True, "A", "", ""], [3, True, "B", "", ""]]
-        self.assertIn("50 min", chatterbox_ui.chapter_summary(rows, lengths, 1.0))
-        self.assertIn("40 min", chatterbox_ui.chapter_summary(rows, lengths, 1.25))
+        self.assertIn("50 min", chatterbox_ui.chapter_summary(rows, stats, 1.0, 0.35, 0.9))
+        self.assertIn("40 min", chatterbox_ui.chapter_summary(rows, stats, 1.25, 0.35, 0.9))
         rows[2][1] = False
-        self.assertIn("1 of 3 chapters", chatterbox_ui.chapter_summary(rows, lengths, 1.0))
+        self.assertIn("1 of 3 chapters", chatterbox_ui.chapter_summary(rows, stats, 1.0, 0.35, 0.9))
+
+    def test_pauses_add_to_listening_time(self):
+        # 400 sentences in 100 paragraphs: 300 sentence pauses + 99 paragraph pauses
+        self.assertAlmostEqual(chatterbox_ui.listening_seconds([30300, 400, 100], 1.0, 0.5, 1.0),
+                               1500 + 150 + 99, places=3)
+        self.assertAlmostEqual(chatterbox_ui.listening_seconds([30300, 400, 100], 2.0, 0.5, 1.0),
+                               (1500 + 150 + 99) / 2, places=3)
+
+    def test_chapter_stats(self):
+        text = f"One. Two! Three?{chatterbox_ui.PARAGRAPH_MARK} Four... \u201cFive.\u201d"
+        self.assertEqual(chatterbox_ui.chapter_stats(text)[1:], [5, 2])
 
     def test_speed_change_retimes_but_keeps_ticks(self):
         rows = [[1, False, "T", "", "x"], [2, True, "A", "", "x"]]
-        updated = chatterbox_ui.retime_chapters(rows, [20, 30300], 2.0)["value"]
+        updated = chatterbox_ui.retime_chapters(rows, [[20, 1, 1], [30300, 1, 1]], 2.0, 0.35, 0.9)["value"]
         self.assertEqual([row[1] for row in updated], [False, True])
         self.assertEqual(updated[1][4], "12 min")
 

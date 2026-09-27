@@ -96,12 +96,28 @@ class EpubBookParser(BaseBookParser):
         return [item for item in self.book.get_items_of_type(ebooklib.ITEM_DOCUMENT)
                 if not self._is_nav_document(item)]
 
+    _BLOCK_TAGS = ["p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "pre", "tr", "dt", "dd",
+                   "section", "article", "header", "footer", "aside", "figcaption"]
+
+    @classmethod
+    def _mark_paragraphs(cls, soup) -> None:
+        """End every block element with a blank line so paragraph breaks survive text extraction.
+
+        Many EPUBs put a single newline (or none) between <p> elements, which "double" newline
+        mode can't see; the HTML structure is the reliable signal.
+        """
+        for tag in soup.find_all(cls._BLOCK_TAGS):
+            tag.append("\n\n")
+        for line_break in soup.find_all("br"):
+            line_break.replace_with("\n")
+
     def get_chapters(self, break_string) -> List[Tuple[str, str]]:
         chapters = []
         search_and_replaces = self.get_search_and_replaces()
         for item in self._reading_order_documents():
             content = item.get_content()
             soup = BeautifulSoup(content, "lxml-xml")
+            self._mark_paragraphs(soup)
             raw = soup.get_text(strip=False)
             logger.debug(f"Raw text: <{raw[:]}>")
 
