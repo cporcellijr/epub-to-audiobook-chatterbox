@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 QUEUED, RUNNING, DONE, FAILED, STOPPED = "queued", "running", "done", "failed", "stopped"
 FINISHED = (DONE, FAILED, STOPPED)
 
+# Chapter audio files are named "<number>_<title>.<ext>"; a chapter work folder in M4B mode.
+_CHAPTER_EXTENSIONS = (".mp3", ".aac")
+_CHAPTER_WORK_FOLDER = ".chapters"
+
 
 def run_job(config, log_file: str) -> None:
     """Process target: generate one book; exit code 0 = every chapter (and the M4B) succeeded."""
@@ -47,6 +51,7 @@ class JobQueue:
                 job["status"] = QUEUED
                 job["settings"]["skip_existing"] = True
                 job["note"] = "resumes after restart"
+                job["estimate_seconds"] *= self._remaining_chapter_fraction(job)
         self._save()
 
     # ---- persistence ----
@@ -87,20 +92,64 @@ class JobQueue:
             return dict(job) if job else None
 
     @staticmethod
-    def chapters_done(job: dict) -> int:
-        """Finished chapter files on disk for a job (all of them once it is done)."""
-        if job["status"] == DONE:
-            return job["chapters"]
-        settings = job["settings"]
+    def _chapter_folder(settings: dict) -> str:
+        """Where this job's chapter audio lives (the hidden work folder in M4B mode)."""
         folder = settings["output_dir"]
         if settings.get("output_m4b"):
-            folder = os.path.join(folder, ".chapters")
+            folder = os.path.join(folder, _CHAPTER_WORK_FOLDER)
+        return folder
+
+    # A mounted filesystem's mtime clock and time.time() are not always perfectly in step (observed:
+    # a file written after started_ts was recorded can still read a few ms earlier on a Windows bind
+    # mount). This tolerance absorbs that without reopening the stale-file bug it guards against --
+    # a file from a genuinely unrelated earlier run is stale by minutes or hours, not milliseconds.
+    _STALE_FILE_TOLERANCE_SECONDS = 2.0
+
+    @staticmethod
+    def _count_chapter_files(folder: str, since: Optional[float] = None) -> int:
+        """Numbered chapter audio files (.mp3 or .aac) in folder; with `since`, only ones modified
+        at or after that time (epoch seconds, less a small clock-skew tolerance), so files left
+        over from an unrelated earlier run are not counted."""
         try:
             names = os.listdir(folder)
         except OSError:
             return 0
-        count = sum(1 for n in names if not n.startswith(".") and n[:4].isdigit() and not n.endswith(".txt"))
+        count = 0
+        cutoff = since - JobQueue._STALE_FILE_TOLERANCE_SECONDS if since is not None else None
+        for name in names:
+            if name.startswith(".") or not name[:4].isdigit() or not name.lower().endswith(_CHAPTER_EXTENSIONS):
+                continue
+            if cutoff is not None:
+                try:
+                    if os.path.getmtime(os.path.join(folder, name)) < cutoff:
+                        continue
+                except OSError:
+                    continue
+            count += 1
+        return count
+
+    @staticmethod
+    def chapters_done(job: dict) -> int:
+        """Finished chapter files on disk for this job's current run (all of them once it is done).
+
+        Only files written at or after this run started count, so numbered chapter files left over
+        from an unrelated earlier job in the same output folder can never be mistaken for this job's
+        own progress.
+        """
+        if job["status"] == DONE:
+            return job["chapters"]
+        count = JobQueue._count_chapter_files(JobQueue._chapter_folder(job["settings"]), since=job.get("started_ts"))
         return min(count, job["chapters"])
+
+    @staticmethod
+    def _remaining_chapter_fraction(job: dict) -> float:
+        """Fraction of a job's chapters not yet sitting on disk: what 'Skip chapters already made'
+        still has to generate, regardless of which run produced the ones already there."""
+        total = job["chapters"]
+        if total <= 0:
+            return 1.0
+        done = JobQueue._count_chapter_files(JobQueue._chapter_folder(job["settings"]))
+        return max(0.0, (total - min(done, total)) / total)
 
     # ---- changes ----
 
@@ -110,7 +159,7 @@ class JobQueue:
             self._data["jobs"].append({
                 "id": uuid.uuid4().hex[:12], "title": title, "voice": voice, "chapters": chapters,
                 "estimate_seconds": estimate_seconds, "status": QUEUED, "added": _now(), "started": None,
-                "finished": None, "note": "", "settings": settings,
+                "started_ts": None, "finished": None, "note": "", "settings": settings,
             })
             self._save()
             return sum(1 for job in self._data["jobs"] if job["status"] == QUEUED)
@@ -133,7 +182,9 @@ class JobQueue:
             if not job or job["status"] not in (FAILED, STOPPED):
                 return False
             self._data["jobs"].remove(job)
-            job.update(status=QUEUED, started=None, finished=None, note="retry: finished chapters kept")
+            job["estimate_seconds"] *= self._remaining_chapter_fraction(job)
+            job.update(status=QUEUED, started=None, started_ts=None, finished=None,
+                       note="retry: finished chapters kept")
             job["settings"]["skip_existing"] = True
             self._data["jobs"].append(job)
             self._save()
@@ -163,18 +214,38 @@ class JobQueue:
             self._data["paused"] = bool(paused)
             self._save()
 
+    @staticmethod
+    def _finish_from_exitcode(job: dict, exitcode: int) -> None:
+        """DONE/FAILED bookkeeping for a job whose process has actually exited: shared by tick()
+        and by a stop_current() that raced a book which had already finished (F-28)."""
+        job["status"] = DONE if exitcode == 0 else FAILED
+        job["finished"] = _now()
+        if job["status"] == FAILED:
+            job["note"] = "failed; see the log (Retry keeps finished chapters)"
+
     def stop_current(self) -> bool:
         """Stop the running book and pause the queue (Resume starts the next one)."""
         with self._lock:
             self._data["paused"] = True
             job = self._find(self._running_id)
-            if self._process is not None and self._process.is_alive():
-                self._process.terminate()
-                self._process.join()
-            if job:
-                job["status"] = STOPPED
-                job["finished"] = _now()
-                job["note"] = "stopped; finished chapters kept"
+            process = self._process
+            if process is not None and process.is_alive():
+                process.terminate()
+                process.join()
+                if job:
+                    job["status"] = STOPPED
+                    job["finished"] = _now()
+                    job["note"] = "stopped; finished chapters kept"
+            elif process is not None:
+                # The process had already exited on its own -- possibly in the last couple of
+                # seconds, before the next tick() could notice -- so there was nothing left to
+                # terminate. Record its real outcome instead of overwriting a finished book as
+                # STOPPED (F-28).
+                process.join()
+                if job and job["status"] == RUNNING:
+                    self._finish_from_exitcode(job, process.exitcode)
+                    logger.info(f"Queue: '{job['title']}' had already finished when Stop was "
+                               f"pressed ({job['status']})")
             self._process, self._running_id = None, None
             self._save()
             return job is not None
@@ -188,10 +259,7 @@ class JobQueue:
                 self._process.join()
                 job = self._find(self._running_id)
                 if job and job["status"] == RUNNING:
-                    job["status"] = DONE if self._process.exitcode == 0 else FAILED
-                    job["finished"] = _now()
-                    if job["status"] == FAILED:
-                        job["note"] = "some chapters failed; see log (re-add with Skip chapters already made)"
+                    self._finish_from_exitcode(job, self._process.exitcode)
                 self._process, self._running_id = None, None
                 self._save()
             if self.paused:
@@ -202,7 +270,13 @@ class JobQueue:
             config = self._build_config(**job["settings"])
             process = self._process_factory(target=run_job, args=(config, self._log_file()))
             process.start()
-            job["status"], job["started"], job["note"] = RUNNING, _now(), job.get("note", "")
+            job["status"], job["note"] = RUNNING, job.get("note", "")
+            if not job.get("started"):
+                # A brand-new job or a Retry (both cleared "started" first): this is genuinely the
+                # first file this run will write, so chapters_done() should count from now. A
+                # restart-resume left "started" alone, since it is the same run continuing -- its
+                # chapters made before the restart still count as this run's own progress.
+                job["started"], job["started_ts"] = _now(), time.time()
             self._process, self._running_id = process, job["id"]
             self._save()
             logger.info(f"Queue: started '{job['title']}'")
