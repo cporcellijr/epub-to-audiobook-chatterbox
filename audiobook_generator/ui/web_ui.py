@@ -1,7 +1,9 @@
 from multiprocessing import Process
 from typing import Optional
+import json
 import os
 import re
+import urllib.request
 from datetime import datetime
 
 import gradio as gr
@@ -51,6 +53,55 @@ def suggest_output_dir(input_file) -> dict:
         print(f"Could not read EPUB title for output folder: {e}")
     folder = safe_folder_name(title) or safe_folder_name(os.path.splitext(os.path.basename(path))[0])
     return gr.update(value=os.path.join(OUTPUT_ROOT, folder) if folder else timestamped_output_dir())
+
+
+VOICE_FILE_EXTENSIONS = (".wav", ".mp3")
+
+
+def _voice_choices_from_names(names: list) -> list:
+    return [(os.path.splitext(name)[0], name) for name in sorted(names, key=str.lower)]
+
+
+def openai_voice_choices() -> list:
+    """(label, voice id) pairs for the OpenAI tab's Voice dropdown.
+
+    TTS_VOICES_DIR (a read-only mount of an OpenAI-compatible server's voice folder, e.g.
+    Chatterbox) is listed directly, so the dropdown never waits on a TTS server that is busy
+    generating; otherwise OPENAI_BASE_URL/audio/voices is asked; otherwise the stock OpenAI
+    voices are offered.
+    """
+    voices_dir = os.environ.get("TTS_VOICES_DIR")
+    if voices_dir and os.path.isdir(voices_dir):
+        names = [name for name in os.listdir(voices_dir)
+                 if name.lower().endswith(VOICE_FILE_EXTENSIONS)
+                 and os.path.isfile(os.path.join(voices_dir, name))]
+        if names:
+            return _voice_choices_from_names(names)
+    base_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
+    if base_url:
+        try:
+            with urllib.request.urlopen(f"{base_url}/audio/voices", timeout=5) as resp:
+                names = [name for name in json.load(resp).get("voices", []) if isinstance(name, str)]
+            if names:
+                return _voice_choices_from_names(names)
+        except Exception as e:
+            print(f"Voice list from {base_url} unavailable: {e}")
+    return [(voice, voice) for voice in get_openai_supported_voices()]
+
+
+def default_openai_voice(choices: list) -> Optional[str]:
+    """OPENAI_DEFAULT_VOICE when offered, else the first voice."""
+    values = [value for _, value in choices]
+    preferred = os.environ.get("OPENAI_DEFAULT_VOICE")
+    if preferred in values:
+        return preferred
+    return values[0] if values else None
+
+
+def refresh_openai_voices() -> dict:
+    """Page-load handler: re-list voices so newly added voice files appear without a restart."""
+    choices = openai_voice_choices()
+    return gr.update(choices=choices, value=default_openai_voice(choices))
 
 
 def on_tab_change(evt: gr.SelectData):
@@ -222,7 +273,10 @@ def host_ui(config):
                 gr.Markdown("It is expected that user configured: `OPENAI_API_KEY` in the environment variables. Optionally `OPENAI_API_BASE` can be set to overwrite OpenAI API endpoint.")
                 with gr.Row(equal_height=True):
                     model = gr.Dropdown(get_openai_supported_models(), label="Model", interactive=True, allow_custom_value=True)
-                    voices = gr.Dropdown(get_openai_supported_voices(), label="Voice", interactive=True, allow_custom_value=True)
+                    voice_choices = openai_voice_choices()
+                    voices = gr.Dropdown(voice_choices, value=default_openai_voice(voice_choices), label="Voice",
+                                         interactive=True, allow_custom_value=True)
+                    ui.load(refresh_openai_voices, inputs=None, outputs=voices)
                     speed = gr.Slider(minimum=0.25, maximum=4.0, step=0.1, label="Speed", value=1.0,
                                       info="Speed of the speech, 1.0 is normal speed")
                     openai_output_format = gr.Dropdown(get_openai_supported_output_formats(), label="Output Format", interactive=True)
