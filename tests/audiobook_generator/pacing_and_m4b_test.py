@@ -77,14 +77,40 @@ class TestPacedUnits(unittest.TestCase):
         text = (f"The rain had stopped by the time they reached the bridge. Yes. She pulled her coat "
                 f"tighter and looked back at the village.{PARAGRAPH_MARK}No. The road home was quiet and dark.")
         self.assertEqual(paced_units(text, "en"), [
-            (0, "The rain had stopped by the time they reached the bridge."),
-            (0, "Yes. She pulled her coat tighter and looked back at the village."),
-            (1, "No. The road home was quiet and dark."),
+            (0, "The rain had stopped by the time they reached the bridge.", False),
+            (0, "Yes. She pulled her coat tighter and looked back at the village.", False),
+            (1, "No. The road home was quiet and dark.", False),
         ])
 
     def test_trailing_short_sentence_joins_previous_unit(self):
         units = paced_units("She pulled her coat tighter against the cold wind. Then she ran.", "en")
-        self.assertEqual(units, [(0, "She pulled her coat tighter against the cold wind. Then she ran.")])
+        self.assertEqual(units, [(0, "She pulled her coat tighter against the cold wind. Then she ran.", False)])
+
+    def test_long_comma_only_sentence_is_split_so_no_unit_reaches_the_token_cap(self):
+        # sentencex will not split this: no sentence-ending punctuation until the very end.
+        clause = "the quiet valley held its breath under a pale and heavy sky"
+        text = ", ".join([clause] * 14) + "."
+        self.assertGreater(len(text), 800)  # matches the WORKLOG's observed truncation range
+
+        units = paced_units(text, "en")
+
+        self.assertGreater(len(units), 1, "an oversized unit must be split into several requests")
+        for _, unit, _ in units:
+            self.assertLessEqual(len(unit), 450)
+        # Reassembling the pieces (space-joined, as split_long_sentence cuts on spaces/commas)
+        # must not lose any non-whitespace content.
+        rejoined = "".join(unit for _, unit, _ in units)
+        self.assertEqual("".join(rejoined.split()), "".join(text.split()))
+        # All pieces after the first are mid-sentence continuations: 0 ms gap, never a pause.
+        self.assertFalse(units[0][2])
+        self.assertTrue(all(continues for _, _, continues in units[1:]))
+
+    def test_scene_break_and_symbol_only_paragraphs_are_dropped(self):
+        text = (f"Yes.{PARAGRAPH_MARK}* * *{PARAGRAPH_MARK}…{PARAGRAPH_MARK}"
+                f"—{PARAGRAPH_MARK}No, she said.")
+        units = paced_units(text, "en")
+        spoken = [unit for _, unit, _ in units]
+        self.assertEqual(spoken, ["Yes.", "No, she said."])
 
 
 class TestPacedSpeech(unittest.TestCase):

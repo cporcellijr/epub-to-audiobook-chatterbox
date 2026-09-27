@@ -12,7 +12,7 @@ from openai import OpenAI
 
 from audiobook_generator.core.audio_tags import AudioTags
 from audiobook_generator.config.general_config import GeneralConfig
-from audiobook_generator.utils.utils import split_text, set_audio_tags, merge_audio_segments
+from audiobook_generator.utils.utils import split_text, split_long_sentence, set_audio_tags, merge_audio_segments
 from audiobook_generator.tts_providers.base_tts_provider import BaseTTSProvider
 
 
@@ -21,12 +21,34 @@ logger = logging.getLogger(__name__)
 PARAGRAPH_MARK = "@BRK#"
 MIN_UNIT_CHARS = 40   # shorter sentences join the next one: tiny inputs make TTS models stumble
 MAX_UNIT_CHARS = 400  # a trailing short sentence joins the previous unit only if it stays under this
+# A unit over this goes through split_long_sentence (F-07): the server's ~1000-token cap silently
+# truncates a single request around ~800 characters, and it is also the paragraph-mode (F-05)
+# packing threshold, so one request never risks that cap either way.
+MAX_REQUEST_CHARS = 450
 _PYDUB_EXPORT = {"aac": ("adts", "aac"), "opus": ("opus", "libopus")}
 
 
-def paced_units(text: str, language: str) -> List[Tuple[int, str]]:
-    """(paragraph number, text) units of one or more whole sentences, in reading order."""
-    units: List[Tuple[int, str]] = []
+def _is_speakable(unit: str) -> bool:
+    """False for a unit with no letters or digits (F-18): scene breaks ("* * *", "...", "--")
+    and other punctuation-only paragraphs should become silence, not a spoken request."""
+    return any(char.isalnum() for char in unit)
+
+
+def _split_oversized_unit(unit: str) -> List[str]:
+    """Break a unit over MAX_REQUEST_CHARS into pieces (F-07), so none can reach the server's
+    token cap. Pieces are meant to be sent as separate requests joined with NO pause: the cut
+    is mid-sentence, not a real sentence or paragraph boundary."""
+    if len(unit) <= MAX_REQUEST_CHARS:
+        return [unit]
+    return split_long_sentence(unit, MAX_REQUEST_CHARS)
+
+
+def paced_units(text: str, language: str) -> List[Tuple[int, str, bool]]:
+    """(paragraph number, text, continues_previous) units of one or more whole sentences, in
+    reading order. continues_previous is True only for a piece produced by splitting an
+    oversized unit (F-07): it must follow the previous piece with NO pause.
+    """
+    units: List[Tuple[int, str, bool]] = []
     paragraphs = [" ".join(p.split()) for p in text.split(PARAGRAPH_MARK)]
     for number, paragraph in enumerate(p for p in paragraphs if p):
         pending, paragraph_units = "", []
@@ -43,7 +65,12 @@ def paced_units(text: str, language: str) -> List[Tuple[int, str]]:
                 paragraph_units[-1] = f"{paragraph_units[-1]} {pending}"
             else:
                 paragraph_units.append(pending)
-        units.extend((number, unit) for unit in paragraph_units)
+        for unit in paragraph_units:
+            if not _is_speakable(unit):
+                continue
+            pieces = _split_oversized_unit(unit)
+            units.append((number, pieces[0], False))
+            units.extend((number, piece, True) for piece in pieces[1:])
     return units
 
 
@@ -160,7 +187,7 @@ class OpenAITTSProvider(BaseTTSProvider):
         pieces: List[bytes] = []
         audio_format = None
         previous_paragraph = None
-        for number, (paragraph, unit) in enumerate(units, 1):
+        for number, (paragraph, unit, continues_previous) in enumerate(units, 1):
             chunk_id = f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{number}_of_{len(units)}"
             logger.info(f"Processing {chunk_id}, length={len(unit)}")
             logger.debug(f"Processing {chunk_id}, length={len(unit)}, text=[{unit}]")
@@ -178,7 +205,10 @@ class OpenAITTSProvider(BaseTTSProvider):
             else:
                 audio = (audio.set_frame_rate(audio_format[0]).set_channels(audio_format[1])
                          .set_sample_width(audio_format[2]))
-                gap_ms = paragraph_gap_ms if paragraph != previous_paragraph else sentence_gap_ms
+                if continues_previous:
+                    gap_ms = 0
+                else:
+                    gap_ms = paragraph_gap_ms if paragraph != previous_paragraph else sentence_gap_ms
                 gap_frames = int(audio_format[0] * gap_ms / 1000)
                 pieces.append(b"\0" * gap_frames * audio_format[1] * audio_format[2])
             pieces.append(audio.raw_data)
