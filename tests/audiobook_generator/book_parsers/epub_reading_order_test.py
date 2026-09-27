@@ -56,6 +56,56 @@ def _config(input_file: str) -> GeneralConfig:
     ))
 
 
+def _write_guide_epub(path: str, toc_body: str) -> None:
+    """EPUB2 book whose <guide> points a generically titled page at the table of contents."""
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr("META-INF/container.xml",
+                   '<?xml version="1.0"?><container version="1.0" '
+                   'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+                   '<rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>'
+                   '</rootfiles></container>')
+        z.writestr("OEBPS/content.opf",
+                   '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0" '
+                   'unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+                   '<dc:identifier id="id">t</dc:identifier><dc:title>Guide Test</dc:title>'
+                   '<dc:creator>Tester</dc:creator><dc:language>en</dc:language></metadata><manifest>'
+                   '<item id="toc" href="toc.xhtml" media-type="application/xhtml+xml"/>'
+                   '<item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>'
+                   '</manifest><spine><itemref idref="toc"/><itemref idref="c1"/></spine>'
+                   '<guide><reference type="toc" title="Contents" href="toc.xhtml"/></guide>'
+                   '</package>')
+        z.writestr("OEBPS/toc.xhtml",
+                   '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head>'
+                   f'<title>Contents</title></head><body><p>{toc_body}</p></body></html>')
+        z.writestr("OEBPS/c1.xhtml",
+                   '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head>'
+                   '<title>c1</title></head><body><p>Chapter one real text.</p></body></html>')
+
+
+class TestEpubGuideToc(unittest.TestCase):
+    """F-17: an EPUB2 <guide type="toc"> page must not be narrated as a chapter, unless it's
+    long enough that it reads as a publisher's mistagged real content page instead."""
+
+    def _reading_order_names(self, toc_body: str) -> list:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "guide.epub")
+            _write_guide_epub(path, toc_body)
+            parser = EpubBookParser(_config(path))
+            return [item.get_name() for item in parser._reading_order_documents()]
+
+    def test_short_guide_toc_page_is_excluded(self):
+        names = self._reading_order_names("Chapter One .. 1\nChapter Two .. 15")
+        self.assertNotIn("toc.xhtml", names)
+        self.assertIn("c1.xhtml", names)
+
+    def test_long_guide_toc_page_is_kept_as_content(self):
+        long_body = "This is really a chapter, not a contents page. " * 120  # > 5,000 chars
+        self.assertGreater(len(long_body), 5000)
+        names = self._reading_order_names(long_body)
+        self.assertIn("toc.xhtml", names)
+
+
 class TestEpubReadingOrder(unittest.TestCase):
 
     def setUp(self):
