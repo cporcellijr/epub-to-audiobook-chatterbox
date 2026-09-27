@@ -37,7 +37,8 @@ class TestProcessChapterPartialWrite(unittest.TestCase):
     def test_completed_chapter_is_renamed_into_place(self):
         with patch("audiobook_generator.core.audiobook_generator.get_tts_provider", return_value=_provider()):
             self.assertTrue(self.generator.process_chapter(1, "Chapter One", "text"))
-        self.assertEqual(self._files(), ["0001_Chapter_One.mp3"])
+        # Also writes the F-11 manifest (original chapter number + text hash) next to it.
+        self.assertEqual(self._files(), [".manifest.json", "0001_Chapter_One.mp3"])
 
     def test_provider_writes_to_hidden_partial_path(self):
         provider = _provider()

@@ -238,8 +238,6 @@ def pydub_merge_audio_segments(tmp_files: List[str], output_file: str, output_fo
             if os.path.exists(tmp_file):
                 os.remove(tmp_file)
         logger.debug(f"Temporary files deleted: {tmp_files}")
-        os.remove(tmp_file)
-    logger.debug(f"Temporary files deleted: {tmp_files}")
 
 
 def direct_merge_audio_segments(audio_segments: List[io.BytesIO], output_file: str) -> None:
@@ -262,11 +260,19 @@ def direct_merge_audio_segments(audio_segments: List[io.BytesIO], output_file: s
     logger.debug(f"Direct writing completed: {output_file}")
 
 
-def merge_audio_segments(audio_segments: List[io.BytesIO], output_file: str, output_format: str, 
+#  Concatenating raw response bytes only produces a valid file when every chunk's frames
+#  carry their own sync/length: verified for mp3 and ADTS aac (F-08). wav and flac each
+#  carry one stream-level header, so only the first chunk plays; anything not verified
+#  safe falls back to the pydub merge, which re-decodes and re-encodes into one file with
+#  correct framing.
+_DIRECT_MERGE_SAFE_FORMATS = frozenset({"mp3", "aac"})
+
+
+def merge_audio_segments(audio_segments: List[io.BytesIO], output_file: str, output_format: str,
                           chunk_ids: List[str], use_pydub_merge: bool) -> None:
     """
     Merge audio segments using either pydub or direct write method based on configuration
-    
+
     Args:
         audio_segments: List of audio segments (BytesIO objects)
         output_file: Path to the final output file
@@ -274,7 +280,7 @@ def merge_audio_segments(audio_segments: List[io.BytesIO], output_file: str, out
         chunk_ids: List of IDs for each audio chunk
         use_pydub_merge: Whether to use pydub for merging (True) or direct write (False)
     """
-    if use_pydub_merge:
+    if use_pydub_merge or output_format not in _DIRECT_MERGE_SAFE_FORMATS:
         logger.info(f"Using pydub to merge audio segments: {chunk_ids}")
         tmp_files = []
         for i, segment in enumerate(audio_segments):
