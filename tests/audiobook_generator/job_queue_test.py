@@ -1,9 +1,11 @@
 import json
+import multiprocessing
 import os
+import pickle
 import tempfile
 import unittest
 
-from audiobook_generator.ui.job_queue import DONE, FAILED, QUEUED, RUNNING, STOPPED, JobQueue
+from audiobook_generator.ui.job_queue import DONE, FAILED, QUEUED, RUNNING, STOPPED, JobQueue, run_job
 
 
 class FakeProcess:
@@ -97,6 +99,26 @@ class TestJobQueue(unittest.TestCase):
         self.queue.tick()
         self.assertEqual(self._statuses(), [("A", STOPPED), ("B", QUEUED)])
 
+    def test_stop_current_after_process_already_finished_marks_done_not_stopped(self):
+        # F-28: the process can exit (success) in the window before the next tick() notices, while
+        # the queue still thinks it is RUNNING. Stop must not overwrite that as STOPPED.
+        self._add("A")
+        self.queue.tick()
+        FakeProcess.instances[0].finish(0)
+        self.assertTrue(self.queue.stop_current())
+        self.assertFalse(FakeProcess.instances[0].terminated)
+        self.assertEqual(self._statuses(), [("A", DONE)])
+        self.assertTrue(self.queue.paused)
+
+    def test_stop_current_after_process_already_failed_marks_failed_not_stopped(self):
+        self._add("A")
+        self.queue.tick()
+        FakeProcess.instances[0].finish(1)
+        self.assertTrue(self.queue.stop_current())
+        job = self.queue.jobs()[0]
+        self.assertEqual(job["status"], FAILED)
+        self.assertIn("Retry keeps finished chapters", job["note"])
+
     def test_retry_requeues_at_the_back_and_keeps_finished_chapters(self):
         self._add("A")
         self._add("B")
@@ -108,6 +130,30 @@ class TestJobQueue(unittest.TestCase):
         self.assertEqual(self._statuses(), [("B", RUNNING), ("A", QUEUED)])
         self.assertTrue(self.queue.jobs()[1]["settings"]["skip_existing"])
         self.assertFalse(self.queue.retry(self.queue.jobs()[0]["id"]))  # running books can't be retried
+
+    def test_retry_scales_estimate_to_chapters_still_to_do(self):
+        # F-42a: 1 of 3 chapters is already on disk, so only 2/3 of the original estimate remains.
+        self._add("A")
+        self.queue.tick()
+        job = self.queue.jobs()[0]
+        work = os.path.join(job["settings"]["output_dir"], ".chapters")
+        os.makedirs(work)
+        open(os.path.join(work, "0001_One.mp3"), "w").close()
+        FakeProcess.instances[0].finish(1)
+        self.queue.tick()
+        self.assertTrue(self.queue.retry(self.queue.jobs()[0]["id"]))
+        self.assertAlmostEqual(self.queue.jobs()[0]["estimate_seconds"], 600 * 2 / 3)
+
+    def test_restart_resume_scales_estimate_to_chapters_still_to_do(self):
+        self._add("A")
+        self.queue.tick()
+        job = self.queue.jobs()[0]
+        work = os.path.join(job["settings"]["output_dir"], ".chapters")
+        os.makedirs(work)
+        open(os.path.join(work, "0001_One.mp3"), "w").close()
+        # The process is left "alive" (RUNNING), exactly as a real restart would find it.
+        restarted = self._queue()
+        self.assertAlmostEqual(restarted.jobs()[0]["estimate_seconds"], 600 * 2 / 3)
 
     def test_remove_waiting_but_not_running(self):
         self._add("A")
@@ -156,12 +202,68 @@ class TestJobQueue(unittest.TestCase):
             open(os.path.join(work, name), "w").close()
         self.assertEqual(JobQueue.chapters_done(job), 2)
 
+    def test_chapters_done_counts_aac_chapters_too(self):
+        # F-29: M4B mode is moving to AAC chapters; both extensions must count.
+        self._add("A")
+        job = self.queue.jobs()[0]
+        work = os.path.join(job["settings"]["output_dir"], ".chapters")
+        os.makedirs(work)
+        for name in ("0001_One.aac", "0002_Two.mp3"):
+            open(os.path.join(work, name), "w").close()
+        self.assertEqual(JobQueue.chapters_done(job), 2)
+
+    def test_chapters_done_ignores_files_older_than_this_run(self):
+        # F-29: numbered files left over from an earlier, unrelated run in the same folder must not
+        # be mistaken for this run's own progress.
+        self._add("A")
+        self.queue.tick()  # RUNNING: records started_ts
+        job = self.queue.jobs()[0]
+        work = os.path.join(job["settings"]["output_dir"], ".chapters")
+        os.makedirs(work)
+        stale = os.path.join(work, "0001_Old.mp3")
+        open(stale, "w").close()
+        old_time = job["started_ts"] - 3600
+        os.utime(stale, (old_time, old_time))
+        open(os.path.join(work, "0002_New.mp3"), "w").close()  # written just now, after started_ts
+        self.assertEqual(JobQueue.chapters_done(job), 1)
+
     def test_corrupt_queue_file_starts_empty(self):
         with open(self.path, "w") as f:
             f.write("{not json")
         self.assertEqual(self._queue().jobs(), [])
         with open(self.path) as f:
             self.assertEqual(json.load(f), {"paused": False, "jobs": []})
+
+
+def _spawn_target(marker_path: str) -> None:
+    """Module-level so the spawn start method can pickle a reference to it (a closure or a method
+    cannot be)."""
+    with open(marker_path, "w") as f:
+        f.write("ran")
+
+
+class TestSpawnProcessFactory(unittest.TestCase):
+    """F-19: job processes are forked from a multithreaded server today; a fork can copy another
+    thread's lock mid-hold and hang the child forever. These confirm the spawn context this repo
+    switches to actually works here, and that the real target/args are picklable for it."""
+
+    def test_spawn_started_process_actually_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "marker.txt")
+            process = multiprocessing.get_context("spawn").Process(target=_spawn_target, args=(marker,))
+            process.start()
+            process.join(timeout=60)
+            self.assertEqual(process.exitcode, 0)
+            with open(marker) as f:
+                self.assertEqual(f.read(), "ran")
+
+    def test_run_job_and_a_real_config_are_picklable(self):
+        from audiobook_generator.config.general_config import GeneralConfig
+        config = GeneralConfig(None)
+        config.input_file, config.output_folder, config.voice_name = "book.epub", "out", "Elena.wav"
+        config.chapter_selection = [1, 2, 3]
+        pickle.dumps(run_job)  # must be a plain module-level function
+        pickle.dumps(config)  # must hold only plain data: no open files, locks or threads
 
 
 if __name__ == "__main__":
