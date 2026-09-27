@@ -4,8 +4,9 @@ import logging
 import math
 import subprocess
 import tempfile
+import time
 import os
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 from pydub import AudioSegment
 from sentencex import segment
@@ -15,7 +16,7 @@ from mutagen.oggopus import OggOpus
 from mutagen.wave import WAVE
 from mutagen.id3._frames import TIT2, TPE1, TALB, TRCK, APIC
 
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, OpenAI
 
 from audiobook_generator.core.audio_tags import AudioTags
 from audiobook_generator.config.general_config import GeneralConfig
@@ -33,6 +34,24 @@ MAX_UNIT_CHARS = 400  # a trailing short sentence joins the previous unit only i
 # packing threshold, so one request never risks that cap either way.
 MAX_REQUEST_CHARS = 450
 _PYDUB_EXPORT = {"aac": ("adts", "aac"), "opus": ("opus", "libopus")}
+
+# F-02: after a restart the app can start before Chatterbox has finished loading its model
+# (observed ~12 s); the OpenAI SDK's own retries give up after ~7 s. RETRYABLE_STATUS_CODES are
+# the "temporarily unavailable" statuses worth waiting out; a plain APIConnectionError (including
+# a timeout) is also retried. Anything else -- 4xx in particular -- is the caller's problem.
+RETRYABLE_STATUS_CODES = (502, 503, 504)
+SERVER_WAIT_TOTAL_SECONDS = 600  # ~10 minutes total budget across all retries of one request
+SERVER_WAIT_INITIAL_DELAY_SECONDS = 2.0
+SERVER_WAIT_MAX_DELAY_SECONDS = 30.0
+
+
+def _is_server_unavailable(error: Exception) -> bool:
+    """True for a connection failure or a 502/503/504: the server is down or still starting up
+    and the request is worth retrying. False for everything else (4xx, a plain 500, ...): those
+    are the caller's problem and must not be retried."""
+    if isinstance(error, APIConnectionError):
+        return True
+    return isinstance(error, APIStatusError) and error.status_code in RETRYABLE_STATUS_CODES
 
 
 def _is_speakable(unit: str) -> bool:
@@ -251,6 +270,37 @@ class OpenAITTSProvider(BaseTTSProvider):
         return any(isinstance(value, (int, float)) and not isinstance(value, bool)
                    for value in (self.config.sentence_pause_ms, self.config.paragraph_pause_ms))
 
+    def _create_speech(self, *, sleep: Callable[[float], None] = time.sleep,
+                        clock: Callable[[], float] = time.monotonic, **kwargs):
+        """Call the TTS endpoint, tolerating Chatterbox being temporarily unavailable (F-02).
+
+        The SDK's own retries (max_retries=4) give up after ~7 s; after a restart the server can
+        take longer than that to finish loading its model, which would otherwise fail a resumed
+        book's first chapters every time. On a connection error or 502/503/504 this waits with
+        backoff for up to SERVER_WAIT_TOTAL_SECONDS in total before giving up. A 4xx (or any
+        other) error is the caller's problem and is never retried.
+
+        `sleep`/`clock` are injectable so a test can drive this without a real ~10 minute wait.
+        """
+        deadline = clock() + SERVER_WAIT_TOTAL_SECONDS
+        delay = SERVER_WAIT_INITIAL_DELAY_SECONDS
+        while True:
+            try:
+                return self.client.audio.speech.create(**kwargs)
+            except (APIConnectionError, APIStatusError) as e:
+                if not _is_server_unavailable(e):
+                    raise
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    logger.error(f"OpenAI: Chatterbox still unavailable after "
+                                 f"{SERVER_WAIT_TOTAL_SECONDS}s, giving up: {e}")
+                    raise
+                wait_for = min(delay, remaining)
+                logger.warning(f"OpenAI: waiting for Chatterbox to become available, "
+                                f"retrying in {wait_for:.1f}s: {e}")
+                sleep(wait_for)
+                delay = min(delay * 2, SERVER_WAIT_MAX_DELAY_SECONDS)
+
     def text_to_speech(self, text: str, output_file: str, audio_tags: AudioTags):
         if self.pacing_enabled():
             self._paced_text_to_speech(text, output_file, audio_tags)
@@ -275,8 +325,9 @@ class OpenAITTSProvider(BaseTTSProvider):
                 f"Processing {chunk_id}, length={len(chunk)}, text=[{chunk}]"
             )
 
-            # NO retry for OpenAI TTS because SDK has built-in retry logic
-            response = self.client.audio.speech.create(
+            # The SDK already retries a transient error within ~7s (max_retries=4);
+            # _create_speech adds a much longer wait for the server still starting up (F-02).
+            response = self._create_speech(
                 model=self.config.model_name,
                 voice=self.config.voice_name,
                 speed=self.config.speed,
@@ -324,7 +375,7 @@ class OpenAITTSProvider(BaseTTSProvider):
             chunk_id = f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{number}_of_{len(units)}"
             logger.info(f"Processing {chunk_id}, length={len(unit)}")
             logger.debug(f"Processing {chunk_id}, length={len(unit)}, text=[{unit}]")
-            response = self.client.audio.speech.create(
+            response = self._create_speech(
                 model=self.config.model_name,
                 voice=self.config.voice_name,
                 speed=1.0,
