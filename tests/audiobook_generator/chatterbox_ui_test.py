@@ -145,48 +145,138 @@ class TestBuildConfig(unittest.TestCase):
 
     def test_config_targets_chatterbox_with_one_worker(self):
         config = chatterbox_ui.build_config(
-            "/tmp/book.epub", "audiobook_output/Book", "Elena.wav", 1.0, 3.0, -1.0, True, False,
-            "auto", "double", False, False, None, "INFO", preview=False)
+            "/tmp/book.epub", "audiobook_output/Book", "Elena.wav", 1.0, [3, 4], True, False,
+            "auto", "double", False, False, None, "INFO")
         self.assertEqual((config.tts, config.output_format, config.worker_count), ("openai", "mp3", 1))
         self.assertEqual((config.voice_name, config.speed), ("Elena.wav", 1.0))
-        self.assertEqual((config.chapter_start, config.chapter_end), (3, -1))
+        self.assertEqual((config.chapter_start, config.chapter_end, config.chapter_selection), (1, -1, [3, 4]))
         self.assertIsNone(config.instructions)
         self.assertTrue(config.skip_existing)
+        self.assertFalse(config.preview)
 
-    SETTINGS = ("out", "Elena.wav", 1.0, 1, -1, False, False, "auto", "double", False, False, None, "INFO")
+
+TABLE = [[1, False, "Title page", "Title", "under 1 min"], [2, True, "One", "It was", "26 min"],
+         [3, True, "Two", "It was", "25 min"]]
+SETTINGS = ("out", "Elena.wav", 1.0, False, False, "auto", "double", False, False, None, "INFO")
+
+
+class TestStartGeneration(unittest.TestCase):
+
+    def _start(self, library_book, input_file, table=TABLE):
+        with patch.object(web_ui, "running_process", None), patch("os.path.isfile", return_value=True), \
+                patch.object(web_ui, "launch_audiobook_generator") as launch, patch.object(gr, "Info"):
+            chatterbox_ui.start_generation(library_book, input_file, table, *SETTINGS)
+        return launch.call_args[0][0]
+
+    def test_ticked_chapters_are_sent(self):
+        self.assertEqual(self._start("/library/book.epub", None).chapter_selection, [2, 3])
+
+    def test_dataframe_table_is_read(self):
+        import pandas as pd
+        table = pd.DataFrame(TABLE, columns=chatterbox_ui.CHAPTER_COLUMNS)
+        self.assertEqual(self._start("/library/book.epub", None, table).chapter_selection, [2, 3])
+
+    def test_library_pick_is_used_over_upload(self):
+        self.assertEqual(self._start("/library/picked.epub", "/tmp/uploaded.epub").input_file, "/library/picked.epub")
+
+    def test_upload_used_when_nothing_picked(self):
+        self.assertEqual(self._start(None, "/tmp/uploaded.epub").input_file, "/tmp/uploaded.epub")
+
+    def test_nothing_ticked_is_an_error(self):
+        table = [[1, False, "A", "", ""], [2, False, "B", "", ""]]
+        with self.assertRaises(gr.Error):
+            self._start("/library/book.epub", None, table)
 
     def test_start_refuses_while_a_book_is_running(self):
         running = MagicMock()
         running.is_alive.return_value = True
-        with patch.object(web_ui, "running_process", running), \
+        with patch.object(web_ui, "running_process", running), patch("os.path.isfile", return_value=True), \
                 patch.object(web_ui, "launch_audiobook_generator") as launch:
             with self.assertRaises(gr.Error):
-                chatterbox_ui.start_generation("/library/book.epub", None, *self.SETTINGS)
+                chatterbox_ui.start_generation("/library/book.epub", None, TABLE, *SETTINGS)
         launch.assert_not_called()
-
-    def test_library_pick_is_used_over_upload(self):
-        with patch.object(web_ui, "running_process", None), patch("os.path.isfile", return_value=True), \
-                patch.object(web_ui, "launch_audiobook_generator") as launch, patch.object(gr, "Info"):
-            chatterbox_ui.start_generation("/library/picked.epub", "/tmp/uploaded.epub", *self.SETTINGS)
-        self.assertEqual(launch.call_args[0][0].input_file, "/library/picked.epub")
 
     def test_typed_text_that_is_not_a_book_is_an_error(self):
-        with patch.object(web_ui, "running_process", None), \
-                patch.object(web_ui, "launch_audiobook_generator") as launch:
+        with patch.object(web_ui, "launch_audiobook_generator") as launch:
             with self.assertRaises(gr.Error):
-                chatterbox_ui.start_generation("detour", None, *self.SETTINGS)
+                chatterbox_ui.start_generation("detour", None, TABLE, *SETTINGS)
         launch.assert_not_called()
-
-    def test_upload_used_when_nothing_picked(self):
-        with patch.object(web_ui, "running_process", None), \
-                patch.object(web_ui, "launch_audiobook_generator") as launch, patch.object(gr, "Info"):
-            chatterbox_ui.preview_chapters(None, "/tmp/uploaded.epub", *self.SETTINGS)
-        config = launch.call_args[0][0]
-        self.assertEqual((config.input_file, config.preview), ("/tmp/uploaded.epub", True))
 
     def test_no_book_is_an_error(self):
         with self.assertRaises(gr.Error):
-            chatterbox_ui.start_generation(None, None, *self.SETTINGS)
+            chatterbox_ui.start_generation(None, None, TABLE, *SETTINGS)
+
+
+class TestChapterList(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.book = os.path.join(self.tmp.name, "collection.epub")
+        _write_collection_epub(self.book)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_front_matter_is_unticked_and_story_ticked(self):
+        table, lengths, summary = chatterbox_ui.chapter_overview(
+            self.book, None, 1.0, "auto", "double", False, False, None)
+        rows = table["value"]
+        self.assertEqual([row[1] for row in rows], [False, False, True, True])
+        self.assertEqual(len(lengths), 4)
+        self.assertIn("2 of 4 chapters", summary)
+        self.assertIn("numbered 1–2", summary)
+
+    def test_no_book_hides_the_table(self):
+        table, lengths, summary = chatterbox_ui.chapter_overview(None, None, 1.0, "auto", "double", False, False, None)
+        self.assertFalse(table["visible"])
+        self.assertEqual((lengths, summary), ([], ""))
+
+    def test_summary_follows_ticks_and_speed(self):
+        lengths = [20, 30300, 30300]  # 30,300 chars = 25 min at 1.0x
+        rows = [[1, False, "T", "", ""], [2, True, "A", "", ""], [3, True, "B", "", ""]]
+        self.assertIn("50 min", chatterbox_ui.chapter_summary(rows, lengths, 1.0))
+        self.assertIn("40 min", chatterbox_ui.chapter_summary(rows, lengths, 1.25))
+        rows[2][1] = False
+        self.assertIn("1 of 3 chapters", chatterbox_ui.chapter_summary(rows, lengths, 1.0))
+
+    def test_speed_change_retimes_but_keeps_ticks(self):
+        rows = [[1, False, "T", "", "x"], [2, True, "A", "", "x"]]
+        updated = chatterbox_ui.retime_chapters(rows, [20, 30300], 2.0)["value"]
+        self.assertEqual([row[1] for row in updated], [False, True])
+        self.assertEqual(updated[1][4], "12 min")
+
+    def test_tick_all(self):
+        rows = [[1, False, "T", "", ""], [2, True, "A", "", ""]]
+        self.assertEqual([row[1] for row in chatterbox_ui.tick_all_chapters(rows)["value"]], [True, True])
+
+
+def _write_collection_epub(path: str) -> None:
+    import zipfile
+    story = "<p>" + "It was a dark and stormy night. " * 150 + "</p>"
+    docs = {
+        "title": "<h1>Story Collection 2</h1>",
+        "blurb": "<p>Five Book Story Collection by A. N. Author</p>",
+        "c1": "<h1>The First Story</h1>" + story,
+        "c2": "<h1>The Second Story</h1>" + story,
+    }
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr("META-INF/container.xml",
+                   '<?xml version="1.0"?><container version="1.0" '
+                   'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+                   '<rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>'
+                   '</rootfiles></container>')
+        manifest = "".join(f'<item id="{k}" href="{k}.xhtml" media-type="application/xhtml+xml"/>' for k in docs)
+        spine = "".join(f'<itemref idref="{k}"/>' for k in docs)
+        z.writestr("content.opf",
+                   '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" '
+                   'unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+                   '<dc:identifier id="id">t</dc:identifier><dc:title>Story Collection 2</dc:title>'
+                   f'<dc:language>en</dc:language></metadata><manifest>{manifest}</manifest>'
+                   f'<spine>{spine}</spine></package>')
+        for key, body in docs.items():
+            z.writestr(f"{key}.xhtml", '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml">'
+                                       f'<body>{body}</body></html>')
 
 
 class TestBookSelection(unittest.TestCase):

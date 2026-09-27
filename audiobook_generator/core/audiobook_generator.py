@@ -180,10 +180,23 @@ class AudiobookGenerator:
                 f"Converting chapters from {self.config.chapter_start} to {self.config.chapter_end}."
             )
 
-            # Initialize total_characters to 0
-            total_characters = get_total_chars(
-                chapters[self.config.chapter_start - 1 : self.config.chapter_end]
-            )
+            # Prepare chapters for processing. Tasks carry only per-chapter data; book
+            # metadata travels on self (resolved once above) rather than passing the
+            # whole book_parser, which would re-pickle the parsed EPUB per chapter.
+            chapters_to_process = chapters[self.config.chapter_start - 1 : self.config.chapter_end]
+            numbered = list(enumerate(chapters_to_process, start=self.config.chapter_start))
+            if self.config.chapter_selection:
+                selected = {int(number) for number in self.config.chapter_selection}
+                numbered = [(idx, chapter) for idx, chapter in numbered if idx in selected]
+                logger.info(f"Selected chapters: {[idx for idx, _ in numbered]}")
+                # Number the output 1..n so the finished audiobook's files and tracks have no gaps.
+                numbered = list(enumerate((chapter for _, chapter in numbered), start=1))
+                if not numbered:
+                    raise ValueError("None of the selected chapters exist in this book.")
+            tasks = [(idx, title, text) for idx, (title, text) in numbered]
+            titles_by_idx = {idx: title for idx, title, _ in tasks}
+
+            total_characters = get_total_chars([(title, text) for _, title, text in tasks])
             logger.info(f"Total characters in selected book chapters: {total_characters}")
             rough_price = tts_provider.estimate_cost(total_characters)
             logger.info(f"Estimate book voiceover would cost you roughly: ${rough_price:.2f}\n")
@@ -195,17 +208,6 @@ class AudiobookGenerator:
                 logger.info("Skipping prompt as in preview mode")
             else:
                 confirm_conversion()
-
-            # Prepare chapters for processing. Tasks carry only per-chapter data; book
-            # metadata travels on self (resolved once above) rather than passing the
-            # whole book_parser, which would re-pickle the parsed EPUB per chapter.
-            chapters_to_process = chapters[self.config.chapter_start - 1 : self.config.chapter_end]
-            tasks = [
-                (idx, title, text)
-                for idx, (title, text) in enumerate(
-                    chapters_to_process, start=self.config.chapter_start
-                )
-            ]
 
             # Track failed chapters
             failed_chapters = []
@@ -222,8 +224,7 @@ class AudiobookGenerator:
                 # Check for failed chapters
                 for idx, success in results:
                     if not success:
-                        chapter_title = chapters_to_process[idx - self.config.chapter_start][0]
-                        failed_chapters.append((idx, chapter_title))
+                        failed_chapters.append((idx, titles_by_idx[idx]))
 
             if failed_chapters:
                 logger.warning("The following chapters failed to convert:")

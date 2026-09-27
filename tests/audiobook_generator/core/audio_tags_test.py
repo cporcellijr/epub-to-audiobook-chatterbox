@@ -100,6 +100,7 @@ class TestAudiobookGeneratorCoverSaving(unittest.TestCase):
         config.output_folder = output_folder
         config.chapter_start = 1
         config.chapter_end = -1
+        config.chapter_selection = None
         config.no_prompt = True
         # Real run (the cover is only written outside preview; audiobook_generator_preview_test covers
         # preview). Chapter processing then fails on pickling the MagicMock config in the worker

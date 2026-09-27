@@ -17,6 +17,8 @@ class GeneralConfig:
         self.newline_mode = getattr(args, 'newline_mode', None)
         self.chapter_start = getattr(args, 'chapter_start', None)
         self.chapter_end = getattr(args, 'chapter_end', None)
+        # Optional list of 1-based chapter numbers to narrate (within start/end); output is renumbered 1..n
+        self.chapter_selection = getattr(args, 'chapter_selection', None)
         self.remove_endnotes = getattr(args, 'remove_endnotes', None)
         self.remove_reference_numbers = getattr(args, 'remove_reference_numbers', None)
         self.search_and_replace_file = getattr(args, 'search_and_replace_file', None)

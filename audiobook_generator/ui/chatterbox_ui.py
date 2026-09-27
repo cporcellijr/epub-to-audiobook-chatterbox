@@ -24,7 +24,9 @@ import gradio as gr
 import yaml
 from gradio_log import Log
 
+from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
+from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.ui import library_index, web_ui
 from audiobook_generator.ui.web_ui import (
     OUTPUT_ROOT,
@@ -199,15 +201,15 @@ def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bo
 
 # ---- Audiobook generation ----
 
-def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_start, chapter_end,
+def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_selection: list,
                  skip_existing: bool, output_text: bool, title_mode: str, newline_mode: str,
                  remove_endnotes: bool, remove_reference_numbers: bool, search_and_replace_file,
-                 log_level: str, preview: bool) -> GeneralConfig:
+                 log_level: str) -> GeneralConfig:
     """GeneralConfig for the OpenAI provider pointed at Chatterbox."""
     config = GeneralConfig(None)
     config.input_file = input_file.name if hasattr(input_file, "name") else input_file
     config.output_folder = output_dir
-    config.preview = preview
+    config.preview = False
     config.output_text = output_text
     config.skip_existing = skip_existing
     config.log = log_level
@@ -215,8 +217,9 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     config.no_prompt = True
     config.title_mode = title_mode
     config.newline_mode = newline_mode
-    config.chapter_start = int(chapter_start or 1)
-    config.chapter_end = int(chapter_end if chapter_end not in (None, 0) else -1)
+    config.chapter_start = 1
+    config.chapter_end = -1
+    config.chapter_selection = list(chapter_selection)
     config.remove_endnotes = remove_endnotes
     config.remove_reference_numbers = remove_reference_numbers
     config.search_and_replace_file = (search_and_replace_file.name if hasattr(search_and_replace_file, "name")
@@ -230,24 +233,131 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     return config
 
 
-def _start(preview: bool, library_book, input_file, *settings) -> None:
+def _table_rows(table) -> list:
+    """Rows of the chapter table, whether Gradio hands over a DataFrame, a dict or a list."""
+    if table is None:
+        return []
+    if hasattr(table, "values") and hasattr(table, "columns"):
+        return table.values.tolist()
+    if isinstance(table, dict):
+        return [list(row) for row in table.get("data", [])]
+    return [list(row) for row in table]
+
+
+def selected_chapter_numbers(table) -> list:
+    return [int(row[0]) for row in _table_rows(table) if row and bool(row[1])]
+
+
+def start_generation(library_book, input_file, chapter_table, output_dir: str, voice: str, speed: float,
+                     *settings) -> None:
     book = library_book or input_file
     if not book:
         raise gr.Error("Pick a book from the library or upload an EPUB first.")
     if library_book and not os.path.isfile(library_book):
         raise gr.Error("Pick the book from the list as you type (or clear the box to use an upload).")
+    selection = selected_chapter_numbers(chapter_table)
+    if not selection:
+        raise gr.Error("Tick at least one chapter.")
     if web_ui.running_process is not None and web_ui.running_process.is_alive():
         raise gr.Error("A book is already being generated. Stop it first or wait for it to finish.")
-    web_ui.launch_audiobook_generator(build_config(book, *settings, preview=preview))
-    gr.Info("Previewing chapters (no audio)..." if preview else "Generating audiobook...")
+    web_ui.launch_audiobook_generator(build_config(book, output_dir, voice, speed, selection, *settings))
+    gr.Info(f"Generating {len(selection)} chapters...")
 
 
-def start_generation(library_book, input_file, *settings) -> None:
-    _start(False, library_book, input_file, *settings)
+# ---- Chapter list ----
+
+# Measured on a finished book (Elena, speed 1.0): 20.2 characters of text per second of audio,
+# generated at ~1.8x real time. Other voices read at somewhat different paces.
+CHARS_PER_AUDIO_SECOND = 20.2
+GENERATION_SPEED = 1.8
+CHAPTER_COLUMNS = ["#", "Include", "Chapter", "Starts with", "Listening"]
 
 
-def preview_chapters(library_book, input_file, *settings) -> None:
-    _start(True, library_book, input_file, *settings)
+def _duration(seconds: float) -> str:
+    minutes = round(seconds / 60)
+    if seconds < 60:
+        return "under 1 min"
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60} min"
+
+
+def _listening(characters: int, speed) -> str:
+    return _duration(characters / CHARS_PER_AUDIO_SECOND / float(speed or 1.0))
+
+
+def book_chapters(book: str, title_mode: str, newline_mode: str, remove_endnotes: bool,
+                  remove_reference_numbers: bool, search_and_replace_file) -> list:
+    """(title, text) for each chapter, numbered exactly as the generator will number them."""
+    config = GeneralConfig(None)
+    config.input_file = book
+    config.title_mode = title_mode
+    config.newline_mode = newline_mode
+    config.remove_endnotes = remove_endnotes
+    config.remove_reference_numbers = remove_reference_numbers
+    config.search_and_replace_file = (search_and_replace_file.name if hasattr(search_and_replace_file, "name")
+                                      else search_and_replace_file)
+    chapters = get_book_parser(config).get_chapters(" ")
+    return [(title, text) for title, text in chapters if text.strip()]  # same filter as the generator
+
+
+def chapter_summary(table, chapter_lengths: list, speed) -> str:
+    """One-line summary of the ticked chapters."""
+    rows = _table_rows(table)
+    if not rows:
+        return ""
+    picked = selected_chapter_numbers(rows)
+    if not picked:
+        return "⚠️ No chapters ticked."
+    speed = float(speed or 1.0)
+    lengths = chapter_lengths or []
+    characters = sum(lengths[n - 1] for n in picked if 0 < n <= len(lengths))
+    audio_seconds = characters / CHARS_PER_AUDIO_SECOND
+    skipped = len(rows) - len(picked)
+    unticked = f" ({skipped} unticked)" if skipped else ""
+    return (f"**{len(picked)} of {len(rows)} chapters** ticked{unticked} · about "
+            f"**{_duration(audio_seconds / speed)}** of audio at {speed:g}× · roughly "
+            f"{_duration(audio_seconds / GENERATION_SPEED)} to generate. "
+            f"They'll be numbered 1–{len(picked)} in the finished book.")
+
+
+def chapter_overview(library_book, input_file, speed, title_mode: str, newline_mode: str,
+                     remove_endnotes: bool, remove_reference_numbers: bool, search_and_replace_file) -> tuple:
+    """Chapter table with story chapters pre-ticked and front/back matter unticked."""
+    book = library_book if library_book and os.path.isfile(library_book) else input_file
+    if not book:
+        return gr.update(value=None, visible=False), [], ""
+    book = book.name if hasattr(book, "name") else book
+    try:
+        chapters = book_chapters(book, title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
+                                 search_and_replace_file)
+    except Exception as e:
+        return gr.update(value=None, visible=False), [], f"Could not read chapters from this book: {e}"
+    if not chapters:
+        return gr.update(value=None, visible=False), [], "No chapters with text found in this book."
+    include = preselect_chapters(chapters)
+    lengths = [len(text) for _, text in chapters]
+    rows = [[number, ticked, title.replace("_", " "), " ".join(text.split())[:70], _listening(len(text), speed)]
+            for number, ((title, text), ticked) in enumerate(zip(chapters, include), start=1)]
+    return gr.update(value=rows, visible=True), lengths, chapter_summary(rows, lengths, speed)
+
+
+def retime_chapters(table, chapter_lengths: list, speed) -> dict:
+    """Speed changed: update the Listening column, keeping the ticks."""
+    rows = _table_rows(table)
+    lengths = chapter_lengths or []
+    for row in rows:
+        number = int(row[0])
+        if 0 < number <= len(lengths):
+            row[4] = _listening(lengths[number - 1], speed)
+    return gr.update(value=rows) if rows else gr.update()
+
+
+def tick_all_chapters(table) -> dict:
+    rows = _table_rows(table)
+    for row in rows:
+        row[1] = True
+    return gr.update(value=rows) if rows else gr.update()
 
 
 def library_output_dir(library_book: Optional[str]) -> dict:
@@ -300,10 +410,15 @@ def build_ui() -> gr.Blocks:
                     voice = gr.Dropdown(choices, value=default_voice, label="Voice", allow_custom_value=True)
                     speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed",
                                       info="1.0 recommended (other speeds are stretched after generation).")
+            chapters_info = gr.Markdown()
+            chapter_table = gr.Dataframe(headers=CHAPTER_COLUMNS, datatype=["number", "bool", "str", "str", "str"],
+                                         interactive=True, static_columns=[0, 2, 3, 4], wrap=True, visible=False,
+                                         label="Chapters: untick anything you don't want narrated",
+                                         column_widths=["6%", "9%", "30%", "40%", "15%"], max_height=520)
+            chapter_lengths = gr.State([])
             with gr.Row(equal_height=True):
-                chapter_start = gr.Number(1, precision=0, minimum=1, label="Start at chapter")
-                chapter_end = gr.Number(-1, precision=0, minimum=-1, label="End at chapter",
-                                        info="-1 = through the last chapter")
+                tick_all_button = gr.Button("Tick all", size="sm")
+                auto_tick_button = gr.Button("Auto-select (skip front/back matter)", size="sm")
                 skip_existing = gr.Checkbox(False, label="Skip chapters already made",
                                             info="Resume an interrupted book in the same folder.")
             with gr.Accordion("Advanced", open=False):
@@ -319,7 +434,6 @@ def build_ui() -> gr.Blocks:
                 search_and_replace_file = gr.File(label="Search & replace file (optional, e.g. fix pronunciations)",
                                                   file_types=[".txt"], file_count="single")
             with gr.Row():
-                preview_button = gr.Button("Preview chapters")
                 start_button = gr.Button("Start", variant="primary")
                 stop_button = gr.Button("Stop", variant="stop")
             web_ui.webui_log_file = generate_unique_log_path("EtA_WebUI")
@@ -360,14 +474,26 @@ def build_ui() -> gr.Blocks:
                     add_button = gr.Button("Add voice")
             add_status = gr.Markdown()
 
-        settings = [output_dir, voice, speed, chapter_start, chapter_end, skip_existing, output_text,
-                    title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
-                    search_and_replace_file, log_level]
+        settings = [output_dir, voice, speed, skip_existing, output_text, title_mode, newline_mode,
+                    remove_endnotes, remove_reference_numbers, search_and_replace_file, log_level]
         library_book.change(library_output_dir, inputs=library_book, outputs=output_dir)
         input_file.change(uploaded_book_selected, inputs=input_file, outputs=[output_dir, library_book])
-        start_button.click(start_generation, inputs=[library_book, input_file, *settings], outputs=None)
-        preview_button.click(preview_chapters, inputs=[library_book, input_file, *settings], outputs=None)
+        start_button.click(start_generation, inputs=[library_book, input_file, chapter_table, *settings],
+                           outputs=None)
         stop_button.click(stop_generation, inputs=None, outputs=None)
+
+        # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
+        # this re-runs the auto-selection. Ticks, speed and "Tick all" only touch the table.
+        overview_inputs = [library_book, input_file, speed, title_mode, newline_mode, remove_endnotes,
+                           remove_reference_numbers, search_and_replace_file]
+        overview_outputs = [chapter_table, chapter_lengths, chapters_info]
+        for trigger in (library_book, input_file, title_mode, newline_mode, remove_endnotes,
+                        remove_reference_numbers, search_and_replace_file):
+            trigger.change(chapter_overview, inputs=overview_inputs, outputs=overview_outputs)
+        auto_tick_button.click(chapter_overview, inputs=overview_inputs, outputs=overview_outputs)
+        tick_all_button.click(tick_all_chapters, inputs=chapter_table, outputs=chapter_table)
+        speed.change(retime_chapters, inputs=[chapter_table, chapter_lengths, speed], outputs=chapter_table)
+        chapter_table.change(chapter_summary, inputs=[chapter_table, chapter_lengths, speed], outputs=chapters_info)
 
         voice.input(lambda v: v, inputs=voice, outputs=lab_voice)
         lab_voice.input(lambda v: v, inputs=lab_voice, outputs=voice)
