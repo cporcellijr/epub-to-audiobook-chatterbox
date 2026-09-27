@@ -22,6 +22,9 @@ from audiobook_generator.tts_providers.openai_tts_provider import (
     PARAGRAPH_MARK,
     OpenAITTSProvider,
     paced_units,
+    paragraph_mode_units,
+    _silence_runs,
+    _stretch_sentence_gaps,
 )
 
 UNIT_MS = 1000
@@ -30,6 +33,20 @@ UNIT_MS = 1000
 def _wav_bytes(ms: int = UNIT_MS) -> bytes:
     buffer = io.BytesIO()
     Sine(300).to_audio_segment(duration=ms).set_frame_rate(24000).set_channels(1).export(buffer, format="wav")
+    return buffer.getvalue()
+
+
+def _tone(ms: int) -> AudioSegment:
+    return Sine(300).to_audio_segment(duration=ms).set_frame_rate(24000).set_channels(1)
+
+
+def _silence(ms: int) -> AudioSegment:
+    return AudioSegment.silent(duration=ms, frame_rate=24000).set_channels(1)
+
+
+def _wav_from_segment(segment: AudioSegment) -> bytes:
+    buffer = io.BytesIO()
+    segment.export(buffer, format="wav")
     return buffer.getvalue()
 
 
@@ -116,6 +133,88 @@ class TestPacedUnits(unittest.TestCase):
         self.assertEqual(spoken, ["Yes.", "No, she said."])
 
 
+class TestParagraphModeUnits(unittest.TestCase):
+    """F-05: paragraph_mode_units packs a whole paragraph into one request when it fits."""
+
+    def test_whole_paragraph_becomes_one_unit_with_a_sentence_count(self):
+        text = (f"One sentence here. Two sentences now. Three now.{PARAGRAPH_MARK}"
+                f"A second paragraph line.")
+        self.assertEqual(paragraph_mode_units(text, "en"), [
+            (0, "One sentence here. Two sentences now. Three now.", 3, False),
+            (1, "A second paragraph line.", 1, False),
+        ])
+
+    def test_long_paragraph_is_split_at_sentence_boundaries_not_mid_sentence(self):
+        sentence = "This is one sentence of a certain moderate length that repeats."
+        text = " ".join([sentence] * 8)
+        self.assertGreater(len(text), 450)
+
+        units = paragraph_mode_units(text, "en")
+
+        self.assertGreater(len(units), 1)
+        for _, unit, _, _ in units:
+            self.assertLessEqual(len(unit), 450)
+            self.assertTrue(unit.endswith("repeats."), "must cut between sentences, not inside one")
+
+    def test_oversized_single_sentence_is_split_like_sentence_mode(self):
+        # Same F-07 shape as paced_units: sentencex won't split this, so it must still be
+        # broken up so no single request nears the server's token cap.
+        clause = "the quiet valley held its breath under a pale and heavy sky"
+        text = ", ".join([clause] * 14) + "."
+        self.assertGreater(len(text), 800)
+
+        units = paragraph_mode_units(text, "en")
+
+        self.assertGreater(len(units), 1)
+        for _, unit, sentence_count, _ in units:
+            self.assertLessEqual(len(unit), 450)
+            self.assertEqual(sentence_count, 1)  # no internal gap to detect in a mid-sentence cut
+        self.assertFalse(units[0][3])
+        self.assertTrue(all(continues for _, _, _, continues in units[1:]))
+
+    def test_scene_break_paragraphs_are_dropped(self):
+        text = f"Real line here.{PARAGRAPH_MARK}* * *{PARAGRAPH_MARK}Another real line."
+        units = paragraph_mode_units(text, "en")
+        spoken = [unit for _, unit, _, _ in units]
+        self.assertEqual(spoken, ["Real line here.", "Another real line."])
+
+
+class TestGapDetection(unittest.TestCase):
+    """F-05: find the model's own inter-sentence gaps in one multi-sentence response and
+    stretch them to the configured sentence pause."""
+
+    def _three_sentence_clip(self) -> AudioSegment:
+        # 3 "sentences" of tone separated by two uneven, short "natural" gaps (300 ms, 80 ms).
+        return _tone(500) + _silence(300) + _tone(500) + _silence(80) + _tone(500)
+
+    def test_silence_runs_finds_both_internal_gaps(self):
+        runs = _silence_runs(self._three_sentence_clip())
+        self.assertEqual(len(runs), 2)
+        (s1, e1), (s2, e2) = runs
+        self.assertAlmostEqual(e1 - s1, 300, delta=20)
+        self.assertAlmostEqual(e2 - s2, 80, delta=20)
+
+    def test_leading_and_trailing_silence_is_not_a_gap(self):
+        clip = _silence(200) + self._three_sentence_clip() + _silence(200)
+        runs = _silence_runs(clip)
+        self.assertEqual(len(runs), 2, "the added leading/trailing silence must not be picked")
+
+    def test_stretch_sets_the_chosen_gaps_to_exactly_the_target_length(self):
+        stretched = _stretch_sentence_gaps(self._three_sentence_clip(), gap_count=2, target_ms=200)
+        self.assertAlmostEqual(len(stretched), 500 * 3 + 200 * 2, delta=30)
+
+    def test_stretch_picks_the_longest_gaps_first_and_leaves_the_rest(self):
+        # Only 1 gap requested (as for a 2-sentence unit): the longer 300 ms gap must be the one
+        # replaced; the shorter 80 ms gap is left alone.
+        stretched = _stretch_sentence_gaps(self._three_sentence_clip(), gap_count=1, target_ms=200)
+        self.assertAlmostEqual(len(stretched), 500 * 3 + 200 + 80, delta=30)
+
+    def test_zero_gap_count_or_target_is_a_no_op(self):
+        clip = self._three_sentence_clip()
+        self.assertEqual(len(_stretch_sentence_gaps(clip, 0, 200)), len(clip))
+        self.assertEqual(len(_stretch_sentence_gaps(clip, 2, 0)), len(clip))
+
+
 class TestPacedSpeech(unittest.TestCase):
 
     def _provider(self, sentence_ms, paragraph_ms, speed=1.0):
@@ -172,6 +271,66 @@ class TestPacedSpeech(unittest.TestCase):
         spoken = " ".join(c.kwargs["input"] for c in provider.client.audio.speech.create.call_args_list)
         self.assertNotIn(PARAGRAPH_MARK, spoken)
         self.assertIn("village. The road", spoken)
+
+
+class TestParagraphModeSpeech(unittest.TestCase):
+    """F-05: opt-in paced_unit_mode="paragraph" cuts the request count; default is unchanged."""
+
+    # Each sentence is long enough on its own (>= MIN_UNIT_CHARS) that sentence mode keeps them
+    # as 3 separate requests, so the comparison against paragraph mode's 1 request is clean.
+    THREE_SENTENCES = ("The lantern swung gently on its rusted iron hook by the door. "
+                        "A cold draft slipped in beneath the warped floorboards. "
+                        "Somewhere upstairs a single floorboard creaked twice.")
+
+    def _provider(self, sentence_ms, paragraph_ms, mode=None):
+        config = GeneralConfig(SimpleNamespace(
+            tts="openai", model_name="chatterbox", voice_name="Elena.wav", output_format="mp3", speed=1.0,
+            instructions=None, language="en", sentence_pause_ms=sentence_ms, paragraph_pause_ms=paragraph_ms,
+            paced_unit_mode=mode))
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}):
+            provider = OpenAITTSProvider(config)
+        provider.client = MagicMock()
+        return provider
+
+    def _speak(self, provider, text):
+        tags = SimpleNamespace(title="Ch", author="A", book_title="B", idx=1, cover=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.mp3")
+            with patch("audiobook_generator.tts_providers.openai_tts_provider.set_audio_tags"):
+                provider.text_to_speech(text, path, tags)
+            return len(AudioSegment.from_file(path))
+
+    def test_default_paced_unit_mode_is_sentence(self):
+        provider = self._provider(400, 1000, mode=None)
+        self.assertEqual(provider.config.paced_unit_mode, "sentence")
+
+    def test_paragraph_mode_sends_one_request_for_a_whole_paragraph(self):
+        provider = self._provider(400, 1000, mode="paragraph")
+        provider.client.audio.speech.create.return_value = SimpleNamespace(
+            content=_wav_from_segment(_tone(300) + _silence(150) + _tone(300) + _silence(150) + _tone(300)))
+        self._speak(provider, self.THREE_SENTENCES)
+        self.assertEqual(provider.client.audio.speech.create.call_count, 1)
+
+    def test_paragraph_mode_uses_fewer_requests_than_sentence_mode_for_the_same_text(self):
+        sentence_provider = self._provider(400, 1000, mode="sentence")
+        sentence_provider.client.audio.speech.create.return_value = SimpleNamespace(content=_wav_bytes())
+        paragraph_provider = self._provider(400, 1000, mode="paragraph")
+        paragraph_provider.client.audio.speech.create.return_value = SimpleNamespace(
+            content=_wav_from_segment(_tone(300) + _silence(150) + _tone(300) + _silence(150) + _tone(300)))
+
+        self._speak(sentence_provider, self.THREE_SENTENCES)
+        self._speak(paragraph_provider, self.THREE_SENTENCES)
+
+        self.assertEqual(sentence_provider.client.audio.speech.create.call_count, 3)
+        self.assertEqual(paragraph_provider.client.audio.speech.create.call_count, 1)
+
+    def test_paragraph_mode_stretches_internal_gaps_to_the_configured_sentence_pause(self):
+        provider = self._provider(400, 1000, mode="paragraph")
+        provider.client.audio.speech.create.return_value = SimpleNamespace(
+            content=_wav_from_segment(_tone(300) + _silence(150) + _tone(300) + _silence(150) + _tone(300)))
+        duration = self._speak(provider, self.THREE_SENTENCES)
+        # 3 tones (300 ms) + the 2 natural 150 ms gaps stretched to the configured 400 ms.
+        self.assertAlmostEqual(duration, 3 * 300 + 2 * 400, delta=120)
 
 
 class TestLooseFileTagging(unittest.TestCase):

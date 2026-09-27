@@ -36,6 +36,10 @@ class GeneralConfig:
         # Paced narration: speak sentence-sized units and insert these pauses (ms); None = off
         self.sentence_pause_ms = getattr(args, 'sentence_pause_ms', None)
         self.paragraph_pause_ms = getattr(args, 'paragraph_pause_ms', None)
+        # Paced narration unit granularity: "sentence" (default) or "paragraph" (F-05: one
+        # request per paragraph, stretching the model's own inter-sentence gaps instead of one
+        # request per sentence)
+        self.paced_unit_mode = getattr(args, 'paced_unit_mode', None)
         # Merge finished chapters into one <title>.m4b (chapter markers, cover) instead of loose files
         self.output_m4b = getattr(args, 'output_m4b', None)
 

@@ -139,6 +139,95 @@ def paced_units(text: str, language: str) -> List[Tuple[int, str, bool]]:
     return units
 
 
+def paragraph_mode_units(text: str, language: str) -> List[Tuple[int, str, int, bool]]:
+    """(paragraph number, text, sentence_count, continues_previous) units for paragraph mode
+    (F-05): whole paragraphs are packed as one request each, splitting only at sentence
+    boundaries when a paragraph would otherwise exceed MAX_REQUEST_CHARS. sentence_count says
+    how many of the model's own inter-sentence gaps _stretch_sentence_gaps should look for and
+    stretch to sentence_pause_ms; it is 1 (no internal gap to find) for a single-sentence piece
+    and for every piece produced by splitting one oversized sentence (F-07), which are marked
+    continues_previous like in paced_units.
+    """
+    units: List[Tuple[int, str, int, bool]] = []
+    paragraphs = [" ".join(p.split()) for p in text.split(PARAGRAPH_MARK)]
+    for number, paragraph in enumerate(p for p in paragraphs if p):
+        sentences = [s for s in (str(raw).strip() for raw in segment(language, paragraph)) if s and _is_speakable(s)]
+        if not sentences:
+            continue
+
+        def flush(bin_sentences: List[str]) -> None:
+            if bin_sentences:
+                units.append((number, " ".join(bin_sentences), len(bin_sentences), False))
+
+        current_bin: List[str] = []
+        for sentence in sentences:
+            if len(sentence) > MAX_REQUEST_CHARS:
+                flush(current_bin)
+                current_bin = []
+                pieces = _split_oversized_unit(sentence)
+                units.append((number, pieces[0], 1, False))
+                units.extend((number, piece, 1, True) for piece in pieces[1:])
+                continue
+            candidate = current_bin + [sentence]
+            if current_bin and len(" ".join(candidate)) > MAX_REQUEST_CHARS:
+                flush(current_bin)
+                current_bin = [sentence]
+            else:
+                current_bin = candidate
+        flush(current_bin)
+    return units
+
+
+_GAP_FRAME_MS = 10
+_GAP_SILENCE_RATIO = 0.15  # a frame under 15% of the clip's peak RMS counts as silence
+
+
+def _silence_runs(audio: AudioSegment) -> List[Tuple[int, int]]:
+    """Contiguous (start_ms, end_ms) runs of low-RMS audio, in ~10 ms frames, excluding any run
+    touching the very start or end of the clip (there is no sentence boundary to mark there)."""
+    frame_count = len(audio) // _GAP_FRAME_MS
+    if frame_count < 3:
+        return []
+    frame_rms = [audio[i * _GAP_FRAME_MS:(i + 1) * _GAP_FRAME_MS].rms for i in range(frame_count)]
+    peak = max(frame_rms)
+    if peak == 0:
+        return []
+    threshold = peak * _GAP_SILENCE_RATIO
+    runs, start = [], None
+    for i, rms in enumerate(frame_rms):
+        if rms <= threshold:
+            if start is None:
+                start = i
+        elif start is not None:
+            runs.append((start, i))
+            start = None
+    if start is not None:
+        runs.append((start, frame_count))
+    return [(s * _GAP_FRAME_MS, e * _GAP_FRAME_MS) for s, e in runs if s > 0 and e < frame_count]
+
+
+def _stretch_sentence_gaps(audio: AudioSegment, gap_count: int, target_ms: int) -> AudioSegment:
+    """Find the model's own inter-sentence pauses inside one multi-sentence paced unit and
+    stretch the gap_count longest ones to target_ms (F-05).
+
+    This is what lets a whole paragraph go in one request while still getting deliberate,
+    configurable pauses between its sentences: the server places its own short, uneven gap at
+    each sentence boundary, and this replaces each with exactly target_ms of silence.
+    """
+    if gap_count <= 0 or target_ms <= 0:
+        return audio
+    runs = _silence_runs(audio)
+    if not runs:
+        return audio
+    chosen = sorted(runs, key=lambda r: r[1] - r[0], reverse=True)[:gap_count]
+    chosen.sort(key=lambda r: r[0], reverse=True)  # splice back-to-front so earlier offsets hold
+    silence = AudioSegment.silent(duration=target_ms, frame_rate=audio.frame_rate)
+    silence = silence.set_channels(audio.channels).set_sample_width(audio.sample_width)
+    for start, end in chosen:
+        audio = audio[:start] + silence + audio[end:]
+    return audio
+
+
 def get_openai_supported_output_formats():
     return ["mp3", "aac", "flac", "opus", "wav"]
 
@@ -257,6 +346,7 @@ class OpenAITTSProvider(BaseTTSProvider):
         config.speed = config.speed or 1.0
         config.instructions = config.instructions or None
         config.output_format = config.output_format or "mp3"
+        config.paced_unit_mode = config.paced_unit_mode or "sentence"
 
         self.price = get_price(config.model_name)
         super().__init__(config)
@@ -303,7 +393,10 @@ class OpenAITTSProvider(BaseTTSProvider):
 
     def text_to_speech(self, text: str, output_file: str, audio_tags: AudioTags):
         if self.pacing_enabled():
-            self._paced_text_to_speech(text, output_file, audio_tags)
+            if self.config.paced_unit_mode == "paragraph":
+                self._paced_text_to_speech_paragraph(text, output_file, audio_tags)
+            else:
+                self._paced_text_to_speech(text, output_file, audio_tags)
             return
         text = " ".join(text.replace(PARAGRAPH_MARK, " ").split())
         # Reason: The max num of input tokens is 2000 for gpt-4o-mini-tts https://platform.openai.com/docs/models/gpt-4o-mini-tts. One token is ~4 chars in English but ~1 word/char in Chinese.
@@ -400,6 +493,57 @@ class OpenAITTSProvider(BaseTTSProvider):
 
         self._combine_and_export(pieces, audio_format, speed, output_file, audio_tags)
 
+    def _paced_text_to_speech_paragraph(self, text: str, output_file: str, audio_tags: AudioTags) -> None:
+        """Paragraph-unit mode (F-05, opt-in: paced_unit_mode="paragraph").
+
+        One request per paragraph (or per packed group of sentences, when a paragraph would
+        otherwise exceed MAX_REQUEST_CHARS) instead of one request per sentence: about 330-420
+        requests per 30-minute chapter each pay a ~0.35 s fixed server cost regardless of how
+        short the text is. The model's own inter-sentence gaps inside a multi-sentence request
+        are found and stretched to sentence_pause_ms (_stretch_sentence_gaps); paragraph pauses
+        and the F-27 one-shot speed change work exactly as in sentence mode.
+        """
+        speed = float(self.config.speed or 1.0)
+        sentence_gap_ms = int(self.config.sentence_pause_ms or 0)
+        paragraph_gap_ms = int(self.config.paragraph_pause_ms or 0)
+        units = paragraph_mode_units(text, self.config.language or "en")
+        if not units:
+            raise ValueError("No speakable text in this chapter")
+
+        pieces: List[bytes] = []
+        audio_format = None
+        previous_paragraph = None
+        for number, (paragraph, unit, sentence_count, continues_previous) in enumerate(units, 1):
+            chunk_id = f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{number}_of_{len(units)}"
+            logger.info(f"Processing {chunk_id}, length={len(unit)}, sentences={sentence_count}")
+            logger.debug(f"Processing {chunk_id}, length={len(unit)}, text=[{unit}]")
+            response = self._create_speech(
+                model=self.config.model_name,
+                voice=self.config.voice_name,
+                speed=1.0,
+                instructions=self.config.instructions,
+                input=unit,
+                response_format="wav",
+            )
+            audio = AudioSegment.from_file(io.BytesIO(response.content), format="wav")
+            if sentence_count > 1 and sentence_gap_ms > 0:
+                audio = _stretch_sentence_gaps(audio, sentence_count - 1, sentence_gap_ms)
+            if audio_format is None:
+                audio_format = (audio.frame_rate, audio.channels, audio.sample_width)
+            else:
+                audio = (audio.set_frame_rate(audio_format[0]).set_channels(audio_format[1])
+                         .set_sample_width(audio_format[2]))
+                if continues_previous:
+                    gap_ms = 0
+                else:
+                    gap_ms = paragraph_gap_ms if paragraph != previous_paragraph else sentence_gap_ms
+                gap_frames = int(audio_format[0] * gap_ms / 1000)
+                pieces.append(b"\0" * gap_frames * audio_format[1] * audio_format[2])
+            pieces.append(audio.raw_data)
+            previous_paragraph = paragraph
+
+        self._combine_and_export(pieces, audio_format, speed, output_file, audio_tags)
+
     def _combine_and_export(self, pieces: List[bytes], audio_format: Tuple[int, int, int], speed: float,
                              output_file: str, audio_tags: AudioTags) -> None:
         """Join raw PCM pieces, apply one client-side atempo pass if speed != 1.0 (F-27), then
@@ -426,6 +570,8 @@ class OpenAITTSProvider(BaseTTSProvider):
             raise ValueError(f"OpenAI: Unsupported speed: {self.config.speed}")
         if self.config.instructions and len(self.config.instructions) > 0 and self.config.model_name != "gpt-4o-mini-tts":
             raise ValueError(f"OpenAI: Instructions are only supported for 'gpt-4o-mini-tts' model")
+        if self.config.paced_unit_mode not in ("sentence", "paragraph"):
+            raise ValueError(f"OpenAI: Unsupported paced_unit_mode: {self.config.paced_unit_mode}")
 
     def estimate_cost(self, total_chars):
         return math.ceil(total_chars / 1000) * self.price
