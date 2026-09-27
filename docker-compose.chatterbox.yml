@@ -1,0 +1,37 @@
+# Example deployment next to a Chatterbox-TTS-Server container
+# (https://github.com/devnen/Chatterbox-TTS-Server). Replace the /path/to/... entries, then:
+#   docker compose -f docker-compose.chatterbox.yml up -d --build
+# The web UI is on http://localhost:7860.
+services:
+  epub-to-audiobook:
+    build: .
+    image: epub_to_audiobook:local
+    container_name: epub-to-audiobook
+    restart: unless-stopped
+    command: ["--host", "0.0.0.0", "--port", "7860"]
+    environment:
+      # Chatterbox's OpenAI-compatible endpoint (container name "chatterbox" on a shared network).
+      - OPENAI_BASE_URL=http://chatterbox:8004/v1
+      # Chatterbox has no auth; the OpenAI SDK just needs a non-empty key.
+      - OPENAI_API_KEY=not-needed
+      # Voice dropdown and "Add a voice" use Chatterbox's voices folder directly.
+      - TTS_VOICES_DIR=/voices
+      - OPENAI_DEFAULT_VOICE=Emily.wav
+      # Voice lab reads Chatterbox's saved delivery settings from its config file.
+      - CHATTERBOX_CONFIG=/chatterbox/config.yaml
+      # Searchable "Book" picker lists this library.
+      - EBOOK_LIBRARY_DIR=/library
+    volumes:
+      - ./data:/app                                        # queue, library index, logs
+      - /path/to/audiobook-library:/app/audiobook_output   # finished books land here
+      - /path/to/chatterbox/voices:/voices                 # writable: the Voice lab adds voices
+      - /path/to/chatterbox:/chatterbox:ro                 # for config.yaml
+      - /path/to/ebook-library:/library:ro
+    ports:
+      - 7860:7860
+    networks:
+      - tts
+
+networks:
+  tts:
+    external: true  # the network your Chatterbox container is on

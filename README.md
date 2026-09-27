@@ -1,3 +1,72 @@
+# EPUB to Audiobook — Chatterbox edition
+
+A fork of [p0n1/epub_to_audiobook](https://github.com/p0n1/epub_to_audiobook) for turning EPUBs into
+audiobooks with a self-hosted [Chatterbox-TTS-Server](https://github.com/devnen/Chatterbox-TTS-Server)
+(through its OpenAI-compatible endpoint). It adds a web UI built around that workflow, natural pacing,
+single-file M4B output and a book queue. The upstream README follows below; the command-line tool
+still works as documented there.
+
+## What this fork adds
+
+**Web UI** (`audiobook_generator/ui/chatterbox_ui.py`, served by `main_ui.py`)
+- **Book picker**: searchable dropdown of the EPUBs in a mounted library, labelled "Title — Author"
+  from each book's metadata (cached; new books are picked up automatically). Uploading an EPUB still works.
+- **Chapter checkboxes** with automatic selection: story chapters are ticked; title pages, copyright,
+  contents, dedications, acknowledgements, "about the author", newsletter pages and similar are unticked.
+  Shows each chapter's opening words and estimated listening time. Ticked chapters are numbered 1…n.
+- **Voice dropdown** filled from Chatterbox's voices folder.
+- **Voice lab**: play a phrase with any voice, tune Chatterbox's exaggeration / CFG weight / temperature
+  and save them as the settings books use, and add new voices (long pauses in the sample are removed,
+  because Chatterbox copies a reference clip's pauses).
+- **Queue**: add books with their own voice, chapters and pauses; they run one at a time in order.
+  Pause, resume, stop, remove, retry. The queue survives restarts and resumes an interrupted book.
+
+**Narration and output**
+- **Paced narration**: paragraphs are taken from the EPUB's HTML, text is sent a sentence at a time,
+  and real pauses are inserted after sentences and between paragraphs (adjustable).
+- **Single M4B** per book with chapter markers, cover art, title/author tags. Chapters are generated in a
+  hidden `.chapters` folder and merged only when all succeed, so a library scanner never sees a
+  half-finished book; a failed book can be resumed with "Skip chapters already made".
+
+**Fixes to the upstream pipeline**
+- Chapters follow the EPUB's reading order (spine) instead of its file list, so the table of contents
+  is no longer narrated and chapters can't come out of order.
+- Chapter files are written under a temporary name and renamed when complete.
+- The output folder is filled in from the book's title; previewing writes nothing.
+
+**Merged upstream pull requests**: #191 skip existing chapters and resource-leak fixes (@gumpgit),
+#189 larger chapter ranges (@bpothier), #186 cover, title and author from the EPUB (@hihilla).
+
+## Running it
+
+1. Run Chatterbox-TTS-Server in Docker and put this container on the same Docker network.
+2. Edit the `/path/to/...` entries in [`docker-compose.chatterbox.yml`](docker-compose.chatterbox.yml), then:
+   ```
+   docker compose -f docker-compose.chatterbox.yml up -d --build
+   ```
+3. Open http://localhost:7860.
+
+| Environment variable | Purpose |
+|---|---|
+| `OPENAI_BASE_URL` | Chatterbox's OpenAI endpoint, e.g. `http://chatterbox:8004/v1` |
+| `OPENAI_API_KEY` | Any non-empty value (Chatterbox has no auth) |
+| `TTS_VOICES_DIR` | Chatterbox's voices folder (writable, for the Voice lab) |
+| `OPENAI_DEFAULT_VOICE` | Voice selected by default |
+| `CHATTERBOX_CONFIG` | Chatterbox's `config.yaml` (read-only), for the Voice lab sliders |
+| `CHATTERBOX_URL` | Chatterbox root URL, if it isn't `OPENAI_BASE_URL` minus `/v1` |
+| `EBOOK_LIBRARY_DIR` | Ebook library for the book picker |
+
+Books are written to `audiobook_output/<title>/` inside the container; mount your audiobook library there.
+
+Tests: `python -m unittest discover -s tests -t . -p "*test*.py"` (ffmpeg required).
+
+## Credits
+
+MIT licensed, like upstream. The chapter auto-selection scoring is adapted from
+[abogen](https://github.com/denizsafak/abogen) (MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+---
+
 # EPUB to Audiobook Converter [![Discord](https://img.shields.io/discord/1177631634724491385?label=Discord&logo=discord&logoColor=white)](https://discord.com/invite/pgp2G8zhS7) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/p0n1/epub_to_audiobook)
 
 *Join our [Discord](https://discord.com/invite/pgp2G8zhS7) server for any questions or discussions. You can also ask questions about this project on [DeepWiki](https://deepwiki.com/p0n1/epub_to_audiobook).*
