@@ -506,6 +506,14 @@ def synthesize(
                     cfg_weight=cfg_weight,
                 )
 
+        # T3.inference builds a fresh T3HuggingfaceBackend wrapper on every call (it resets
+        # self.compiled to False each time), and generate() runs inside torch.autocast above.
+        # Autocast's cache of casted weights is not released when the wrapper is discarded,
+        # so GPU memory grew with every request (+461 live CUDA tensors / +248 MB over 240
+        # requests). Clearing the cache after each generation keeps it flat (verified).
+        if BF16_ENABLED:
+            torch.clear_autocast_cache()
+
         # Store conds in cache after first compute for this voice.
         if conds_key is not None and effective_prompt is not None:
             if chatterbox_model.conds is not None:

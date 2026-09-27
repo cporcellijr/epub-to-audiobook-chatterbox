@@ -77,7 +77,7 @@ class OpenAISpeechRequest(BaseModel):
     model: str
     input_: str = Field(..., alias="input")
     voice: str
-    response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
+    response_format: Literal["wav", "opus", "mp3", "aac", "flac"] = "wav"
     speed: float = 1.0
     seed: Optional[int] = None
     language: Optional[str] = None
@@ -1423,8 +1423,11 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             request.seed if request.seed is not None else get_gen_default_seed()
         )
 
-        # Split long text into chunks for better quality (same as /tts endpoint)
-        DEFAULT_CHUNK_SIZE = 120
+        # Split long text into chunks for better quality (same as /tts endpoint).
+        # Raised from the upstream default of 120: BookOrbit sends whole
+        # paragraphs per request, and one generation pass per paragraph is
+        # faster than several (Original, 426 chars warm: ~13.0s -> ~10.6s).
+        DEFAULT_CHUNK_SIZE = 500 if engine.loaded_model_type == "original" else 400
         text_chunks = utils.chunk_text_by_sentences(request.input_, DEFAULT_CHUNK_SIZE)
         if not text_chunks:
             raise HTTPException(
@@ -1501,7 +1504,9 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         if encoded_audio is None:
             raise HTTPException(status_code=500, detail="Failed to encode audio.")
 
-        media_type = f"audio/{request.response_format}"
+        media_type = {"aac": "audio/aac", "flac": "audio/flac"}.get(
+            request.response_format, f"audio/{request.response_format}"
+        )
 
         # Optional: Save to disk if enabled
         if config_manager.get_bool("audio_output.save_to_disk", False):

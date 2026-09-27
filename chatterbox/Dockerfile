@@ -47,6 +47,9 @@ RUN pip3 install --no-cache-dir --upgrade pip && \
 # Copy the rest of the application code
 COPY . .
 
+# Local speed patch for the installed chatterbox package (see patches/apply_speed_patches.py)
+RUN python3 patches/apply_speed_patches.py
+
 # Create required directories for the application (fixed syntax error)
 RUN mkdir -p model_cache reference_audio outputs voices logs hf_cache
 

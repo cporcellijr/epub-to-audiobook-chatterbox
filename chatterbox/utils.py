@@ -9,6 +9,7 @@ import re
 import time
 import io
 import uuid
+import subprocess
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Set, List
 from pydub import AudioSegment
@@ -349,6 +350,21 @@ def encode_audio(
             )
             audio_segment.export(output_buffer, format="mp3")
 
+        elif output_format == "aac":
+            # ADTS-framed AAC, the same container OpenAI's /audio/speech returns for "aac".
+            audio_clipped = np.clip(audio_array, -1.0, 1.0)
+            audio_int16 = (audio_clipped * 32767).astype(np.int16)
+            audio_segment = AudioSegment(
+                audio_int16.tobytes(),
+                frame_rate=sample_rate,
+                sample_width=2,
+                channels=1,
+            )
+            audio_segment.export(output_buffer, format="adts", codec="aac", bitrate="96k")
+
+        elif output_format == "flac":
+            sf.write(output_buffer, np.clip(audio_array, -1.0, 1.0), rate_to_write, format="flac")
+
         else:
             logger.error(
                 f"Unsupported output format requested for encoding: {output_format}"
@@ -478,6 +494,41 @@ def save_audio_tensor_to_file(
 
 
 # --- Audio Manipulation Utilities ---
+def _ffmpeg_atempo(audio_np: np.ndarray, sample_rate: int, speed_factor: float) -> Optional[np.ndarray]:
+    """Time-stretch mono float32 audio with ffmpeg's atempo (WSOLA) filter.
+
+    librosa.effects.time_stretch is a plain phase vocoder, which smears speech
+    into a metallic, "tin can" sound even at modest rates like 1.25x. atempo keeps
+    speech clean. It accepts 0.5-100 per stage, so slower rates are chained.
+    Returns None if ffmpeg is unavailable or fails.
+    """
+    stages = []
+    remaining = speed_factor
+    while remaining < 0.5:
+        stages.append(0.5)
+        remaining /= 0.5
+    stages.append(remaining)
+    filter_arg = ",".join(f"atempo={stage:.6f}" for stage in stages)
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "f32le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0",
+                "-filter:a", filter_arg,
+                "-f", "f32le", "-ar", str(sample_rate), "-ac", "1", "pipe:1",
+            ],
+            input=np.ascontiguousarray(audio_np, dtype=np.float32).tobytes(),
+            capture_output=True,
+            timeout=60,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning(f"ffmpeg atempo failed for speed factor {speed_factor}: {e}", exc_info=True)
+        return None
+    stretched = np.frombuffer(proc.stdout, dtype=np.float32)
+    return stretched.copy() if stretched.size else None
+
+
 def apply_speed_factor(
     audio_tensor: torch.Tensor, sample_rate: int, speed_factor: float
 ) -> Tuple[torch.Tensor, int]:
@@ -522,6 +573,13 @@ def apply_speed_factor(
             f"apply_speed_factor: audio_tensor_cpu is not 1D after processing (shape {audio_tensor_cpu.shape}). Returning original audio."
         )
         return audio_tensor, sample_rate
+
+    stretched_ffmpeg = _ffmpeg_atempo(audio_tensor_cpu.numpy(), sample_rate, speed_factor)
+    if stretched_ffmpeg is not None:
+        logger.info(
+            f"Applied speed factor {speed_factor} using ffmpeg atempo. Original SR: {sample_rate}"
+        )
+        return torch.from_numpy(stretched_ffmpeg), sample_rate
 
     if LIBROSA_AVAILABLE:
         try:
