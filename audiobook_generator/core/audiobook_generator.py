@@ -135,7 +135,10 @@ class AudiobookGenerator:
             book_parser = get_book_parser(self.config)
             tts_provider = get_tts_provider(self.config)
 
-            os.makedirs(self.config.output_folder, exist_ok=True)
+            # Preview writes nothing unless chapter text was asked for, so previewing into a
+            # library folder doesn't leave an empty or cover-only "book" behind.
+            if not self.config.preview or self.config.output_text:
+                os.makedirs(self.config.output_folder, exist_ok=True)
 
             # Log and save book metadata
             self.book_title = book_parser.get_book_title()
@@ -144,7 +147,7 @@ class AudiobookGenerator:
             logger.info(f"Book author: {self.book_author}")
 
             self.cover = book_parser.get_book_cover()
-            if self.cover:
+            if self.cover and not self.config.preview:
                 ext = _ext_for_mime(self.cover.mime)
                 cover_path = os.path.join(self.config.output_folder, f"cover.{ext}")
                 with open(cover_path, 'wb') as f:

@@ -153,15 +153,48 @@ class TestBuildConfig(unittest.TestCase):
         self.assertIsNone(config.instructions)
         self.assertTrue(config.skip_existing)
 
+    SETTINGS = ("out", "Elena.wav", 1.0, 1, -1, False, False, "auto", "double", False, False, None, "INFO")
+
     def test_start_refuses_while_a_book_is_running(self):
         running = MagicMock()
         running.is_alive.return_value = True
         with patch.object(web_ui, "running_process", running), \
                 patch.object(web_ui, "launch_audiobook_generator") as launch:
             with self.assertRaises(gr.Error):
-                chatterbox_ui.start_generation("/tmp/book.epub", "out", "Elena.wav", 1.0, 1, -1, False, False,
-                                               "auto", "double", False, False, None, "INFO")
+                chatterbox_ui.start_generation("/library/book.epub", None, *self.SETTINGS)
         launch.assert_not_called()
+
+    def test_library_pick_is_used_over_upload(self):
+        with patch.object(web_ui, "running_process", None), \
+                patch.object(web_ui, "launch_audiobook_generator") as launch, patch.object(gr, "Info"):
+            chatterbox_ui.start_generation("/library/picked.epub", "/tmp/uploaded.epub", *self.SETTINGS)
+        self.assertEqual(launch.call_args[0][0].input_file, "/library/picked.epub")
+
+    def test_upload_used_when_nothing_picked(self):
+        with patch.object(web_ui, "running_process", None), \
+                patch.object(web_ui, "launch_audiobook_generator") as launch, patch.object(gr, "Info"):
+            chatterbox_ui.preview_chapters(None, "/tmp/uploaded.epub", *self.SETTINGS)
+        config = launch.call_args[0][0]
+        self.assertEqual((config.input_file, config.preview), ("/tmp/uploaded.epub", True))
+
+    def test_no_book_is_an_error(self):
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.start_generation(None, None, *self.SETTINGS)
+
+
+class TestBookSelection(unittest.TestCase):
+
+    def test_library_pick_names_output_folder_from_its_title(self):
+        index = {"/library/01. Detour (1988).epub": {"title": "Detour: A Novel", "author": "Jane Doe"}}
+        with patch.object(chatterbox_ui.library_index, "load_index", return_value=index):
+            update = chatterbox_ui.library_output_dir("/library/01. Detour (1988).epub")
+        self.assertEqual(update["value"], os.path.join("audiobook_output", "Detour A Novel"))
+
+    def test_upload_clears_library_pick(self):
+        with patch.object(chatterbox_ui, "suggest_output_dir", return_value={"value": "audiobook_output/X"}):
+            output_dir, library_book = chatterbox_ui.uploaded_book_selected("/tmp/x.epub")
+        self.assertEqual(output_dir, {"value": "audiobook_output/X"})
+        self.assertIsNone(library_book["value"])
 
 
 class TestLayout(unittest.TestCase):
@@ -170,6 +203,7 @@ class TestLayout(unittest.TestCase):
         ui = chatterbox_ui.build_ui()
         labels = {getattr(block, "label", None) for block in ui.blocks.values()}
         self.assertIn("Voice", labels)
+        self.assertIn("Book", labels)
         self.assertIn("Exaggeration", labels)
         self.assertIn("Voice sample: 10-15 s of one person speaking clearly", labels)
         for removed in ("Azure", "Edge", "Piper", "Model", "Voice Instructions", "Worker Count", "Output Format"):

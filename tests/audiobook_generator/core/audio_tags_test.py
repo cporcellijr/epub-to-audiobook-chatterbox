@@ -101,7 +101,10 @@ class TestAudiobookGeneratorCoverSaving(unittest.TestCase):
         config.chapter_start = 1
         config.chapter_end = -1
         config.no_prompt = True
-        config.preview = True  # skip actual TTS
+        # Real run (the cover is only written outside preview; audiobook_generator_preview_test covers
+        # preview). Chapter processing then fails on pickling the MagicMock config in the worker
+        # pool, which run() logs -- the cover is saved before that point.
+        config.preview = False
         config.output_text = False
         config.worker_count = 1
         config.log = 'WARNING'

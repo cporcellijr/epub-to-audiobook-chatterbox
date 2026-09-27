@@ -9,6 +9,7 @@ Environment:
     CHATTERBOX_CONFIG    Chatterbox config.yaml (read-only mount) for the saved delivery settings
     TTS_VOICES_DIR       Chatterbox voices folder (writable mount, for adding voices)
     OPENAI_DEFAULT_VOICE Voice selected by default
+    EBOOK_LIBRARY_DIR    Ebook library (read-only mount) for the searchable book picker
 """
 import json
 import os
@@ -24,8 +25,9 @@ import yaml
 from gradio_log import Log
 
 from audiobook_generator.config.general_config import GeneralConfig
-from audiobook_generator.ui import web_ui
+from audiobook_generator.ui import library_index, web_ui
 from audiobook_generator.ui.web_ui import (
+    OUTPUT_ROOT,
     default_openai_voice,
     openai_voice_choices,
     safe_folder_name,
@@ -228,21 +230,41 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     return config
 
 
-def _start(preview: bool, input_file, *settings) -> None:
-    if not input_file:
-        raise gr.Error("Choose an EPUB first.")
+def _start(preview: bool, library_book, input_file, *settings) -> None:
+    book = library_book or input_file
+    if not book:
+        raise gr.Error("Pick a book from the library or upload an EPUB first.")
     if web_ui.running_process is not None and web_ui.running_process.is_alive():
         raise gr.Error("A book is already being generated. Stop it first or wait for it to finish.")
-    web_ui.launch_audiobook_generator(build_config(input_file, *settings, preview=preview))
+    web_ui.launch_audiobook_generator(build_config(book, *settings, preview=preview))
     gr.Info("Previewing chapters (no audio)..." if preview else "Generating audiobook...")
 
 
-def start_generation(input_file, *settings) -> None:
-    _start(False, input_file, *settings)
+def start_generation(library_book, input_file, *settings) -> None:
+    _start(False, library_book, input_file, *settings)
 
 
-def preview_chapters(input_file, *settings) -> None:
-    _start(True, input_file, *settings)
+def preview_chapters(library_book, input_file, *settings) -> None:
+    _start(True, library_book, input_file, *settings)
+
+
+def library_output_dir(library_book: Optional[str]) -> dict:
+    """Picking a library book points the output folder at audiobook_output/<its title>."""
+    if not library_book:
+        return gr.update()
+    folder = safe_folder_name(library_index.book_title(library_book, library_index.load_index()))
+    return gr.update(value=os.path.join(OUTPUT_ROOT, folder) if folder else timestamped_output_dir())
+
+
+def uploaded_book_selected(input_file) -> tuple:
+    """An upload takes over from the library pick and names the output folder."""
+    if not input_file:
+        return gr.update(), gr.update()
+    return suggest_output_dir(input_file), gr.update(value=None)
+
+
+def refresh_library() -> dict:
+    return gr.update(choices=library_index.book_choices(library_index.refresh_index()))
 
 
 def stop_generation() -> None:
@@ -264,7 +286,12 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(analytics_enabled=False, title="Audiobook Maker") as ui:
         with gr.Tab("Make audiobook"):
             with gr.Row(equal_height=True):
-                input_file = gr.File(label="Book (EPUB)", file_types=[".epub"], file_count="single")
+                with gr.Column():
+                    library_book = gr.Dropdown(library_index.book_choices(library_index.load_index()), value=None,
+                                               label="Book", filterable=True,
+                                               info="Type part of a title or author to search the library.")
+                    with gr.Accordion("Or upload an EPUB", open=False):
+                        input_file = gr.File(label="EPUB file", file_types=[".epub"], file_count="single")
                 with gr.Column():
                     output_dir = gr.Textbox(label="Output folder", value=timestamped_output_dir,
                                             info="Filled in from the book title; lands in the audiobook library.")
@@ -334,9 +361,10 @@ def build_ui() -> gr.Blocks:
         settings = [output_dir, voice, speed, chapter_start, chapter_end, skip_existing, output_text,
                     title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
                     search_and_replace_file, log_level]
-        input_file.change(suggest_output_dir, inputs=input_file, outputs=output_dir)
-        start_button.click(start_generation, inputs=[input_file, *settings], outputs=None)
-        preview_button.click(preview_chapters, inputs=[input_file, *settings], outputs=None)
+        library_book.change(library_output_dir, inputs=library_book, outputs=output_dir)
+        input_file.change(uploaded_book_selected, inputs=input_file, outputs=[output_dir, library_book])
+        start_button.click(start_generation, inputs=[library_book, input_file, *settings], outputs=None)
+        preview_button.click(preview_chapters, inputs=[library_book, input_file, *settings], outputs=None)
         stop_button.click(stop_generation, inputs=None, outputs=None)
 
         voice.input(lambda v: v, inputs=voice, outputs=lab_voice)
@@ -350,9 +378,11 @@ def build_ui() -> gr.Blocks:
                          outputs=[add_status, lab_voice, voice])
 
         ui.load(refresh_voices, inputs=None, outputs=[voice, lab_voice])
+        ui.load(refresh_library, inputs=None, outputs=library_book)
         ui.load(load_saved_settings, inputs=None, outputs=[exaggeration, cfg_weight, temperature])
     return ui
 
 
 def host_ui(config) -> None:
+    library_index.warm_up_in_background()
     build_ui().launch(server_name=config.host, server_port=config.port)
