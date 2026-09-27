@@ -697,7 +697,7 @@ This endpoint is designed to be compatible with the basic OpenAI TTS API structu
     | `model`           | string  | No       | Model identifier. Often ignored by self-hosted servers as they use a fixed engine. Can be included for compatibility.                                                    | `chatterbox` (example) |
     | `input`           | string  | Yes      | The plain text to be synthesized.                                                                                                                                        |                       |
     | `voice`           | string  | No       | Specifies the voice. This would map to either a predefined voice filename (e.g., `"default_sample.wav"`) or a reference audio filename for cloning (e.g., `"my_clone.mp3"`). | Engine default/config |
-    | `response_format` | string  | No       | Desired audio output format. Supported: `"wav"`, `"opus"`.                                                                                                               | `"wav"` (from config) |
+    | `response_format` | string  | No       | Desired audio output format. Supported: `"wav"`, `"mp3"`, `"opus"`, `"aac"`, `"flac"`.                                                                                    | `"wav"` (from config) |
     | `speed`           | float   | No       | Playback speed factor (e.g., 0.5 to 2.0). Applied post-generation.                                                                                                       | `1.0`                 |
     | `seed`            | integer | No       | Generation seed for reproducibility. `0` or absent might use default engine randomness.                                                                                  | `0` (from config)     |
 
@@ -709,7 +709,7 @@ This endpoint is designed to be compatible with the basic OpenAI TTS API structu
     *   Generation parameters like temperature, exaggeration, cfg_weight would use server defaults from `config.yaml` as they are not standard OpenAI API fields.
     *   The `speed` and `seed` parameters, if provided, would be used.
 *   **Response:**
-    *   **Success (200 OK):** `StreamingResponse` containing binary audio data (media type `audio/wav` or `audio/opus`).
+    *   **Success (200 OK):** `StreamingResponse` containing binary audio data (media type `audio/wav`, `audio/mp3`, `audio/opus`, `audio/aac`, or `audio/flac`).
     *   **Error:** Standard FastAPI JSON error response (e.g., 400, 404, 500).
 
 #### 8.2.3 POST `/tts` (Custom Parameters)
@@ -723,7 +723,7 @@ This is the primary and most flexible endpoint for TTS generation, offering full
     | `voice_mode`                | `"predefined"` \| `"clone"`      | No          | Specifies the voice generation mode.                                                                          | `"predefined"`                               |
     | `predefined_voice_id`       | string \| null                   | Conditional | Filename of the voice from `voices/`. Required if `voice_mode` is `predefined`.                             | `tts_engine.default_voice_id`                |
     | `reference_audio_filename`  | string \| null                   | Conditional | Filename of the audio from `reference_audio/`. Required if `voice_mode` is `clone`.                           | `null`                                       |
-    | `output_format`             | `"wav"` \| `"mp3"` \| `"opus"`   | No          | Desired audio output format. Ignored when `stream=true` (streaming always uses WAV).                          | `audio_output.format`                        |
+    | `output_format`             | `"wav"` \| `"mp3"` \| `"opus"` \| `"aac"` \| `"flac"` | No | Desired audio output format. Ignored when `stream=true` (streaming always uses WAV).            | `audio_output.format`                        |
     | `stream`                    | boolean                          | No          | If true, returns a `StreamingResponse` that flushes WAV bytes as each chunk is synthesized. Chunk-level streaming only — see note below. | `false`                          |
     | `split_text`                | boolean \| null                  | No          | Enable/disable automatic text chunking.                                                                       | `true`                                       |
     | `chunk_size`                | integer \| null                  | No          | Approximate target character length for chunks (50-500 recommended).                                          | `120`                                        |
