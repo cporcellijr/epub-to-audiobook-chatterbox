@@ -1,3 +1,5 @@
+# Upstream example for the Kokoro-FastAPI TTS provider, kept for reference. This fork's
+# own deployment (Chatterbox) is docker-compose.chatterbox.yml — use that instead.
 services:
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-cpu

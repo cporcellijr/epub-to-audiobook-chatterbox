@@ -154,7 +154,7 @@ non-story after one fix (a novel stored as a single section that begins with its
 | K8 | Queue: all books log to one shared file; progress counts finished chapter files only; the worker thread forks processes from a multithreaded server. |
 | K9 | The library index walks the whole library on every page load (~5 s over a Windows bind mount). |
 | K10 | Pauses, M4B output and chapter selection are UI-only; the CLI has no flags for them. |
-| K11 | Dependencies are unpinned: the local image has Gradio 5.50, upstream's image 5.33. |
+| K11 | `requirements.txt` pins every dependency; the local image's Gradio 5.50 vs. upstream's image 5.33 is a deliberate pin, not drift. |
 | K12 | Security: the UI has no login and is reachable on the LAN; the Book box accepts any existing path; the Voice lab writes into the voices folder and changes Chatterbox's global settings. |
 | K13 | Upstream's `web_ui.py` stays in place to keep upstream merges easy; `main_ui.py` uses `chatterbox_ui.py`, which reuses helpers from it. |
 | K14 | Upstream's `.gitattributes` (`* text=auto`) gives Windows checkouts a CRLF `entrypoint.sh`, and the container then fails to start. Worked around locally with `core.eol lf`; `*.sh text eol=lf` would fix it for everyone. |
