@@ -68,10 +68,38 @@ class EpubBookParser(BaseBookParser):
         logger.warning("No cover image found in EPUB")
         return None
 
+    @staticmethod
+    def _is_nav_document(item) -> bool:
+        """True for the EPUB3 navigation (table of contents) document."""
+        return isinstance(item, epub.EpubNav) or "nav" in (getattr(item, "properties", None) or [])
+
+    def _reading_order_documents(self) -> list:
+        """Content documents in spine (reading) order.
+
+        The manifest is an unordered resource list, so iterating it can put chapters out of
+        order and picks up the navigation document (a table of contents read aloud). Follow
+        the spine instead, skipping the nav document and non-linear (auxiliary) items. Falls
+        back to manifest order if the spine resolves to nothing.
+        """
+        documents = []
+        for entry in self.book.spine:
+            idref, linear = (entry, "yes") if isinstance(entry, str) else (entry[0], entry[1])
+            item = self.book.get_item_with_id(idref)
+            if item is None or item.get_type() != ebooklib.ITEM_DOCUMENT or self._is_nav_document(item):
+                continue
+            if str(linear).lower() in ("no", "false"):
+                continue
+            documents.append(item)
+        if documents:
+            return documents
+        logger.warning("EPUB spine yielded no content documents; falling back to manifest order")
+        return [item for item in self.book.get_items_of_type(ebooklib.ITEM_DOCUMENT)
+                if not self._is_nav_document(item)]
+
     def get_chapters(self, break_string) -> List[Tuple[str, str]]:
         chapters = []
         search_and_replaces = self.get_search_and_replaces()
-        for item in self.book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        for item in self._reading_order_documents():
             content = item.get_content()
             soup = BeautifulSoup(content, "lxml-xml")
             raw = soup.get_text(strip=False)

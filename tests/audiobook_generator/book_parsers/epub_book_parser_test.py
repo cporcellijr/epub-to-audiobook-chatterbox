@@ -24,7 +24,11 @@ class TestGetBookParser(unittest.TestCase):
         self.assertEqual(parser.get_book_author(), "Daniel Defoe")
         self.assertEqual(parser.get_book_title(), "The Life and Adventures of Robinson Crusoe")
         self.assertEqual(parser._sanitize_title(parser.get_book_title(), " @BRK#"), "The_Life_and_Adventures_of_Robinson_Crusoe")
-        self.assertEqual(len(parser.get_chapters("   ")), 24)
+        # 23 spine documents; the manifest also lists the EPUB3 nav (toc.xhtml), which is a
+        # table of contents, not narration, and must not be read as a chapter.
+        self.assertEqual(len(parser.get_chapters("   ")), 23)
+        self.assertNotIn("toc.xhtml", [item.get_name() for item in parser._reading_order_documents()])
+        self.assertEqual(parser._reading_order_documents()[0].get_name(), "wrap0000.xhtml")
 
     def test_unsupported_file_format(self):
         # Set up a config mock with an unsupported file extension

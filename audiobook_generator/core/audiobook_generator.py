@@ -106,7 +106,16 @@ class AudiobookGenerator:
                 title, self.book_author, self.book_title, idx,
                 self.cover,
             )
-            tts_provider.text_to_speech(text, output_file, audio_tags)
+            # Generate into a hidden partial file and rename into place only once it is complete
+            # (audio + tags), so an interrupted run never leaves a truncated or untagged chapter
+            # that skip_existing would then keep, or that a library scanner would pick up.
+            partial_file = os.path.join(self.config.output_folder, f".{safe_audio_name}.part")
+            try:
+                tts_provider.text_to_speech(text, partial_file, audio_tags)
+                os.replace(partial_file, output_file)
+            finally:
+                if os.path.exists(partial_file):
+                    os.remove(partial_file)
 
             logger.info(f"✅ Converted chapter {idx}: {title}, output file: {output_file}")
 

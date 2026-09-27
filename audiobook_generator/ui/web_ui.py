@@ -1,9 +1,11 @@
 from multiprocessing import Process
 from typing import Optional
 import os
+import re
 from datetime import datetime
 
 import gradio as gr
+from ebooklib import epub
 from gradio_log import Log
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.tts_providers.azure_tts_provider import get_azure_supported_languages, \
@@ -20,6 +22,36 @@ from main import main
 selected_tts = "Edge"
 running_process: Optional[Process] = None
 webui_log_file = None
+
+OUTPUT_ROOT = "audiobook_output"
+
+
+def timestamped_output_dir() -> str:
+    """Default output folder, evaluated per page load (not once at server start)."""
+    return os.path.join(OUTPUT_ROOT, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+
+
+def safe_folder_name(name: str, max_length: int = 150) -> str:
+    """Make a book title usable as a folder name on Windows and Linux, keeping spaces."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:max_length].rstrip(" .")
+
+
+def suggest_output_dir(input_file) -> dict:
+    """On upload, point the output folder at audiobook_output/<EPUB title>."""
+    if not input_file:
+        return gr.update()
+    path = input_file.name if hasattr(input_file, "name") else input_file
+    title = ""
+    try:
+        titles = epub.read_epub(path, {"ignore_ncx": True}).get_metadata("DC", "title")
+        title = titles[0][0] if titles else ""
+    except Exception as e:
+        print(f"Could not read EPUB title for output folder: {e}")
+    folder = safe_folder_name(title) or safe_folder_name(os.path.splitext(os.path.basename(path))[0])
+    return gr.update(value=os.path.join(OUTPUT_ROOT, folder) if folder else timestamped_output_dir())
+
 
 def on_tab_change(evt: gr.SelectData):
     print(f"{evt.value} tab selected")
@@ -139,16 +171,16 @@ def terminate_audiobook_generator():
         print("Audiobook generator terminated manually")
 
 def host_ui(config):
-    default_output_dir = os.path.join("audiobook_output", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-    print(f"Default audiobook output directory: {default_output_dir}")
     with gr.Blocks(analytics_enabled=False, title="Epub to Audiobook Converter") as ui:
         with gr.Row(equal_height=True):
             with gr.Column():
-                input_file = gr.File(label="Select the book file to process", file_types=[".epub"], 
+                input_file = gr.File(label="Select the book file to process", file_types=[".epub"],
                                     file_count="single", interactive=True)
 
             with gr.Column():
-                output_dir = gr.Textbox(label="Set Output Directory", value=default_output_dir, interactive=True, info="Default one should be fine.")
+                output_dir = gr.Textbox(label="Set Output Directory", value=timestamped_output_dir, interactive=True,
+                                        info="Filled in from the book title when you upload an EPUB.")
+                input_file.change(suggest_output_dir, inputs=input_file, outputs=output_dir)
                 log_level = gr.Dropdown(["INFO", "DEBUG", "WARNING", "ERROR", "CRITICAL"], label="Log Level", value="INFO", interactive=True)
 
             with gr.Column():
