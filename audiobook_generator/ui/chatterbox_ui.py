@@ -234,6 +234,8 @@ def _start(preview: bool, library_book, input_file, *settings) -> None:
     book = library_book or input_file
     if not book:
         raise gr.Error("Pick a book from the library or upload an EPUB first.")
+    if library_book and not os.path.isfile(library_book):
+        raise gr.Error("Pick the book from the list as you type (or clear the box to use an upload).")
     if web_ui.running_process is not None and web_ui.running_process.is_alive():
         raise gr.Error("A book is already being generated. Stop it first or wait for it to finish.")
     web_ui.launch_audiobook_generator(build_config(book, *settings, preview=preview))
@@ -288,7 +290,7 @@ def build_ui() -> gr.Blocks:
             with gr.Row(equal_height=True):
                 with gr.Column():
                     library_book = gr.Dropdown(library_index.book_choices(library_index.load_index()), value=None,
-                                               label="Book", filterable=True,
+                                               label="Book", filterable=True, allow_custom_value=True,
                                                info="Type part of a title or author to search the library.")
                     with gr.Accordion("Or upload an EPUB", open=False):
                         input_file = gr.File(label="EPUB file", file_types=[".epub"], file_count="single")
@@ -384,5 +386,8 @@ def build_ui() -> gr.Blocks:
 
 
 def host_ui(config) -> None:
-    library_index.warm_up_in_background()
+    if library_index.load_index():
+        library_index.warm_up_in_background()
+    else:
+        library_index.refresh_index()  # first run: build the list before the page is served
     build_ui().launch(server_name=config.host, server_port=config.port)

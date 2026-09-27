@@ -165,10 +165,17 @@ class TestBuildConfig(unittest.TestCase):
         launch.assert_not_called()
 
     def test_library_pick_is_used_over_upload(self):
-        with patch.object(web_ui, "running_process", None), \
+        with patch.object(web_ui, "running_process", None), patch("os.path.isfile", return_value=True), \
                 patch.object(web_ui, "launch_audiobook_generator") as launch, patch.object(gr, "Info"):
             chatterbox_ui.start_generation("/library/picked.epub", "/tmp/uploaded.epub", *self.SETTINGS)
         self.assertEqual(launch.call_args[0][0].input_file, "/library/picked.epub")
+
+    def test_typed_text_that_is_not_a_book_is_an_error(self):
+        with patch.object(web_ui, "running_process", None), \
+                patch.object(web_ui, "launch_audiobook_generator") as launch:
+            with self.assertRaises(gr.Error):
+                chatterbox_ui.start_generation("detour", None, *self.SETTINGS)
+        launch.assert_not_called()
 
     def test_upload_used_when_nothing_picked(self):
         with patch.object(web_ui, "running_process", None), \
