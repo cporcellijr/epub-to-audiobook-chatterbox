@@ -1,12 +1,19 @@
+import base64
 import io
 import logging
 import math
+import subprocess
 import tempfile
 import os
 from typing import List, Tuple
 
 from pydub import AudioSegment
 from sentencex import segment
+
+from mutagen.flac import FLAC, Picture as FlacPicture
+from mutagen.oggopus import OggOpus
+from mutagen.wave import WAVE
+from mutagen.id3._frames import TIT2, TPE1, TALB, TRCK, APIC
 
 from openai import OpenAI
 
@@ -41,6 +48,45 @@ def _split_oversized_unit(unit: str) -> List[str]:
     if len(unit) <= MAX_REQUEST_CHARS:
         return [unit]
     return split_long_sentence(unit, MAX_REQUEST_CHARS)
+
+
+_PCM_FORMATS = {1: "u8", 2: "s16le", 3: "s24le", 4: "s32le"}
+
+
+def _atempo_filter_arg(speed: float) -> str:
+    """Build an ffmpeg atempo filter chain for one speed factor.
+
+    atempo accepts 0.5-100 per stage, so a speed under 0.5 is chained (the same approach
+    chatterbox/utils.py's _ffmpeg_atempo uses server-side; reimplemented here, not shared,
+    since the client and server are separate images).
+    """
+    stages = []
+    remaining = speed
+    while remaining < 0.5:
+        stages.append(0.5)
+        remaining /= 0.5
+    stages.append(remaining)
+    return ",".join(f"atempo={stage:.6f}" for stage in stages)
+
+
+def _stretch_pcm(raw_pcm: bytes, frame_rate: int, channels: int, sample_width: int, speed: float) -> bytes:
+    """Time-stretch raw PCM once for a whole chapter with ffmpeg atempo (F-27).
+
+    Applying atempo per unit costs one ffmpeg process spawn (~57 ms measured) for every one of
+    the ~330 units in a chapter; one pass over the finished chapter is a single spawn regardless
+    of unit count, and stretches the client-inserted pauses along with the speech uniformly.
+    """
+    if speed == 1.0 or not raw_pcm:
+        return raw_pcm
+    pcm_format = _PCM_FORMATS.get(sample_width, "s16le")
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-f", pcm_format, "-ar", str(frame_rate), "-ac", str(channels), "-i", "pipe:0",
+         "-filter:a", _atempo_filter_arg(speed),
+         "-f", pcm_format, "-ar", str(frame_rate), "-ac", str(channels), "pipe:1"],
+        input=raw_pcm, capture_output=True, timeout=120, check=True,
+    )
+    return proc.stdout
 
 
 def paced_units(text: str, language: str) -> List[Tuple[int, str, bool]]:
@@ -102,6 +148,87 @@ def get_price(model):
     else:
         logger.warning(f"OpenAI: Unsupported model name: {model}, unable to retrieve the price")
         return 0.0
+
+
+def _tag_wav(output_file: str, audio_tags: AudioTags) -> None:
+    """Tag a loose WAV chapter (F-26). mutagen.wave.WAVE writes the same ID3 frames
+    set_audio_tags uses for MP3, but into a proper RIFF chunk so the "RIFF....WAVE" header
+    stays intact (a raw ID3.save() on a WAV, as set_audio_tags does, prepends bytes in front
+    of that header instead)."""
+    audio = WAVE(output_file)
+    if audio.tags is None:
+        audio.add_tags()
+    audio.tags.add(TIT2(encoding=3, text=audio_tags.title))
+    audio.tags.add(TPE1(encoding=3, text=audio_tags.author))
+    audio.tags.add(TALB(encoding=3, text=audio_tags.book_title))
+    audio.tags.add(TRCK(encoding=3, text=str(audio_tags.idx)))
+    if audio_tags.cover:
+        audio.tags.add(APIC(encoding=3, mime=audio_tags.cover.mime, type=3, desc="Cover",
+                             data=audio_tags.cover.data))
+    audio.save()
+
+
+def _tag_flac(output_file: str, audio_tags: AudioTags) -> None:
+    """Tag a loose FLAC chapter with native Vorbis comments and a picture block (F-26)."""
+    audio = FLAC(output_file)
+    audio["title"] = audio_tags.title
+    audio["artist"] = audio_tags.author
+    audio["album"] = audio_tags.book_title
+    audio["tracknumber"] = str(audio_tags.idx)
+    if audio_tags.cover:
+        picture = FlacPicture()
+        picture.data = audio_tags.cover.data
+        picture.type = 3
+        picture.mime = audio_tags.cover.mime
+        picture.desc = "Cover"
+        audio.clear_pictures()
+        audio.add_picture(picture)
+    audio.save()
+
+
+def _tag_opus(output_file: str, audio_tags: AudioTags) -> None:
+    """Tag a loose Opus chapter with native Vorbis comments (F-26). The cover goes in as a
+    base64 METADATA_BLOCK_PICTURE comment, the same convention other Ogg-family taggers use."""
+    audio = OggOpus(output_file)
+    audio["title"] = audio_tags.title
+    audio["artist"] = audio_tags.author
+    audio["album"] = audio_tags.book_title
+    audio["tracknumber"] = str(audio_tags.idx)
+    if audio_tags.cover:
+        picture = FlacPicture()
+        picture.data = audio_tags.cover.data
+        picture.type = 3
+        picture.mime = audio_tags.cover.mime
+        picture.desc = "Cover"
+        audio["metadata_block_picture"] = [base64.b64encode(picture.write()).decode("ascii")]
+    audio.save()
+
+
+_LOOSE_FILE_TAGGERS = {"wav": _tag_wav, "flac": _tag_flac, "opus": _tag_opus}
+
+
+def _tag_loose_file(output_file: str, output_format: str, audio_tags: AudioTags) -> None:
+    """Tag a loose chapter file in its own native format (F-26).
+
+    mp3 and aac (ADTS) both keep using set_audio_tags: mutagen's own docs say ADTS tagging
+    is not supported and to use ID3 directly, which is what set_audio_tags already does, and
+    it round-trips correctly (verified against ffprobe). wav/flac/opus get their native
+    mutagen class instead, since a raw ID3 write is either inert (wav/flac: ffmpeg's demuxers
+    skip a leading ID3v2 block without exposing it as format tags) or non-conformant (opus:
+    it would sit in front of the required "OggS" capture pattern). A tagging failure is
+    logged once and the (already-exported) audio file is left as is, never raised further.
+    """
+    if output_format in ("mp3", "aac"):
+        set_audio_tags(output_file, audio_tags)
+        return
+    tagger = _LOOSE_FILE_TAGGERS.get(output_format)
+    if tagger is None:
+        logger.warning(f"OpenAI: no tagger for output format '{output_format}'; chapter file left untagged")
+        return
+    try:
+        tagger(output_file, audio_tags)
+    except Exception as e:
+        logger.warning(f"OpenAI: could not tag {output_format} chapter file {output_file}: {e}", exc_info=True)
 
 
 class OpenAITTSProvider(BaseTTSProvider):
@@ -169,17 +296,23 @@ class OpenAITTSProvider(BaseTTSProvider):
         # Use utility function to merge audio segments
         merge_audio_segments(audio_segments, output_file, self.config.output_format, chunk_ids, self.config.use_pydub_merge)
 
-        set_audio_tags(output_file, audio_tags)
+        _tag_loose_file(output_file, self.config.output_format, audio_tags)
 
     def _paced_text_to_speech(self, text: str, output_file: str, audio_tags: AudioTags) -> None:
         """Speak sentence-sized units and insert real pauses between sentences and paragraphs.
 
         Long requests only get the server's own short gaps between sentences, and paragraph
-        breaks are lost entirely, so narration runs together. Pauses shrink with speed.
+        breaks are lost entirely, so narration runs together.
+
+        Every unit is requested at speed 1.0 and pauses are inserted at their full configured
+        length (F-27): running the server's per-unit atempo ~330 times a chapter costs about
+        19 s of ffmpeg process spawns alone. Instead, if speed != 1.0, one atempo pass stretches
+        the whole finished chapter (speech and pauses together) at the end, which shrinks the
+        pauses by the same proportion the server's per-unit approach did.
         """
         speed = float(self.config.speed or 1.0)
-        sentence_gap_ms = int((self.config.sentence_pause_ms or 0) / speed)
-        paragraph_gap_ms = int((self.config.paragraph_pause_ms or 0) / speed)
+        sentence_gap_ms = int(self.config.sentence_pause_ms or 0)
+        paragraph_gap_ms = int(self.config.paragraph_pause_ms or 0)
         units = paced_units(text, self.config.language or "en")
         if not units:
             raise ValueError("No speakable text in this chapter")
@@ -194,7 +327,7 @@ class OpenAITTSProvider(BaseTTSProvider):
             response = self.client.audio.speech.create(
                 model=self.config.model_name,
                 voice=self.config.voice_name,
-                speed=self.config.speed,
+                speed=1.0,
                 instructions=self.config.instructions,
                 input=unit,
                 response_format="wav",
@@ -214,13 +347,19 @@ class OpenAITTSProvider(BaseTTSProvider):
             pieces.append(audio.raw_data)
             previous_paragraph = paragraph
 
-        combined = AudioSegment(data=b"".join(pieces), frame_rate=audio_format[0],
+        self._combine_and_export(pieces, audio_format, speed, output_file, audio_tags)
+
+    def _combine_and_export(self, pieces: List[bytes], audio_format: Tuple[int, int, int], speed: float,
+                             output_file: str, audio_tags: AudioTags) -> None:
+        """Join raw PCM pieces, apply one client-side atempo pass if speed != 1.0 (F-27), then
+        export and tag the finished chapter."""
+        raw_pcm = _stretch_pcm(b"".join(pieces), audio_format[0], audio_format[1], audio_format[2], speed)
+        combined = AudioSegment(data=raw_pcm, frame_rate=audio_format[0],
                                 channels=audio_format[1], sample_width=audio_format[2])
         export_format, codec = _PYDUB_EXPORT.get(self.config.output_format, (self.config.output_format, None))
         combined.export(output_file, format=export_format, codec=codec,
                         bitrate="64k" if self.config.output_format in ("mp3", "aac", "opus") else None)
-        if self.config.output_format == "mp3":
-            set_audio_tags(output_file, audio_tags)
+        _tag_loose_file(output_file, self.config.output_format, audio_tags)
 
     def get_break_string(self):
         # Non-whitespace so paragraph breaks survive the parser's whitespace collapsing.

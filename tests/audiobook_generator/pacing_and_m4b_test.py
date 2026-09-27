@@ -10,6 +10,9 @@ from unittest.mock import MagicMock, patch
 
 from pydub import AudioSegment
 from pydub.generators import Sine
+from mutagen.flac import FLAC
+from mutagen.oggopus import OggOpus
+from mutagen.wave import WAVE
 
 from audiobook_generator.book_parsers.epub_book_parser import EpubBookParser
 from audiobook_generator.config.general_config import GeneralConfig
@@ -145,8 +148,20 @@ class TestPacedSpeech(unittest.TestCase):
         self.assertTrue(all(r["response_format"] == "wav" and PARAGRAPH_MARK not in r["input"] for r in requests))
 
     def test_pauses_shrink_with_speed(self):
+        # F-27: speed is applied ONCE client-side over the whole finished chapter (speech and
+        # unscaled pauses together), not per unit server-side, so the entire unscaled timeline
+        # (3 units + full 400 ms + full 1000 ms pauses) is what ends up divided by speed.
         duration = self._speak(self._provider(400, 1000, speed=2.0), self.TEXT)
-        self.assertAlmostEqual(duration, 3 * UNIT_MS + 200 + 500, delta=80)
+        self.assertAlmostEqual(duration, (3 * UNIT_MS + 400 + 1000) / 2.0, delta=150)
+
+    def test_speed_is_requested_once_client_side_not_per_unit(self):
+        # F-27: every unit is requested at speed 1.0 regardless of the configured speed; the
+        # server would otherwise run its own per-unit ffmpeg atempo ~330 times per chapter.
+        provider = self._provider(400, 1000, speed=2.0)
+        self._speak(provider, self.TEXT)
+        requests = [call.kwargs for call in provider.client.audio.speech.create.call_args_list]
+        self.assertTrue(requests, "expected at least one request")
+        self.assertTrue(all(r["speed"] == 1.0 for r in requests))
 
     def test_without_pauses_marks_are_never_spoken(self):
         provider = self._provider(None, None)
@@ -157,6 +172,50 @@ class TestPacedSpeech(unittest.TestCase):
         spoken = " ".join(c.kwargs["input"] for c in provider.client.audio.speech.create.call_args_list)
         self.assertNotIn(PARAGRAPH_MARK, spoken)
         self.assertIn("village. The road", spoken)
+
+
+class TestLooseFileTagging(unittest.TestCase):
+    """F-26: wav/flac/opus loose chapter files get native tags instead of a raw ID3 write,
+    which is inert on wav/flac and non-conformant on opus (see openai_tts_provider._tag_loose_file)."""
+
+    def _provider(self, output_format):
+        config = GeneralConfig(SimpleNamespace(
+            tts="openai", model_name="chatterbox", voice_name="Elena.wav", output_format=output_format,
+            speed=1.0, instructions=None, language="en", sentence_pause_ms=400, paragraph_pause_ms=1000))
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}):
+            provider = OpenAITTSProvider(config)
+        provider.client = MagicMock()
+        provider.client.audio.speech.create.return_value = SimpleNamespace(content=_wav_bytes(300))
+        return provider
+
+    def test_wav_flac_opus_chapters_are_tagged_in_their_native_format(self):
+        tags = SimpleNamespace(title="Chapter One", author="Author Name", book_title="Test Book",
+                                idx=3, cover=None)
+        readers = {"wav": WAVE, "flac": FLAC, "opus": OggOpus}
+        for output_format, reader in readers.items():
+            with self.subTest(output_format=output_format):
+                provider = self._provider(output_format)
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, f"out.{output_format}")
+                    provider.text_to_speech("A short paced sentence for tagging.", path, tags)
+                    audio = reader(path)  # raises if the fix broke the container header
+                    if output_format == "wav":
+                        self.assertEqual(audio.tags["TIT2"].text[0], "Chapter One")
+                        self.assertEqual(audio.tags["TALB"].text[0], "Test Book")
+                    else:
+                        self.assertEqual(audio["title"][0], "Chapter One")
+                        self.assertEqual(audio["album"][0], "Test Book")
+
+    def test_aac_chapter_is_tagged_via_id3_and_does_not_fail(self):
+        # Note (F-26): ADTS has no native tag container; mutagen's own docs say to use ID3
+        # directly, which is what set_audio_tags already does. Must never raise for aac.
+        provider = self._provider("aac")
+        tags = SimpleNamespace(title="Chapter One", author="Author Name", book_title="Test Book",
+                                idx=3, cover=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.aac")
+            provider.text_to_speech("A short paced sentence for tagging.", path, tags)
+            self.assertTrue(os.path.exists(path))
 
 
 class TestBuildM4b(unittest.TestCase):
