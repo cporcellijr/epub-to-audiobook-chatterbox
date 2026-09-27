@@ -231,7 +231,7 @@ def main(config=None, log_file=None):
 
     setup_logging(config.log, str(effective_log_file))
 
-    AudiobookGenerator(config).run()
+    return AudiobookGenerator(config).run()
 
 
 if __name__ == "__main__":

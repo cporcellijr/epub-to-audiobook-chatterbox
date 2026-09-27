@@ -162,51 +162,90 @@ TABLE = [[1, False, "Title page", "Title", "under 1 min"], [2, True, "One", "It 
 SETTINGS = ("out", "Elena.wav", 1.0, 0.35, 0.9, True, False, False, "auto", "double", False, False, None, "INFO")
 
 
-class TestStartGeneration(unittest.TestCase):
+class TestQueueSettings(unittest.TestCase):
 
-    def _start(self, library_book, input_file, table=TABLE):
-        with patch.object(web_ui, "running_process", None), patch("os.path.isfile", return_value=True), \
-                patch.object(web_ui, "launch_audiobook_generator") as launch, patch.object(gr, "Info"):
-            chatterbox_ui.start_generation(library_book, input_file, table, *SETTINGS)
-        return launch.call_args[0][0]
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.uploads = patch.object(chatterbox_ui, "QUEUE_UPLOADS", os.path.join(self.tmp.name, "uploads"))
+        self.uploads.start()
 
-    def test_ticked_chapters_are_sent(self):
-        self.assertEqual(self._start("/library/book.epub", None).chapter_selection, [2, 3])
+    def tearDown(self):
+        self.uploads.stop()
+        self.tmp.cleanup()
+
+    def _settings(self, library_book, input_file, table=TABLE):
+        with patch("os.path.isfile", side_effect=lambda p: p == "/library/book.epub" or os.path.exists(p)):
+            return chatterbox_ui.queue_settings(library_book, input_file, table, *SETTINGS)
+
+    def test_library_book_settings(self):
+        settings = self._settings("/library/book.epub", None)
+        self.assertEqual(settings["input_file"], "/library/book.epub")
+        self.assertEqual(settings["chapter_selection"], [2, 3])
+        self.assertEqual((settings["voice"], settings["sentence_pause"], settings["paragraph_pause"],
+                          settings["output_m4b"]), ("Elena.wav", 0.35, 0.9, True))
+        config = chatterbox_ui.build_config(**settings)  # queued settings rebuild a full config
+        self.assertEqual((config.chapter_selection, config.paragraph_pause_ms), ([2, 3], 900))
 
     def test_dataframe_table_is_read(self):
         import pandas as pd
         table = pd.DataFrame(TABLE, columns=chatterbox_ui.CHAPTER_COLUMNS)
-        self.assertEqual(self._start("/library/book.epub", None, table).chapter_selection, [2, 3])
+        self.assertEqual(self._settings("/library/book.epub", None, table)["chapter_selection"], [2, 3])
 
-    def test_library_pick_is_used_over_upload(self):
-        self.assertEqual(self._start("/library/picked.epub", "/tmp/uploaded.epub").input_file, "/library/picked.epub")
+    def test_upload_is_copied_so_it_outlives_the_browser_upload(self):
+        upload = os.path.join(self.tmp.name, "mine.epub")
+        with open(upload, "w") as f:
+            f.write("epub")
+        settings = self._settings(None, upload)
+        self.assertNotEqual(settings["input_file"], upload)
+        self.assertTrue(settings["input_file"].startswith(os.path.abspath(chatterbox_ui.QUEUE_UPLOADS)))
+        with open(settings["input_file"]) as f:
+            self.assertEqual(f.read(), "epub")
 
-    def test_upload_used_when_nothing_picked(self):
-        self.assertEqual(self._start(None, "/tmp/uploaded.epub").input_file, "/tmp/uploaded.epub")
+    def test_library_pick_wins_over_upload(self):
+        upload = os.path.join(self.tmp.name, "mine.epub")
+        open(upload, "w").close()
+        self.assertEqual(self._settings("/library/book.epub", upload)["input_file"], "/library/book.epub")
 
     def test_nothing_ticked_is_an_error(self):
-        table = [[1, False, "A", "", ""], [2, False, "B", "", ""]]
         with self.assertRaises(gr.Error):
-            self._start("/library/book.epub", None, table)
-
-    def test_start_refuses_while_a_book_is_running(self):
-        running = MagicMock()
-        running.is_alive.return_value = True
-        with patch.object(web_ui, "running_process", running), patch("os.path.isfile", return_value=True), \
-                patch.object(web_ui, "launch_audiobook_generator") as launch:
-            with self.assertRaises(gr.Error):
-                chatterbox_ui.start_generation("/library/book.epub", None, TABLE, *SETTINGS)
-        launch.assert_not_called()
+            self._settings("/library/book.epub", None, [[1, False, "A", "", ""]])
 
     def test_typed_text_that_is_not_a_book_is_an_error(self):
-        with patch.object(web_ui, "launch_audiobook_generator") as launch:
-            with self.assertRaises(gr.Error):
-                chatterbox_ui.start_generation("detour", None, TABLE, *SETTINGS)
-        launch.assert_not_called()
+        with self.assertRaises(gr.Error):
+            self._settings("detour", None)
 
     def test_no_book_is_an_error(self):
         with self.assertRaises(gr.Error):
-            chatterbox_ui.start_generation(None, None, TABLE, *SETTINGS)
+            self._settings(None, None)
+
+    def test_generation_estimate_counts_ticked_chapters_only(self):
+        stats = [[20, 1, 1], [36360, 1, 1], [36360, 1, 1]]  # 36,360 chars = 30 min of speech
+        seconds = chatterbox_ui.generation_estimate(TABLE, stats)
+        self.assertAlmostEqual(seconds, 2 * 1800 / 1.8 * 1.14, delta=1)
+
+
+class TestQueueView(unittest.TestCase):
+
+    def test_rows_and_status(self):
+        queue = MagicMock()
+        queue.paused = False
+        queue.jobs.return_value = [
+            {"id": "a", "title": "Book A", "voice": "Elena.wav", "chapters": 4, "estimate_seconds": 3600,
+             "status": "done", "finished": "2026-09-27 10:00", "note": "", "settings": {}},
+            {"id": "b", "title": "Book B", "voice": "love poem.wav", "chapters": 5, "estimate_seconds": 1800,
+             "status": "queued", "note": "", "settings": {}},
+        ]
+        rows, ids, status = chatterbox_ui.queue_view(queue)
+        self.assertEqual(ids, ["a", "b"])
+        self.assertEqual(rows[1][:4], [2, "Book B", "love poem", 5])
+        self.assertIn("done", rows[0][4])
+        self.assertIn("1 book(s) to go", status)
+        self.assertIn("30 min", status)
+
+    def test_empty_and_paused(self):
+        queue = MagicMock()
+        queue.paused, queue.jobs.return_value = True, []
+        self.assertIn("empty", chatterbox_ui.queue_view(queue)[2])
 
 
 class TestChapterList(unittest.TestCase):

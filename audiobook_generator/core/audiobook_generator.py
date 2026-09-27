@@ -141,7 +141,9 @@ class AudiobookGenerator:
         idx, title, text = args
         return idx, self.process_chapter(idx, title, text)
 
-    def run(self):
+    def run(self) -> bool:
+        """Generate the book; True when every selected chapter (and the M4B, if asked) succeeded."""
+        succeeded = False
         try:
             logger.info("Starting audiobook generation...")
             book_parser = get_book_parser(self.config)
@@ -253,6 +255,7 @@ class AudiobookGenerator:
                 logger.info(f"All chapters converted successfully. Check your output directory: {self.config.output_folder}")
                 if self.output_m4b() and not self.config.preview:
                     self._merge_into_m4b(tasks, tts_provider.get_output_file_extension(), cover_path)
+                succeeded = True
 
         except KeyboardInterrupt:
             logger.info("Audiobook generation process interrupted by user (Ctrl+C).")
@@ -260,6 +263,7 @@ class AudiobookGenerator:
             logger.exception(f"Error during audiobook generation: {e}")
         finally:
             logger.debug("AudiobookGenerator.run() method finished.")
+        return succeeded
 
     def _merge_into_m4b(self, tasks, extension: str, cover_path) -> None:
         """Merge the finished chapters into <title>.m4b and remove the working folder."""

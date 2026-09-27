@@ -30,6 +30,7 @@ from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.tts_providers.openai_tts_provider import PARAGRAPH_MARK
 from audiobook_generator.ui import library_index, web_ui
+from audiobook_generator.ui.job_queue import DONE, FAILED, QUEUED, RUNNING, STOPPED, JobQueue
 from audiobook_generator.ui.web_ui import (
     OUTPUT_ROOT,
     default_openai_voice,
@@ -254,21 +255,97 @@ def selected_chapter_numbers(table) -> list:
     return [int(row[0]) for row in _table_rows(table) if row and bool(row[1])]
 
 
-def start_generation(library_book, input_file, chapter_table, output_dir: str, voice: str, speed: float,
-                     sentence_pause: float, paragraph_pause: float, output_m4b: bool, *settings) -> None:
-    book = library_book or input_file
-    if not book:
-        raise gr.Error("Pick a book from the library or upload an EPUB first.")
+QUEUE_FILE = "queue.json"
+QUEUE_UPLOADS = "queue_uploads"
+
+
+def _copy_for_queue(path, suffix: str) -> str:
+    """Keep a private copy of an uploaded file: Gradio's temporary uploads can vanish before a
+    queued book gets its turn."""
+    os.makedirs(QUEUE_UPLOADS, exist_ok=True)
+    handle, copy = tempfile.mkstemp(prefix="upload_", suffix=suffix, dir=QUEUE_UPLOADS)
+    os.close(handle)
+    shutil.copyfile(path, copy)
+    return os.path.abspath(copy)
+
+
+def queue_settings(library_book, input_file, chapter_table, output_dir: str, voice: str, speed: float,
+                   sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
+                   output_text: bool, title_mode: str, newline_mode: str, remove_endnotes: bool,
+                   remove_reference_numbers: bool, search_and_replace_file, log_level: str) -> dict:
+    """Validate the form and turn it into build_config keyword arguments for a queued book."""
     if library_book and not os.path.isfile(library_book):
         raise gr.Error("Pick the book from the list as you type (or clear the box to use an upload).")
+    upload = input_file.name if hasattr(input_file, "name") else input_file
+    if not library_book and not upload:
+        raise gr.Error("Pick a book from the library or upload an EPUB first.")
     selection = selected_chapter_numbers(chapter_table)
     if not selection:
         raise gr.Error("Tick at least one chapter.")
-    if web_ui.running_process is not None and web_ui.running_process.is_alive():
-        raise gr.Error("A book is already being generated. Stop it first or wait for it to finish.")
-    web_ui.launch_audiobook_generator(build_config(book, output_dir, voice, speed, selection, sentence_pause,
-                                                   paragraph_pause, output_m4b, *settings))
-    gr.Info(f"Generating {len(selection)} chapters...")
+    if not voice:
+        raise gr.Error("Pick a voice.")
+    if not (output_dir or "").strip():
+        raise gr.Error("Set an output folder.")
+    replace_file = (search_and_replace_file.name if hasattr(search_and_replace_file, "name")
+                    else search_and_replace_file)
+    return {
+        "input_file": library_book or _copy_for_queue(upload, ".epub"),
+        "output_dir": output_dir.strip(), "voice": voice, "speed": float(speed),
+        "chapter_selection": selection, "sentence_pause": float(sentence_pause),
+        "paragraph_pause": float(paragraph_pause), "output_m4b": bool(output_m4b),
+        "skip_existing": bool(skip_existing), "output_text": bool(output_text), "title_mode": title_mode,
+        "newline_mode": newline_mode, "remove_endnotes": bool(remove_endnotes),
+        "remove_reference_numbers": bool(remove_reference_numbers),
+        "search_and_replace_file": _copy_for_queue(replace_file, ".txt") if replace_file else None,
+        "log_level": log_level,
+    }
+
+
+def generation_estimate(table, stats: list) -> float:
+    """Seconds Chatterbox needs for the ticked chapters."""
+    stats = stats or []
+    chosen = [stats[n - 1] for n in selected_chapter_numbers(table) if 0 < n <= len(stats)]
+    return sum(s[0] for s in chosen) / CHARS_PER_AUDIO_SECOND / GENERATION_SPEED * PACED_GENERATION_OVERHEAD
+
+
+def _status_label(job: dict) -> str:
+    note = f" · {job['note']}" if job.get("note") else ""
+    if job["status"] == RUNNING:
+        return f"▶ generating · {JobQueue.chapters_done(job)} of {job['chapters']} chapters done"
+    if job["status"] == QUEUED:
+        return f"waiting{note}"
+    if job["status"] == DONE:
+        return f"✓ done {job['finished']}"
+    if job["status"] == FAILED:
+        return f"✗ failed{note}"
+    return f"■ stopped{note}"
+
+
+QUEUE_COLUMNS = ["#", "Book", "Voice", "Chapters", "Status", "Generating time"]
+
+
+def queue_view(queue: JobQueue) -> tuple:
+    """(table rows, job ids in row order, one-line queue status)."""
+    jobs = queue.jobs()
+    rows = [[n, job["title"], os.path.splitext(job["voice"])[0], job["chapters"], _status_label(job),
+             _duration(job["estimate_seconds"])] for n, job in enumerate(jobs, start=1)]
+    ids = [job["id"] for job in jobs]
+    left = 0.0
+    for job in jobs:
+        if job["status"] == QUEUED:
+            left += job["estimate_seconds"]
+        elif job["status"] == RUNNING:
+            left += job["estimate_seconds"] * (1 - JobQueue.chapters_done(job) / max(1, job["chapters"]))
+    to_go = sum(1 for job in jobs if job["status"] in (QUEUED, RUNNING))
+    if not jobs:
+        status = "The queue is empty. Pick a book, tick chapters, choose a voice, then **Add to queue**."
+    elif queue.paused:
+        status = f"⏸ **Queue paused** · {to_go} book(s) waiting. Press **Resume queue** to continue."
+    elif to_go:
+        status = f"▶ **Working** · {to_go} book(s) to go · about {_duration(left)} of generating left."
+    else:
+        status = "✓ **All done.** Finished books are in the audiobook library."
+    return rows, ids, status
 
 
 # ---- Chapter list ----
@@ -404,11 +481,6 @@ def refresh_library() -> dict:
     return gr.update(choices=library_index.book_choices(library_index.refresh_index()))
 
 
-def stop_generation() -> None:
-    web_ui.terminate_audiobook_generator()
-    gr.Info("Stopped.")
-
-
 def refresh_voices() -> tuple:
     choices = openai_voice_choices()
     return (gr.update(choices=choices, value=default_openai_voice(choices)),
@@ -417,9 +489,66 @@ def refresh_voices() -> tuple:
 
 # ---- Layout ----
 
-def build_ui() -> gr.Blocks:
+def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
+    web_ui.webui_log_file = generate_unique_log_path("EtA_WebUI")
+    web_ui.webui_log_file.touch()
+    if queue is None:  # standalone build (tests): a throwaway queue that never starts on its own
+        queue = JobQueue(os.path.join(tempfile.mkdtemp(), QUEUE_FILE), build_config,
+                         lambda: str(web_ui.webui_log_file.absolute()))
     choices = openai_voice_choices()
     default_voice = default_openai_voice(choices)
+
+    def refresh_queue() -> tuple:
+        rows, ids, status = queue_view(queue)
+        return gr.update(value=rows), ids, status
+
+    def enqueue(library_book, input_file, chapter_table, stats, *settings) -> tuple:
+        job_settings = queue_settings(library_book, input_file, chapter_table, *settings)
+        title = os.path.basename(job_settings["output_dir"].rstrip("/\\")) or "Book"
+        position = queue.add(title, job_settings, len(job_settings["chapter_selection"]),
+                             generation_estimate(chapter_table, stats), job_settings["voice"])
+        queue.tick()
+        gr.Info(f"Added '{title}' to the queue" + ("." if position <= 1 else f" (#{position} in line)."))
+        return refresh_queue()
+
+    def select_job(ids: list, evt: gr.SelectData) -> tuple:
+        row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+        job = next((j for j in queue.jobs() if 0 <= row < len(ids) and j["id"] == ids[row]), None)
+        if not job:
+            return None, ""
+        return job["id"], f"Selected: **{job['title']}**"
+
+    def remove_selected(job_id) -> tuple:
+        if not job_id:
+            raise gr.Error("Click a book in the queue first.")
+        if not queue.remove(job_id):
+            raise gr.Error("That book is generating: press Stop current book first.")
+        return (*refresh_queue(), None, "")
+
+    def retry_selected(job_id) -> tuple:
+        if not job_id or not queue.retry(job_id):
+            raise gr.Error("Pick a failed or stopped book to retry.")
+        gr.Info("Re-queued; chapters already made are kept.")
+        return (*refresh_queue(), None, "")
+
+    def clear_finished() -> tuple:
+        queue.clear_finished()
+        return refresh_queue()
+
+    def pause_queue() -> tuple:
+        queue.set_paused(True)
+        return refresh_queue()
+
+    def resume_queue() -> tuple:
+        queue.set_paused(False)
+        queue.tick()
+        return refresh_queue()
+
+    def stop_current() -> tuple:
+        if queue.stop_current():
+            gr.Info("Stopped. The queue is paused: press Resume queue to go on to the next book.")
+        return refresh_queue()
+
     with gr.Blocks(analytics_enabled=False, title="Audiobook Maker") as ui:
         with gr.Tab("Make audiobook"):
             with gr.Row(equal_height=True):
@@ -463,11 +592,22 @@ def build_ui() -> gr.Blocks:
                     output_text = gr.Checkbox(False, label="Also save each chapter's text")
                 search_and_replace_file = gr.File(label="Search & replace file (optional, e.g. fix pronunciations)",
                                                   file_types=[".txt"], file_count="single")
-            with gr.Row():
-                start_button = gr.Button("Start", variant="primary")
-                stop_button = gr.Button("Stop", variant="stop")
-            web_ui.webui_log_file = generate_unique_log_path("EtA_WebUI")
-            web_ui.webui_log_file.touch()
+            enqueue_button = gr.Button("➕ Add to queue", variant="primary")
+            with gr.Accordion("Queue", open=True):
+                queue_status = gr.Markdown()
+                queue_table = gr.Dataframe(headers=QUEUE_COLUMNS, interactive=False, wrap=True, label="Books",
+                                           column_widths=["5%", "33%", "14%", "9%", "27%", "12%"])
+                queue_ids = gr.State([])
+                selected_job = gr.State(None)
+                selected_info = gr.Markdown()
+                with gr.Row():
+                    remove_button = gr.Button("Remove selected", size="sm")
+                    retry_button = gr.Button("Retry selected", size="sm")
+                    clear_button = gr.Button("Clear finished", size="sm")
+                    pause_button = gr.Button("Pause queue", size="sm")
+                    resume_button = gr.Button("Resume queue", size="sm")
+                    stop_button = gr.Button("Stop current book", variant="stop", size="sm")
+            queue_timer = gr.Timer(3)
             Log(str(web_ui.webui_log_file.absolute()), dark=True, xterm_font_size=12)
 
         with gr.Tab("Voice lab"):
@@ -509,9 +649,18 @@ def build_ui() -> gr.Blocks:
                     search_and_replace_file, log_level]
         library_book.change(library_output_dir, inputs=library_book, outputs=output_dir)
         input_file.change(uploaded_book_selected, inputs=input_file, outputs=[output_dir, library_book])
-        start_button.click(start_generation, inputs=[library_book, input_file, chapter_table, *settings],
-                           outputs=None)
-        stop_button.click(stop_generation, inputs=None, outputs=None)
+        queue_outputs = [queue_table, queue_ids, queue_status]
+        selection_outputs = [*queue_outputs, selected_job, selected_info]
+        enqueue_button.click(enqueue, inputs=[library_book, input_file, chapter_table, chapter_stats_state, *settings],
+                             outputs=queue_outputs)
+        queue_timer.tick(refresh_queue, inputs=None, outputs=queue_outputs)
+        queue_table.select(select_job, inputs=queue_ids, outputs=[selected_job, selected_info])
+        remove_button.click(remove_selected, inputs=selected_job, outputs=selection_outputs)
+        retry_button.click(retry_selected, inputs=selected_job, outputs=selection_outputs)
+        clear_button.click(clear_finished, inputs=None, outputs=queue_outputs)
+        pause_button.click(pause_queue, inputs=None, outputs=queue_outputs)
+        resume_button.click(resume_queue, inputs=None, outputs=queue_outputs)
+        stop_button.click(stop_current, inputs=None, outputs=queue_outputs)
 
         # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
         # this re-runs the auto-selection. Ticks, speed, pauses and "Tick all" only touch the table.
@@ -543,6 +692,7 @@ def build_ui() -> gr.Blocks:
         ui.load(refresh_voices, inputs=None, outputs=[voice, lab_voice])
         ui.load(refresh_library, inputs=None, outputs=library_book)
         ui.load(load_saved_settings, inputs=None, outputs=[exaggeration, cfg_weight, temperature])
+        ui.load(refresh_queue, inputs=None, outputs=queue_outputs)
     return ui
 
 
@@ -551,4 +701,8 @@ def host_ui(config) -> None:
         library_index.warm_up_in_background()
     else:
         library_index.refresh_index()  # first run: build the list before the page is served
-    build_ui().launch(server_name=config.host, server_port=config.port)
+    queue = JobQueue(QUEUE_FILE, build_config, lambda: str(web_ui.webui_log_file.absolute()),
+                     uploads_dir=QUEUE_UPLOADS)
+    ui = build_ui(queue)
+    queue.start_worker()
+    ui.launch(server_name=config.host, server_port=config.port)
