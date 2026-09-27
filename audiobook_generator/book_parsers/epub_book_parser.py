@@ -194,7 +194,7 @@ class EpubBookParser(BaseBookParser):
                         title = soup.find(level).text
                         break
                 if title.strip() == "" or re.match(r'^\d{1,3}$', title.strip()) is not None:
-                    title = cleaned_text[:60]
+                    title = cleaned_text.replace(break_string, " ")[:60]
             elif self.config.title_mode == "tag_text":
                 title = ""
                 title_levels = ['title', 'h1', 'h2', 'h3']
@@ -205,7 +205,7 @@ class EpubBookParser(BaseBookParser):
                 if title.strip() == "":
                     title = "<blank>"
             elif self.config.title_mode == "first_few":
-                title = cleaned_text[:60]
+                title = cleaned_text.replace(break_string, " ")[:60]
             else:
                 raise ValueError("Unsupported title_mode")
             logger.debug("Raw title: <%s>", title)

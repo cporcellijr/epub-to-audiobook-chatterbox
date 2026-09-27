@@ -159,3 +159,18 @@ class TestNumericHeadingFallback(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFallbackTitleHasNoMarkerFragment(unittest.TestCase):
+
+    def test_title_cut_at_60_chars_never_ends_in_part_of_the_paragraph_marker(self):
+        # First paragraph is 58 characters, so a 60-character cut of the marked text would
+        # land inside the " @BRK#" paragraph marker and leave "@" in the title.
+        first = "An untitled opening paragraph that runs for fifty-eight ch"
+        self.assertEqual(len(first), 58)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "b.epub")
+            _write_epub(path, "", f"<p>{first}</p><p>Second paragraph.</p>")
+            title, _ = EpubBookParser(_config(path, title_mode="first_few")).get_chapters(" @BRK#")[0]
+        self.assertNotIn("@", title)
+        self.assertTrue(title.startswith(first))
