@@ -1,0 +1,49 @@
+services:
+  chatterbox-tts-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+    ports:
+      - "${PORT:-8004}:8004"
+    volumes:
+      # Mount local config file for persistence
+      - ./config.yaml:/app/config.yaml
+      # Mount local directories for persistent app data
+      - ./voices:/app/voices
+      - ./reference_audio:/app/reference_audio
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+      - hf_cache:/app/hf_cache
+
+    # --- ROCm GPU Access ---
+    # Standard ROCm device access - required for AMD GPU acceleration
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    ipc: host
+    shm_size: 8g
+    security_opt:
+      - seccomp=unconfined
+    
+    # --- Optional: Enhanced ROCm Access ---
+    # Uncomment the lines below if you experience GPU access issues
+    # privileged: true
+    # cap_add:
+    #   - SYS_PTRACE
+    # devices:
+    #   - /dev/mem
+    
+    restart: unless-stopped
+    environment:
+      # Enable faster Hugging Face downloads
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - HF_TOKEN=YOUR_TOKEN_HERE
+      # NOTE: HSA_OVERRIDE_GFX_VERSION should only be set by users with unsupported GPUs
+      # Example usage: HSA_OVERRIDE_GFX_VERSION=10.3.0 docker compose up
+      # Common values: 10.3.0 (RX 5000/6000), 11.0.0 (RX 7000), 9.0.6 (Vega)
+
+volumes:
+  hf_cache:
