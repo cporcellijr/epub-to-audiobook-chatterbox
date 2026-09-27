@@ -179,7 +179,12 @@ def paragraph_mode_units(text: str, language: str) -> List[Tuple[int, str, int, 
 
 
 _GAP_FRAME_MS = 10
-_GAP_SILENCE_RATIO = 0.15  # a frame under 15% of the clip's peak RMS counts as silence
+# A frame under this fraction of the clip's peak RMS counts as silence. Empirically checked
+# against 5 short real Chatterbox (Original model) clips: 0.15 missed one true sentence gap
+# (a low-energy consonant onset early in a sentence briefly outscored it); 0.20-0.30 found all
+# 8 expected gaps, including in a comma-heavy sentence where the real gap was still correctly
+# picked over both comma pauses. Not re-validated against longer or different-voice audio.
+_GAP_SILENCE_RATIO = 0.20
 
 
 def _silence_runs(audio: AudioSegment) -> List[Tuple[int, int]]:
