@@ -20,6 +20,9 @@ reviewed: the upload and reference-audio endpoints, the `/tts` UI path and its s
 the config manager, the static UI, the alternative Dockerfiles, and the pip-installed `chatterbox-v2`
 model package (not in this repository; the speed patch edits it at build time). Server-side speed ideas
 that need a GPU to test are in section 3, Priority 3b.
+A second pass over the rest of `chatterbox/` (remaining endpoints, config manager, browser UI) and the
+pip-installed model package is in `REVIEW_FINDINGS_CHATTERBOX.md` (F-49 onward); its section 2 lists
+corrections to F-03, F-10, F-22, F-24 and F-45 below.
 
 ---
 
