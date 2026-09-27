@@ -1,5 +1,11 @@
 # Third-party notices
 
+## Chatterbox-TTS-Server
+
+`chatterbox/` is [Chatterbox-TTS-Server](https://github.com/devnen/Chatterbox-TTS-Server) by devnen,
+MIT licensed; its licence is in [`chatterbox/LICENSE`](chatterbox/LICENSE). Local changes are in the
+commit that follows the subtree import (`git log -- chatterbox`).
+
 ## abogen
 
 The chapter auto-selection scoring in `audiobook_generator/core/chapter_selection.py` (title and

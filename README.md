@@ -6,6 +6,15 @@ audiobooks with a self-hosted [Chatterbox-TTS-Server](https://github.com/devnen/
 single-file M4B output and a book queue. The upstream README follows below; the command-line tool
 still works as documented there.
 
+The repo holds the whole stack:
+
+| Path | What |
+|---|---|
+| repo root | The audiobook app (this fork of epub_to_audiobook) |
+| [`chatterbox/`](chatterbox/) | Chatterbox-TTS-Server, added as a git subtree at upstream commit 915ae28, plus one commit of local patches (AAC/FLAC output, cleaner speed changes, faster generation, a GPU memory-leak fix) |
+| [`docker-compose.chatterbox.yml`](docker-compose.chatterbox.yml) | Builds and runs both as two containers |
+| [`docs/chatterbox-edition/`](docs/chatterbox-edition/) | Work log, findings and the code-review brief |
+
 ## What this fork adds
 
 **Web UI** (`audiobook_generator/ui/chatterbox_ui.py`, served by `main_ui.py`)
@@ -39,12 +48,24 @@ still works as documented there.
 
 ## Running it
 
-1. Run Chatterbox-TTS-Server in Docker and put this container on the same Docker network.
-2. Edit the `/path/to/...` entries in [`docker-compose.chatterbox.yml`](docker-compose.chatterbox.yml), then:
+Needs Docker with an NVIDIA GPU (Chatterbox's Original model uses about 4.5 GB of VRAM).
+
+1. Copy [`.env.example`](.env.example) to `.env` and set the paths. For a first run, copy
+   `chatterbox/config.yaml` and `chatterbox/voices/` into the folder you set as `CHATTERBOX_DATA`.
+2. Create the Docker network once (`docker network create tts`), or point `DOCKER_NETWORK` at an existing one.
+3. Build and start both containers:
    ```
    docker compose -f docker-compose.chatterbox.yml up -d --build
    ```
-3. Open http://localhost:7860.
+   The first build of the Chatterbox image downloads CUDA and PyTorch and takes a while; later
+   builds only redo the layers that changed.
+4. Open http://localhost:7860 (Chatterbox's own UI and API are on port 8004).
+
+Updating Chatterbox from upstream: `git subtree pull --prefix=chatterbox
+https://github.com/devnen/Chatterbox-TTS-Server.git main --squash`, then check the local patches still
+apply. `chatterbox/patches/apply_speed_patches.py` stops the image build if its target code changed.
+
+Settings the app reads (the compose file sets them):
 
 | Environment variable | Purpose |
 |---|---|
@@ -62,7 +83,8 @@ Tests: `python -m unittest discover -s tests -t . -p "*test*.py"` (ffmpeg requir
 
 ## Credits
 
-MIT licensed, like upstream. The chapter auto-selection scoring is adapted from
+MIT licensed, like upstream. `chatterbox/` is Chatterbox-TTS-Server by devnen (MIT, see
+`chatterbox/LICENSE`). The chapter auto-selection scoring is adapted from
 [abogen](https://github.com/denizsafak/abogen) (MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---

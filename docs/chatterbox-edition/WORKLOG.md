@@ -3,11 +3,15 @@
 Covers 2026-09-25 to 2026-09-27. Written for the owner and for any agent reviewing or continuing
 this project. Personal library details (book titles, authors) are deliberately left out.
 
+Since 2026-09-27 this repo holds the whole stack: the audiobook app at the root and the Chatterbox
+server in `chatterbox/` (upstream commit 915ae28 as a git subtree, then one commit of local patches),
+deployed together by `docker-compose.chatterbox.yml` as two containers.
+
 ## 1. The setup
 
 | Component | Role | Notes |
 |---|---|---|
-| [Chatterbox-TTS-Server](https://github.com/devnen/Chatterbox-TTS-Server) (MIT), container `chatterbox`, port 8004 | Speech engine | "Original" English model, BF16, RTX 4070 (12 GB), ~4.4 GiB VRAM. Local patches: see section 2.3. |
+| [Chatterbox-TTS-Server](https://github.com/devnen/Chatterbox-TTS-Server) (MIT), container `chatterbox`, port 8004 | Speech engine | "Original" English model, BF16, RTX 4070 (12 GB), ~4.4 GiB VRAM. Built from `chatterbox/`; local patches in section 2.3. |
 | This app, container `epub-to-audiobook`, port 7860 | EPUB → audiobook | Local build of this repo; talks to Chatterbox's OpenAI-compatible `/v1/audio/speech`. |
 | BookOrbit (self-hosted library and reader) | Plays the finished books; also has live read-aloud TTS | Separate project; see section 4. |
 | Kokoro-FastAPI, container `kokoro` (stopped) | Alternative engine | ~50× real time vs Chatterbox's ~1.8×, but no voice cloning and flatter delivery. Not wired into this app yet. |
@@ -25,7 +29,7 @@ EPUB (library mount or upload)
  → audiobook library → BookOrbit
 ```
 
-## 2. Chatterbox server (outside this repo)
+## 2. Chatterbox server (`chatterbox/`)
 
 ### 2.1 Behaviour this app depends on (verified)
 
@@ -58,7 +62,7 @@ EPUB (library mount or upload)
   every 8 steps (no gain), `cfg_weight = 0` (breaks this fork's unconditional batch slice).
 - Not yet tried: CUDA graphs or `torch.compile` with a static KV cache for the per-token step.
 
-### 2.3 Local patches (see [chatterbox-server-local-patches.diff](chatterbox-server-local-patches.diff))
+### 2.3 Local patches (the commit after the subtree add: `git log -- chatterbox`)
 
 | Patch | Why | Result |
 |---|---|---|
@@ -69,8 +73,9 @@ EPUB (library mount or upload)
 | `torch.clear_autocast_cache()` after each generation | GPU memory leak: +461 live CUDA tensors (+248 MB) over 240 requests; host RAM reached 12 GB over hours | Flat after the fix |
 | `TTS_BF16=auto` | Faster Original model | Enabled |
 
-Tidy-up owed: the `engine.py` comment above the autocast fix still says "TEMP … suspected fix",
-although the fix was verified.
+Until 2026-09-27 these patches existed only as uncommitted edits in a local clone, deployed through
+a thin image (`FROM` the full build, `COPY server.py`). They are now committed here and the image is
+built from `chatterbox/`.
 
 ## 3. Voice reference clips (findings)
 
@@ -156,16 +161,20 @@ non-story after one fix (a novel stored as a single section that begins with its
 | K15 | The OpenAI provider logs "Unsupported model name … unable to retrieve the price" for every chapter; the cost estimate is meaningless for a local server. |
 | K16 | Voice lab "Save for books" changes Chatterbox's global settings at once, including for a book in progress and for BookOrbit. |
 | K17 | At speeds other than 1.0, Chatterbox stretches each unit separately; the inserted pauses are scaled on the client. |
-| K18 | The Chatterbox `engine.py` comment described in 2.3 is out of date. |
 
 ## 8. Run, test, deploy
 
 - Tests (need ffmpeg): `python -m unittest discover -s tests -t . -p "*test*.py"`. The owner runs
   them inside the image: `docker run --rm --entrypoint python3 -v <repo>:/src -w /src
   epub_to_audiobook:local -m unittest discover -s tests -t . -p "*test*.py"`.
-- Deploy: `docker compose build && docker compose up -d` in the stack folder (the owner's compose
-  builds from this repo; see `docker-compose.chatterbox.yml` for a template). Restarting while a
-  book is generating stops it; the queue resumes it on the next start.
+- Deploy both containers: `docker compose -f docker-compose.chatterbox.yml up -d --build`, with
+  this machine's paths in `.env` (see `.env.example`). The owner's stack folder has a small
+  `compose.yaml` that includes the repo's file with its own `.env`. Rebuilding the app is quick;
+  rebuilding Chatterbox only redoes changed layers unless its requirements change. Restarting the app
+  while a book is generating stops it, and the queue resumes it on the next start; restarting
+  Chatterbox fails the chapter in progress (K6).
+- Chatterbox upstream updates: `git subtree pull --prefix=chatterbox
+  https://github.com/devnen/Chatterbox-TTS-Server.git main --squash`, then re-check the patches.
 - Upstream updates: `git fetch upstream && git merge upstream/main`, then run the tests and rebuild.
 - On Windows, set `git config core.eol lf` before checking out (K14).
 

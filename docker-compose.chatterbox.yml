@@ -1,37 +1,82 @@
-# Example deployment next to a Chatterbox-TTS-Server container
-# (https://github.com/devnen/Chatterbox-TTS-Server). Replace the /path/to/... entries, then:
+# The whole stack: Chatterbox TTS server (./chatterbox) + the audiobook web UI (repo root).
+# Two containers, one project. Copy .env.example to .env, set the paths, then:
 #   docker compose -f docker-compose.chatterbox.yml up -d --build
-# The web UI is on http://localhost:7860.
+# Web UI: http://localhost:7860 · Chatterbox UI/API: http://localhost:8004 (OpenAI API under /v1)
 services:
+  chatterbox:
+    build:
+      context: ./chatterbox
+      dockerfile: Dockerfile
+      args:
+        - RUNTIME=nvidia
+    image: chatterbox-tts-server:local
+    container_name: chatterbox
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - TZ=${TZ:-UTC}
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - TTS_BF16=auto
+    volumes:
+      # Chatterbox's own settings file and voice clips live outside the repo.
+      - ${CHATTERBOX_DATA:?set CHATTERBOX_DATA in .env}/config.yaml:/app/config.yaml
+      - ${CHATTERBOX_DATA}/voices:/app/voices
+      - ${CHATTERBOX_DATA}/reference_audio:/app/reference_audio
+      - ${CHATTERBOX_DATA}/outputs:/app/outputs
+      - ${CHATTERBOX_DATA}/logs:/app/logs
+      - hf-cache:/app/hf_cache  # downloaded models survive rebuilds
+    ports:
+      - ${CHATTERBOX_PORT:-8004}:8004
+    networks:
+      - tts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+
   epub-to-audiobook:
     build: .
     image: epub_to_audiobook:local
     container_name: epub-to-audiobook
     restart: unless-stopped
+    depends_on:
+      - chatterbox
     command: ["--host", "0.0.0.0", "--port", "7860"]
     environment:
-      # Chatterbox's OpenAI-compatible endpoint (container name "chatterbox" on a shared network).
+      - TZ=${TZ:-UTC}
       - OPENAI_BASE_URL=http://chatterbox:8004/v1
       # Chatterbox has no auth; the OpenAI SDK just needs a non-empty key.
       - OPENAI_API_KEY=not-needed
       # Voice dropdown and "Add a voice" use Chatterbox's voices folder directly.
       - TTS_VOICES_DIR=/voices
-      - OPENAI_DEFAULT_VOICE=Emily.wav
+      - OPENAI_DEFAULT_VOICE=${DEFAULT_VOICE:-Emily.wav}
       # Voice lab reads Chatterbox's saved delivery settings from its config file.
       - CHATTERBOX_CONFIG=/chatterbox/config.yaml
       # Searchable "Book" picker lists this library.
       - EBOOK_LIBRARY_DIR=/library
     volumes:
-      - ./data:/app                                        # queue, library index, logs
-      - /path/to/audiobook-library:/app/audiobook_output   # finished books land here
-      - /path/to/chatterbox/voices:/voices                 # writable: the Voice lab adds voices
-      - /path/to/chatterbox:/chatterbox:ro                 # for config.yaml
-      - /path/to/ebook-library:/library:ro
+      - ${APP_DATA:?set APP_DATA in .env}:/app                            # queue, library index, logs
+      - ${AUDIOBOOK_LIBRARY:?set AUDIOBOOK_LIBRARY in .env}:/app/audiobook_output  # finished books
+      - ${CHATTERBOX_DATA}/voices:/voices                                # writable: the Voice lab adds voices
+      - ${CHATTERBOX_DATA}:/chatterbox:ro                                # for config.yaml
+      - ${EBOOK_LIBRARY:?set EBOOK_LIBRARY in .env}:/library:ro
     ports:
-      - 7860:7860
+      - ${APP_PORT:-7860}:7860
     networks:
       - tts
 
+volumes:
+  hf-cache:
+    # Reuse an existing model cache by naming it here (avoids re-downloading several GB of models).
+    name: ${HF_CACHE_VOLUME:-chatterbox-hf-cache}
+
 networks:
   tts:
-    external: true  # the network your Chatterbox container is on
+    name: ${DOCKER_NETWORK:-tts}
+    external: true  # create once: docker network create tts (or reuse an existing network)

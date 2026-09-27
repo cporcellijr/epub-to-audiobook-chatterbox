@@ -34,3 +34,6 @@ private_examples/
 tests
 logs/
 venv/
+# Chatterbox edition: other build contexts / docs
+chatterbox/
+docs/
