@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 import subprocess
 import tempfile
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import gradio as gr
 
 from audiobook_generator.ui import chatterbox_ui, web_ui
+from audiobook_generator.ui.job_queue import QUEUED
 
 
 def _fake_response(body: bytes = b"") -> MagicMock:
@@ -66,6 +68,57 @@ class TestDeliverySettings(unittest.TestCase):
         self.assertIn("Saved", message)
 
 
+class TestDeliverySettingsRobustness(unittest.TestCase):
+    """F-52: build_ui() calls read_saved_settings() at start-up, so a bad read must never raise.
+    The Chatterbox server rewrites config.yaml non-atomically (copy, then fill), so a read can
+    briefly see the path missing, a directory, empty or unparsable."""
+
+    def setUp(self):
+        self.delay = patch.object(chatterbox_ui, "SETTINGS_READ_RETRY_DELAY_SECONDS", 0.0)
+        self.delay.start()
+
+    def tearDown(self):
+        self.delay.stop()
+
+    def test_directory_falls_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"CHATTERBOX_CONFIG": tmp}):
+            self.assertEqual(chatterbox_ui.read_saved_settings(), chatterbox_ui.FALLBACK_SETTINGS)
+
+    def test_missing_file_falls_back_to_defaults(self):
+        with patch.dict(os.environ, {"CHATTERBOX_CONFIG": "/nonexistent/config.yaml"}):
+            self.assertEqual(chatterbox_ui.read_saved_settings(), chatterbox_ui.FALLBACK_SETTINGS)
+
+    def test_empty_file_falls_back_to_defaults(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            pass  # zero bytes, as a reader can briefly see mid-rewrite
+        try:
+            with patch.dict(os.environ, {"CHATTERBOX_CONFIG": f.name}):
+                self.assertEqual(chatterbox_ui.read_saved_settings(), chatterbox_ui.FALLBACK_SETTINGS)
+        finally:
+            os.remove(f.name)
+
+    def test_unparsable_file_falls_back_to_defaults(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write("{")  # guaranteed to raise yaml.YAMLError, not just parse oddly
+        try:
+            with patch.dict(os.environ, {"CHATTERBOX_CONFIG": f.name}):
+                self.assertEqual(chatterbox_ui.read_saved_settings(), chatterbox_ui.FALLBACK_SETTINGS)
+        finally:
+            os.remove(f.name)
+
+    def test_a_transient_glitch_recovers_on_retry(self):
+        good = {"exaggeration": 0.9, "cfg_weight": 0.4, "temperature": 0.5}
+        with patch.object(chatterbox_ui, "_read_generation_defaults", side_effect=[None, good]), \
+                patch.dict(os.environ, {"CHATTERBOX_CONFIG": "/whatever.yaml"}):
+            self.assertEqual(chatterbox_ui.read_saved_settings(), good)
+
+    def test_a_permanent_failure_is_retried_exactly_once(self):
+        with patch.object(chatterbox_ui, "_read_generation_defaults", return_value=None) as read, \
+                patch.dict(os.environ, {"CHATTERBOX_CONFIG": "/whatever.yaml"}):
+            chatterbox_ui.read_saved_settings()
+        self.assertEqual(read.call_count, 2)
+
+
 class TestPreviewVoice(unittest.TestCase):
 
     def test_preview_sends_sliders_and_returns_audio_file(self):
@@ -96,6 +149,35 @@ class TestPreviewVoice(unittest.TestCase):
     def test_no_voice_is_an_error(self):
         with self.assertRaises(gr.Error):
             chatterbox_ui.preview_voice("", "Hi", 0.5, 0.5, 0.8, 1.0)
+
+
+class TestPreviewCleanup(unittest.TestCase):
+    """F-30: preview MP3s must not accumulate in the container's writable layer forever."""
+
+    def tearDown(self):
+        chatterbox_ui._delete_if_exists(chatterbox_ui._current_preview_path)
+        chatterbox_ui._current_preview_path = None
+
+    def test_previous_preview_is_deleted_when_a_new_one_is_made(self):
+        with patch.dict(os.environ, {"CHATTERBOX_URL": "http://cb:8004"}), \
+                patch("urllib.request.urlopen", return_value=_fake_response(b"one")):
+            first = chatterbox_ui.preview_voice("Elena.wav", "Hi", 0.5, 0.5, 0.8, 1.0)
+        self.assertTrue(os.path.isfile(first))
+        with patch.dict(os.environ, {"CHATTERBOX_URL": "http://cb:8004"}), \
+                patch("urllib.request.urlopen", return_value=_fake_response(b"two")):
+            second = chatterbox_ui.preview_voice("Elena.wav", "Hi", 0.5, 0.5, 0.8, 1.0)
+        self.assertFalse(os.path.isfile(first))
+        self.assertTrue(os.path.isfile(second))
+
+    def test_sweep_removes_leftover_previews(self):
+        handle, path = tempfile.mkstemp(prefix="voice_preview_", suffix=".mp3")
+        os.close(handle)
+        try:
+            chatterbox_ui.sweep_voice_previews()
+            self.assertFalse(os.path.isfile(path))
+        finally:
+            if os.path.isfile(path):
+                os.remove(path)
 
 
 class TestAddVoice(unittest.TestCase):
@@ -159,7 +241,8 @@ class TestBuildConfig(unittest.TestCase):
 
 TABLE = [[1, False, "Title page", "Title", "under 1 min"], [2, True, "One", "It was", "26 min"],
          [3, True, "Two", "It was", "25 min"]]
-SETTINGS = ("out", "Elena.wav", 1.0, 0.35, 0.9, True, False, False, "auto", "double", False, False, None, "INFO")
+SETTINGS = ("audiobook_output/out", "Elena.wav", 1.0, 0.35, 0.9, True, False, False, "auto", "double", False,
+            False, None, "INFO")
 
 
 class TestQueueSettings(unittest.TestCase):
@@ -168,8 +251,13 @@ class TestQueueSettings(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.uploads = patch.object(chatterbox_ui, "QUEUE_UPLOADS", os.path.join(self.tmp.name, "uploads"))
         self.uploads.start()
+        # These tests use "/library/book.epub" as a stand-in library pick (F-21 requires it be
+        # inside the configured library folder).
+        self.env = patch.dict(os.environ, {"EBOOK_LIBRARY_DIR": "/library"})
+        self.env.start()
 
     def tearDown(self):
+        self.env.stop()
         self.uploads.stop()
         self.tmp.cleanup()
 
@@ -224,6 +312,120 @@ class TestQueueSettings(unittest.TestCase):
         self.assertAlmostEqual(seconds, 2 * 1800 / 1.8 * 1.14, delta=1)
 
 
+class TestOutputDirSafety(unittest.TestCase):
+    """F-12 (folder collisions) and F-21 (path containment)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "audiobook_output")
+        os.makedirs(self.root)
+        self.library = os.path.join(self.tmp.name, "library")
+        os.makedirs(self.library)
+        self.book = os.path.join(self.library, "book.epub")
+        open(self.book, "w").close()
+        self.patches = [
+            patch.object(chatterbox_ui, "OUTPUT_ROOT", self.root),
+            patch.dict(os.environ, {"EBOOK_LIBRARY_DIR": self.library}),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def _settings(self, output_dir, library_book=None, skip_existing=False, active_jobs=None):
+        library_book = library_book if library_book is not None else self.book
+        return chatterbox_ui.queue_settings(library_book, None, TABLE, output_dir, "Elena.wav", 1.0, 0.35, 0.9,
+                                            True, skip_existing, False, "auto", "double", False, False, None,
+                                            "INFO", active_jobs=active_jobs)
+
+    def test_output_dir_must_be_inside_output_root(self):
+        with self.assertRaises(gr.Error):
+            self._settings(os.path.join(self.tmp.name, "elsewhere"))
+
+    def test_output_dir_inside_output_root_is_accepted(self):
+        settings = self._settings(os.path.join(self.root, "Book"))
+        self.assertEqual(settings["output_dir"], os.path.join(self.root, "Book"))
+
+    def test_library_book_must_be_inside_library_dir(self):
+        outside = os.path.join(self.tmp.name, "outside.epub")
+        open(outside, "w").close()
+        with self.assertRaises(gr.Error):
+            self._settings(os.path.join(self.root, "Book"), library_book=outside)
+
+    def test_refuses_a_folder_already_queued(self):
+        target = os.path.join(self.root, "Book")
+        active = [{"status": QUEUED, "title": "Book (already queued)", "settings": {"output_dir": target}}]
+        with self.assertRaises(gr.Error):
+            self._settings(target, active_jobs=active)
+
+    def test_a_different_folder_is_unaffected_by_other_queued_jobs(self):
+        active = [{"status": QUEUED, "title": "Other book",
+                  "settings": {"output_dir": os.path.join(self.root, "Other")}}]
+        settings = self._settings(os.path.join(self.root, "Book"), active_jobs=active)
+        self.assertEqual(settings["output_dir"], os.path.join(self.root, "Book"))
+
+    def test_refuses_a_folder_with_an_existing_m4b_unless_skip_existing(self):
+        target = os.path.join(self.root, "Book")
+        os.makedirs(target)
+        open(os.path.join(target, "Book.m4b"), "w").close()
+        with self.assertRaises(gr.Error):
+            self._settings(target)
+        # ticking "Skip chapters already made" is the documented way to resume into the same folder
+        settings = self._settings(target, skip_existing=True)
+        self.assertEqual(settings["output_dir"], target)
+
+    def test_refuses_a_folder_with_a_leftover_chapters_work_folder(self):
+        target = os.path.join(self.root, "Book")
+        os.makedirs(os.path.join(target, chatterbox_ui.CHAPTER_WORK_FOLDER))
+        with self.assertRaises(gr.Error):
+            self._settings(target)
+
+
+class TestUploadValidationOrder(unittest.TestCase):
+    """F-31: an upload copy must never be orphaned by a validation failure discovered later."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.uploads = os.path.join(self.tmp.name, "uploads")
+        self.patch = patch.object(chatterbox_ui, "QUEUE_UPLOADS", self.uploads)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def test_a_missing_replace_file_leaves_no_orphaned_epub_copy(self):
+        upload = os.path.join(self.tmp.name, "mine.epub")
+        with open(upload, "w") as f:
+            f.write("epub")
+        missing_replace_file = os.path.join(self.tmp.name, "gone.txt")  # never created
+        with self.assertRaises(Exception):
+            chatterbox_ui.queue_settings(None, upload, TABLE, "audiobook_output/out", "Elena.wav", 1.0, 0.35,
+                                         0.9, True, False, False, "auto", "double", False, False,
+                                         missing_replace_file, "INFO")
+        self.assertEqual(os.listdir(self.uploads) if os.path.isdir(self.uploads) else [], [])
+
+    def test_sweep_deletes_files_no_job_references(self):
+        os.makedirs(self.uploads, exist_ok=True)
+        orphan = os.path.join(self.uploads, "upload_orphan.epub")
+        open(orphan, "w").close()
+        referenced = os.path.join(self.uploads, "upload_kept.epub")
+        open(referenced, "w").close()
+        queue = MagicMock()
+        queue.jobs.return_value = [{"settings": {"input_file": referenced, "search_and_replace_file": None}}]
+        chatterbox_ui.sweep_orphaned_uploads(queue)
+        self.assertFalse(os.path.isfile(orphan))
+        self.assertTrue(os.path.isfile(referenced))
+
+    def test_sweep_is_a_no_op_without_an_uploads_folder(self):
+        queue = MagicMock()
+        queue.jobs.return_value = []
+        chatterbox_ui.sweep_orphaned_uploads(queue)  # must not raise just because nothing was ever uploaded
+
+
 class TestQueueView(unittest.TestCase):
 
     def test_rows_and_status(self):
@@ -272,6 +474,15 @@ class TestChapterList(unittest.TestCase):
             None, None, 1.0, 0.35, 0.9, "auto", "double", False, False, None)
         self.assertFalse(table["visible"])
         self.assertEqual((stats, summary), ([], ""))
+
+    def test_typed_text_that_is_not_a_book_explains_itself(self):
+        # F-42c: typed text with no upload used to hide the table with an empty message.
+        table, stats, summary = chatterbox_ui.chapter_overview(
+            "detour", None, 1.0, 0.35, 0.9, "auto", "double", False, False, None)
+        self.assertFalse(table["visible"])
+        self.assertEqual(stats, [])
+        self.assertNotEqual(summary, "")
+        self.assertIn("Pick the book from the list", summary)
 
     def test_summary_follows_ticks_speed_and_pauses(self):
         stats = [[20, 1, 1], [30300, 1, 1], [30300, 1, 1]]  # 30,300 chars = 25 min of speech at 1.0x
@@ -355,9 +566,58 @@ class TestLayout(unittest.TestCase):
         self.assertIn("Voice", labels)
         self.assertIn("Book", labels)
         self.assertIn("Exaggeration", labels)
-        self.assertIn("Voice sample: 10-15 s of one person speaking clearly", labels)
+        self.assertIn("Voice sample: ~10 s of one person speaking clearly", labels)
         for removed in ("Azure", "Edge", "Piper", "Model", "Voice Instructions", "Worker Count", "Output Format"):
             self.assertNotIn(removed, labels)
+
+    def test_voice_lab_explains_that_save_also_waits(self):
+        # F-42d: only a preview waiting for the current chunk used to be mentioned.
+        ui = chatterbox_ui.build_ui()
+        texts = [block.value for block in ui.blocks.values() if isinstance(getattr(block, "value", None), str)]
+        joined = " ".join(texts)
+        self.assertIn("waits for the current chunk", joined)
+        self.assertIn("Save", joined)
+
+
+class TestUploadTableSequencing(unittest.TestCase):
+    """F-42b: uploading a book must build the chapter table once, from the upload -- not once (briefly,
+    wrongly) from the previous library pick and again from the upload."""
+
+    def test_input_file_change_does_not_directly_trigger_chapter_overview(self):
+        ui = chatterbox_ui.build_ui()
+        input_file_id = next(block._id for block in ui.blocks.values()
+                             if getattr(block, "label", None) == "EPUB file")
+        direct_triggers = {
+            getattr(fn.fn, "__name__", None)
+            for fn in ui.fns.values()
+            for target_id, event in getattr(fn, "targets", [])
+            if target_id == input_file_id and event == "change"
+        }
+        self.assertIn("uploaded_book_selected", direct_triggers)
+        self.assertNotIn("chapter_overview", direct_triggers)
+
+    def test_chapter_overview_is_still_reachable_after_an_upload(self):
+        # The .then() chain must exist somewhere, or an upload would never refresh the table at all.
+        ui = chatterbox_ui.build_ui()
+        names = {getattr(fn.fn, "__name__", None) for fn in ui.fns.values()}
+        self.assertIn("chapter_overview", names)
+
+
+class TestHostUiProcessFactory(unittest.TestCase):
+    """F-19: job processes are forked from a multithreaded server; host_ui must use the spawn
+    context instead of the platform default (fork on Linux)."""
+
+    def test_job_queue_is_built_with_a_spawn_process_factory(self):
+        fake_queue = MagicMock()
+        with patch.object(chatterbox_ui.library_index, "load_index", return_value={}), \
+                patch.object(chatterbox_ui.library_index, "refresh_index"), \
+                patch.object(chatterbox_ui, "sweep_voice_previews"), \
+                patch.object(chatterbox_ui, "sweep_orphaned_uploads"), \
+                patch.object(chatterbox_ui, "build_ui", return_value=MagicMock()), \
+                patch.object(chatterbox_ui, "JobQueue", return_value=fake_queue) as job_queue_cls:
+            chatterbox_ui.host_ui(MagicMock(host="127.0.0.1", port=7860))
+        self.assertEqual(job_queue_cls.call_args.kwargs["process_factory"],
+                         multiprocessing.get_context("spawn").Process)
 
 
 if __name__ == "__main__":

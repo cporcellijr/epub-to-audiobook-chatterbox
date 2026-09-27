@@ -11,15 +11,18 @@ Environment:
     OPENAI_DEFAULT_VOICE Voice selected by default
     EBOOK_LIBRARY_DIR    Ebook library (read-only mount) for the searchable book picker
 """
+import glob
 import json
+import multiprocessing
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
-from typing import Optional
+from typing import List, Optional
 
 import gradio as gr
 import yaml
@@ -80,16 +83,44 @@ def _http_error_detail(error: urllib.error.HTTPError) -> str:
 
 # ---- Delivery settings (Chatterbox generation defaults) ----
 
+# The Chatterbox server rewrites config.yaml non-atomically (copy, then fill), so a read can briefly
+# see it missing, empty or mid-write; one retry after this short a delay rides out that window (F-52).
+SETTINGS_READ_RETRY_DELAY_SECONDS = 0.2
+
+
+def _read_generation_defaults(path: str) -> Optional[dict]:
+    """One attempt to read Chatterbox's generation_defaults; None if `path` is missing, a directory,
+    empty or unparsable, instead of raising."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    defaults = data.get("generation_defaults")
+    return defaults if isinstance(defaults, dict) else None
+
+
 def read_saved_settings() -> dict:
-    """Chatterbox's saved delivery settings, read from its config file (never blocks on a busy server)."""
+    """Chatterbox's saved delivery settings, read from its config file (never blocks on a busy
+    server, and never raises). build_ui() calls this at start-up, so a bad read must fall back to
+    defaults instead of taking the UI down with it."""
     path = os.environ.get("CHATTERBOX_CONFIG")
     settings = dict(FALLBACK_SETTINGS)
-    if path and os.path.isfile(path):
-        with open(path, encoding="utf-8") as f:
-            defaults = (yaml.safe_load(f) or {}).get("generation_defaults", {})
-        for key in settings:
-            if isinstance(defaults.get(key), (int, float)):
-                settings[key] = float(defaults[key])
+    if not path:
+        return settings
+    defaults = _read_generation_defaults(path)
+    if defaults is None:
+        time.sleep(SETTINGS_READ_RETRY_DELAY_SECONDS)
+        defaults = _read_generation_defaults(path)
+    if defaults is None:
+        print(f"Could not read Chatterbox settings from '{path}' (missing, a directory, empty or "
+              "unparsable after one retry); using defaults.")
+        return settings
+    for key in settings:
+        if isinstance(defaults.get(key), (int, float)):
+            settings[key] = float(defaults[key])
     return settings
 
 
@@ -118,9 +149,28 @@ def save_settings(exaggeration: float, cfg_weight: float, temperature: float) ->
 
 # ---- Voice preview ----
 
+_current_preview_path: Optional[str] = None
+
+
+def _delete_if_exists(path: Optional[str]) -> None:
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def sweep_voice_previews() -> None:
+    """Delete leftover preview files from earlier runs (F-30): otherwise the container's writable
+    layer grows by one small MP3 per Play, for as long as the container lives."""
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "voice_preview_*")):
+        _delete_if_exists(path)
+
+
 def preview_voice(voice: str, phrase: str, exaggeration: float, cfg_weight: float,
                   temperature: float, speed: float) -> str:
     """Speak the phrase with the slider values (not saved) and return the audio file path."""
+    global _current_preview_path
     if not voice:
         raise gr.Error("Pick a voice first.")
     text = (phrase or "").strip() or PREVIEW_PHRASE
@@ -145,6 +195,8 @@ def preview_voice(voice: str, phrase: str, exaggeration: float, cfg_weight: floa
     handle, path = tempfile.mkstemp(prefix="voice_preview_", suffix=".mp3")
     with os.fdopen(handle, "wb") as f:
         f.write(audio)
+    _delete_if_exists(_current_preview_path)
+    _current_preview_path = path
     return path
 
 
@@ -269,13 +321,67 @@ def _copy_for_queue(path, suffix: str) -> str:
     return os.path.abspath(copy)
 
 
+def sweep_orphaned_uploads(queue: JobQueue) -> None:
+    """Delete files in queue_uploads/ that no job references (F-31): a crash or an error between
+    copying an upload and queuing the job would otherwise leave it there forever."""
+    if not os.path.isdir(QUEUE_UPLOADS):
+        return
+    referenced = set()
+    for job in queue.jobs():
+        for key in ("input_file", "search_and_replace_file"):
+            path = job["settings"].get(key)
+            if path:
+                referenced.add(os.path.abspath(path))
+    for name in os.listdir(QUEUE_UPLOADS):
+        path = os.path.abspath(os.path.join(QUEUE_UPLOADS, name))
+        if os.path.isfile(path) and path not in referenced:
+            try:
+                os.remove(path)
+            except OSError as e:
+                print(f"Could not remove orphaned upload {path}: {e}")
+
+
+def _within_root(path: str, root: str) -> bool:
+    """True if `path` resolves (symlinks included) to `root` itself or somewhere inside it."""
+    if not root or not path:
+        return False
+    real_root = os.path.realpath(root)
+    real_path = os.path.realpath(path)
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
+
+
+CHAPTER_WORK_FOLDER = ".chapters"  # mirrors core.audiobook_generator.CHAPTER_WORK_FOLDER
+
+
+def _refuse_if_output_dir_unavailable(output_dir: str, skip_existing: bool, active_jobs: List[dict]) -> None:
+    """Refuse an output folder another queued/running book already owns, and guard against silently
+    overwriting a finished book unless the owner ticked 'Skip chapters already made' (F-12)."""
+    target = os.path.realpath(output_dir)
+    for job in active_jobs:
+        if job.get("status") in (QUEUED, RUNNING):
+            other = job.get("settings", {}).get("output_dir")
+            if other and os.path.realpath(other) == target:
+                raise gr.Error(f"'{output_dir}' is already queued as '{job.get('title', 'another book')}'. "
+                               "Pick a different output folder.")
+    if not skip_existing and os.path.isdir(target):
+        names = os.listdir(target)
+        has_book = any(name.lower().endswith(".m4b") for name in names) or CHAPTER_WORK_FOLDER in names
+        if has_book:
+            raise gr.Error(f"'{output_dir}' already has a book in it. Use a different output folder "
+                           "(e.g. add the author's name) or tick 'Skip chapters already made' to resume it.")
+
+
 def queue_settings(library_book, input_file, chapter_table, output_dir: str, voice: str, speed: float,
                    sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
                    output_text: bool, title_mode: str, newline_mode: str, remove_endnotes: bool,
-                   remove_reference_numbers: bool, search_and_replace_file, log_level: str) -> dict:
+                   remove_reference_numbers: bool, search_and_replace_file, log_level: str,
+                   active_jobs: Optional[List[dict]] = None) -> dict:
     """Validate the form and turn it into build_config keyword arguments for a queued book."""
-    if library_book and not os.path.isfile(library_book):
-        raise gr.Error("Pick the book from the list as you type (or clear the box to use an upload).")
+    if library_book:
+        if not os.path.isfile(library_book):
+            raise gr.Error("Pick the book from the list as you type (or clear the box to use an upload).")
+        if not _within_root(library_book, library_index.library_dir()):
+            raise gr.Error("That book is outside the ebook library folder.")
     upload = input_file.name if hasattr(input_file, "name") else input_file
     if not library_book and not upload:
         raise gr.Error("Pick a book from the library or upload an EPUB first.")
@@ -284,19 +390,32 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         raise gr.Error("Tick at least one chapter.")
     if not voice:
         raise gr.Error("Pick a voice.")
-    if not (output_dir or "").strip():
+    output_dir = (output_dir or "").strip()
+    if not output_dir:
         raise gr.Error("Set an output folder.")
+    if not _within_root(output_dir, OUTPUT_ROOT):
+        raise gr.Error(f"Output folder must be inside '{OUTPUT_ROOT}'.")
+    _refuse_if_output_dir_unavailable(output_dir, bool(skip_existing), active_jobs or [])
     replace_file = (search_and_replace_file.name if hasattr(search_and_replace_file, "name")
                     else search_and_replace_file)
+    if replace_file and not os.path.isfile(replace_file):
+        raise gr.Error("The search & replace file could not be read.")
+    if upload and not library_book and not os.path.isfile(upload):
+        raise gr.Error("The uploaded EPUB could not be read.")
+    # Every check above has passed, so copying now can never orphan one file because a later
+    # validation failed (F-31); sweep_orphaned_uploads() is the backstop for anything else (a crash,
+    # a disk error) that still leaves one behind.
+    queued_input_file = library_book or _copy_for_queue(upload, ".epub")
+    queued_replace_file = _copy_for_queue(replace_file, ".txt") if replace_file else None
     return {
-        "input_file": library_book or _copy_for_queue(upload, ".epub"),
-        "output_dir": output_dir.strip(), "voice": voice, "speed": float(speed),
+        "input_file": queued_input_file,
+        "output_dir": output_dir, "voice": voice, "speed": float(speed),
         "chapter_selection": selection, "sentence_pause": float(sentence_pause),
         "paragraph_pause": float(paragraph_pause), "output_m4b": bool(output_m4b),
         "skip_existing": bool(skip_existing), "output_text": bool(output_text), "title_mode": title_mode,
         "newline_mode": newline_mode, "remove_endnotes": bool(remove_endnotes),
         "remove_reference_numbers": bool(remove_reference_numbers),
-        "search_and_replace_file": _copy_for_queue(replace_file, ".txt") if replace_file else None,
+        "search_and_replace_file": queued_replace_file,
         "log_level": log_level,
     }
 
@@ -427,8 +546,14 @@ def chapter_overview(library_book, input_file, speed, sentence_pause, paragraph_
                      newline_mode: str, remove_endnotes: bool, remove_reference_numbers: bool,
                      search_and_replace_file) -> tuple:
     """Chapter table with story chapters pre-ticked and front/back matter unticked."""
-    book = library_book if library_book and os.path.isfile(library_book) else input_file
+    valid_library_pick = bool(library_book) and os.path.isfile(library_book)
+    book = library_book if valid_library_pick else input_file
     if not book:
+        if library_book and not input_file:
+            # Typed text that doesn't match a library book, with nothing uploaded either: say so
+            # instead of silently hiding the table (F-42c).
+            return (gr.update(value=None, visible=False), [],
+                    "Pick the book from the list as you type (or clear the box to use an upload).")
         return gr.update(value=None, visible=False), [], ""
     book = book.name if hasattr(book, "name") else book
     try:
@@ -507,7 +632,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         return gr.update(value=rows), ids, status
 
     def enqueue(library_book, input_file, chapter_table, stats, *settings) -> tuple:
-        job_settings = queue_settings(library_book, input_file, chapter_table, *settings)
+        job_settings = queue_settings(library_book, input_file, chapter_table, *settings, active_jobs=queue.jobs())
         title = os.path.basename(job_settings["output_dir"].rstrip("/\\")) or "Book"
         position = queue.add(title, job_settings, len(job_settings["chapter_selection"]),
                              generation_estimate(chapter_table, stats), job_settings["voice"])
@@ -616,8 +741,9 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
 
         with gr.Tab("Voice lab"):
             gr.Markdown("Try voices and tune delivery. **Save** applies the sliders to every book "
-                        "(including one in progress). While a book is generating, a preview waits for "
-                        "the current chunk to finish (up to about a minute).")
+                        "(including one in progress). While a book is generating, a preview or "
+                        "**Save** waits for the current chunk to finish (up to about a minute): "
+                        "Chatterbox handles one request at a time.")
             with gr.Row(equal_height=True):
                 lab_voice = gr.Dropdown(choices, value=default_voice, label="Voice", allow_custom_value=True)
                 phrase = gr.Textbox(PREVIEW_PHRASE, lines=2, label="Phrase")
@@ -639,7 +765,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             gr.Markdown("### Add a voice")
             with gr.Row(equal_height=True):
                 sample = gr.Audio(sources=["upload"], type="filepath",
-                                  label="Voice sample: 10-15 s of one person speaking clearly")
+                                  label="Voice sample: ~10 s of one person speaking clearly")
                 with gr.Column():
                     new_voice_name = gr.Textbox(label="Voice name")
                     remove_pauses = gr.Checkbox(True, label="Remove long pauses (recommended)",
@@ -651,8 +777,20 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         settings = [output_dir, voice, speed, sentence_pause, paragraph_pause, output_m4b, skip_existing,
                     output_text, title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
                     search_and_replace_file, log_level]
+        # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
+        # this re-runs the auto-selection. Ticks, speed, pauses and "Tick all" only touch the table.
+        timing = [speed, sentence_pause, paragraph_pause]
+        overview_inputs = [library_book, input_file, *timing, title_mode, newline_mode, remove_endnotes,
+                           remove_reference_numbers, search_and_replace_file]
+        overview_outputs = [chapter_table, chapter_stats_state, chapters_info]
+
         library_book.change(library_output_dir, inputs=library_book, outputs=output_dir)
-        input_file.change(uploaded_book_selected, inputs=input_file, outputs=[output_dir, library_book])
+        # An upload takes over from the library pick (its handler also clears library_book); chain
+        # with .then() rather than wiring chapter_overview to input_file too, so the table is built
+        # once, from the upload, instead of once from the stale library pick and again from the
+        # upload (F-42b).
+        input_file.change(uploaded_book_selected, inputs=input_file, outputs=[output_dir, library_book]) \
+            .then(chapter_overview, inputs=overview_inputs, outputs=overview_outputs)
         queue_outputs = [queue_table, queue_ids, queue_status]
         selection_outputs = [*queue_outputs, selected_job, selected_info]
         enqueue_button.click(enqueue, inputs=[library_book, input_file, chapter_table, chapter_stats_state, *settings],
@@ -666,13 +804,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         resume_button.click(resume_queue, inputs=None, outputs=queue_outputs)
         stop_button.click(stop_current, inputs=None, outputs=queue_outputs)
 
-        # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
-        # this re-runs the auto-selection. Ticks, speed, pauses and "Tick all" only touch the table.
-        timing = [speed, sentence_pause, paragraph_pause]
-        overview_inputs = [library_book, input_file, *timing, title_mode, newline_mode, remove_endnotes,
-                           remove_reference_numbers, search_and_replace_file]
-        overview_outputs = [chapter_table, chapter_stats_state, chapters_info]
-        for trigger in (library_book, input_file, title_mode, newline_mode, remove_endnotes,
+        for trigger in (library_book, title_mode, newline_mode, remove_endnotes,
                         remove_reference_numbers, search_and_replace_file):
             trigger.change(chapter_overview, inputs=overview_inputs, outputs=overview_outputs)
         auto_tick_button.click(chapter_overview, inputs=overview_inputs, outputs=overview_outputs)
@@ -705,8 +837,13 @@ def host_ui(config) -> None:
         library_index.warm_up_in_background()
     else:
         library_index.refresh_index()  # first run: build the list before the page is served
+    sweep_voice_previews()
+    # Job processes are started from this worker thread while Gradio's request threads run; forking
+    # (the platform default on Linux) can copy another thread's lock mid-hold and hang the child on
+    # its first log line (F-19). Spawn starts each job in a fresh interpreter instead.
     queue = JobQueue(QUEUE_FILE, build_config, lambda: str(web_ui.webui_log_file.absolute()),
-                     uploads_dir=QUEUE_UPLOADS)
+                     process_factory=multiprocessing.get_context("spawn").Process, uploads_dir=QUEUE_UPLOADS)
+    sweep_orphaned_uploads(queue)
     ui = build_ui(queue)
     queue.start_worker()
     ui.launch(server_name=config.host, server_port=config.port)
