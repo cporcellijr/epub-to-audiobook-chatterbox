@@ -1,7 +1,7 @@
 import argparse
 
 from audiobook_generator.config.ui_config import UiConfig
-from audiobook_generator.ui.web_ui import host_ui
+from audiobook_generator.ui.chatterbox_ui import host_ui
 
 
 def handle_args():
