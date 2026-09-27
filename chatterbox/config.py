@@ -3,6 +3,7 @@
 # Handles loading, saving, and providing access to configuration settings.
 
 import os
+import sys
 import logging
 import yaml
 import shutil
@@ -16,8 +17,12 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # --- File Path Constants ---
-# Defines the primary configuration file name.
-CONFIG_FILE_PATH = Path("config.yaml")
+# Defines the primary configuration file path. Default unchanged for upstream
+# compatibility; CHATTERBOX_CONFIG_PATH lets a deployment point this at a file inside a
+# writable, whole-directory bind mount instead of bind-mounting config.yaml itself as a
+# single file, which made every save a copy onto a mount point instead of a real
+# rename (F-52) and turned a missing host file into a directory (F-24).
+CONFIG_FILE_PATH = Path(os.environ.get("CHATTERBOX_CONFIG_PATH", "config.yaml"))
 
 # --- Default Directory Paths ---
 # These paths are used if not specified in config.yaml and are created if they don't exist
@@ -304,6 +309,19 @@ class YamlConfigManager:
         Device settings and path types are resolved after loading.
         """
         with self._lock:  # Ensure thread-safe loading.
+            if CONFIG_FILE_PATH.is_dir():
+                # A single-file Docker bind mount whose host source was missing at
+                # container start creates an empty directory here instead of failing;
+                # reading it as YAML would otherwise fail with an opaque OSError.
+                logger.critical(
+                    f"{CONFIG_FILE_PATH} is a directory, not a file. This usually means "
+                    f"the config file was not copied to the bind-mount source path before "
+                    f"'docker compose up', so Docker created an empty directory in its place. "
+                    f"Copy a config.yaml into that path on the host, remove the empty "
+                    f"directory it created, and restart the container."
+                )
+                sys.exit(1)
+
             base_defaults = self._load_defaults()  # Ensures default paths exist.
 
             if CONFIG_FILE_PATH.exists():
@@ -402,13 +420,12 @@ class YamlConfigManager:
                     )
                     # Non-fatal: proceed with saving even without a backup.
 
-            # Replace the config file with the new content.
-            # Use copy+remove instead of move for compatibility with Docker bind mounts.
-            shutil.copy2(str(temp_file), str(CONFIG_FILE_PATH))
-            try:
-                os.remove(str(temp_file))
-            except OSError:
-                pass  # Temp file cleanup is best-effort
+            # Atomically replace the config file with the new content: a same-directory
+            # rename, so a reader never sees a truncated or empty file (F-52). This needs
+            # CONFIG_FILE_PATH's directory to be a real writable directory rather than a
+            # single-file bind mount itself (a rename onto a mount point fails) — see
+            # CHATTERBOX_CONFIG_PATH above and the compose file's whole-folder mount.
+            os.replace(str(temp_file), str(CONFIG_FILE_PATH))
             logger.info(f"Configuration successfully saved to {CONFIG_FILE_PATH}")
             return True
 
