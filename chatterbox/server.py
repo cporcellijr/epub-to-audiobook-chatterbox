@@ -141,6 +141,13 @@ async def lifespan(app: FastAPI):
     try:
         logger.info(f"Configuration loaded. Log file at: {get_log_file_path()}")
 
+        if config_manager.get_bool("server.use_auth", False):
+            logger.warning(
+                "config sets server.use_auth: true, but this server does not implement "
+                "authentication (F-55); the setting has no effect and every endpoint is "
+                "reachable by anything that can reach this port."
+            )
+
         paths_to_ensure = [
             get_output_path(),
             get_reference_audio_path(),
@@ -190,10 +197,15 @@ app = FastAPI(
 )
 
 # --- CORS Middleware ---
+# No cross-origin access: the bundled web UI is same-origin (needs no CORS at all),
+# and the app + reader app call the API server-to-server, which CORS doesn't govern.
+# The previous allow_origins=["*", "null"] + allow_credentials=True combination let any
+# page loaded in a LAN browser call the unauthenticated /reset_settings, /restart_server,
+# /api/unload and upload endpoints (F-55).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*", "null"],
-    allow_credentials=True,
+    allow_origins=[],
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -456,6 +468,15 @@ async def get_ui_initial_data():
     logger.info("Request received for /api/ui/initial-data.")
     try:
         full_config = get_full_config_for_template()
+        # Redact auth fields before they reach the browser (F-55); use_auth isn't
+        # implemented (see the start-up warning in lifespan()), but there's no reason
+        # for auth_password to be in a response any caller of this API can read.
+        if isinstance(full_config.get("server"), dict):
+            full_config["server"] = {
+                key: value
+                for key, value in full_config["server"].items()
+                if key not in ("auth_username", "auth_password")
+            }
         reference_files = utils.get_valid_reference_files()
         predefined_voices = utils.get_predefined_voices()
 
@@ -731,6 +752,15 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
             error_msg = f"Error processing file '{file.filename}': {str(e_upload)}"
             logger.error(error_msg, exc_info=True)
             upload_errors.append({"filename": file.filename, "error": str(e_upload)})
+            # Don't leave a partial/broken file behind for the voice picker to list (F-61).
+            if destination_path.exists():
+                try:
+                    destination_path.unlink()
+                    logger.info(f"Removed partially written upload: {destination_path}")
+                except OSError as e_cleanup:
+                    logger.warning(
+                        f"Could not remove partial upload {destination_path}: {e_cleanup}"
+                    )
         finally:
             await file.close()
 
@@ -814,6 +844,15 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
             error_msg = f"Error processing predefined voice file '{file.filename}': {str(e_upload)}"
             logger.error(error_msg, exc_info=True)
             upload_errors.append({"filename": file.filename, "error": str(e_upload)})
+            # Don't leave a partial/broken file behind for the voice picker to list (F-61).
+            if destination_path.exists():
+                try:
+                    destination_path.unlink()
+                    logger.info(f"Removed partially written upload: {destination_path}")
+                except OSError as e_cleanup:
+                    logger.warning(
+                        f"Could not remove partial upload {destination_path}: {e_cleanup}"
+                    )
         finally:
             await file.close()
 
@@ -1068,38 +1107,45 @@ async def custom_tts_endpoint(
         )
     # --- End streaming fork ---
 
+    non_stream_loop = asyncio.get_running_loop()
     for i, chunk in enumerate(text_chunks):
         logger.info(f"Synthesizing chunk {i+1}/{len(text_chunks)}...")
         try:
-            chunk_audio_tensor, chunk_sr_from_engine = engine.synthesize(
-                text=chunk,
-                audio_prompt_path=(
-                    str(audio_prompt_path_for_engine)
-                    if audio_prompt_path_for_engine
-                    else None
-                ),
-                temperature=(
-                    request.temperature
-                    if request.temperature is not None
-                    else get_gen_default_temperature()
-                ),
-                exaggeration=(
-                    request.exaggeration
-                    if request.exaggeration is not None
-                    else get_gen_default_exaggeration()
-                ),
-                cfg_weight=(
-                    request.cfg_weight
-                    if request.cfg_weight is not None
-                    else get_gen_default_cfg_weight()
-                ),
-                seed=(
-                    request.seed if request.seed is not None else get_gen_default_seed()
-                ),
-                language=(
-                    request.language
-                    if request.language is not None
-                    else get_gen_default_language()
+            # Run the blocking generation in a threadpool so it doesn't stall the event
+            # loop for the whole chapter (matches the streaming branch above); engine.py's
+            # own lock keeps GPU work serial across concurrent requests.
+            chunk_audio_tensor, chunk_sr_from_engine = await non_stream_loop.run_in_executor(
+                None,
+                lambda chunk=chunk: engine.synthesize(
+                    text=chunk,
+                    audio_prompt_path=(
+                        str(audio_prompt_path_for_engine)
+                        if audio_prompt_path_for_engine
+                        else None
+                    ),
+                    temperature=(
+                        request.temperature
+                        if request.temperature is not None
+                        else get_gen_default_temperature()
+                    ),
+                    exaggeration=(
+                        request.exaggeration
+                        if request.exaggeration is not None
+                        else get_gen_default_exaggeration()
+                    ),
+                    cfg_weight=(
+                        request.cfg_weight
+                        if request.cfg_weight is not None
+                        else get_gen_default_cfg_weight()
+                    ),
+                    seed=(
+                        request.seed if request.seed is not None else get_gen_default_seed()
+                    ),
+                    language=(
+                        request.language
+                        if request.language is not None
+                        else get_gen_default_language()
+                    ),
                 ),
             )
             perf_monitor.record(f"Engine synthesized chunk {i+1}")
@@ -1392,7 +1438,11 @@ async def openai_voices_endpoint(model: str = ""):
         )
 
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
-async def openai_speech_endpoint(request: OpenAISpeechRequest):
+def openai_speech_endpoint(request: OpenAISpeechRequest):
+    # Plain `def`: FastAPI runs this in its threadpool instead of the event loop, so a
+    # chapter-length synthesis no longer blocks every other endpoint (health checks,
+    # /v1/audio/voices, /save_settings). engine.py's own lock keeps GPU work serial
+    # across whichever threadpool workers end up running concurrent requests.
     # Determine the audio prompt path based on the voice parameter
     predefined_voices_path = get_predefined_voices_path(ensure_absolute=True)
     reference_audio_path = get_reference_audio_path(ensure_absolute=True)
@@ -1544,6 +1594,8 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
 
         return StreamingResponse(io.BytesIO(encoded_audio), media_type=media_type)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
