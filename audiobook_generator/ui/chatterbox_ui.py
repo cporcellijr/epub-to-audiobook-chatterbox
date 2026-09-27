@@ -368,7 +368,8 @@ def _refuse_if_output_dir_unavailable(output_dir: str, skip_existing: bool, acti
         has_book = any(name.lower().endswith(".m4b") for name in names) or CHAPTER_WORK_FOLDER in names
         if has_book:
             raise gr.Error(f"'{output_dir}' already has a book in it. Use a different output folder "
-                           "(e.g. add the author's name) or tick 'Skip chapters already made' to resume it.")
+                           "(e.g. add the author's name), or tick 'Skip chapters already made' to resume an "
+                           "unfinished book there (a finished book in that folder will be replaced).")
 
 
 def queue_settings(library_book, input_file, chapter_table, output_dir: str, voice: str, speed: float,
