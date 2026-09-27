@@ -1,4 +1,5 @@
 import logging
+import mimetypes
 import multiprocessing
 import os
 
@@ -10,6 +11,30 @@ from audiobook_generator.utils.log_handler import setup_logging
 from audiobook_generator.utils.filename_sanitizer import make_safe_filename
 
 logger = logging.getLogger(__name__)
+
+
+_MIME_TO_EXT = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/gif': 'gif',
+    'image/webp': 'webp',
+    'image/svg+xml': 'svg',
+    'image/tiff': 'tiff',
+    'image/bmp': 'bmp',
+}
+
+
+def _ext_for_mime(mime: str) -> str:
+    """Return a safe file extension for an image MIME type, defaulting to 'jpg'."""
+    if not mime:
+        return 'jpg'
+    if mime in _MIME_TO_EXT:
+        return _MIME_TO_EXT[mime]
+    # Fall back to mimetypes stdlib (strips the leading dot)
+    ext = mimetypes.guess_extension(mime)
+    if ext:
+        return ext.lstrip('.')
+    return 'jpg'
 
 
 def confirm_conversion():
@@ -30,11 +55,14 @@ def get_total_chars(chapters):
 class AudiobookGenerator:
     def __init__(self, config: GeneralConfig):
         self.config = config
+        self.cover = None
+        self.book_title = None
+        self.book_author = None
 
     def __str__(self) -> str:
         return f"{self.config}"
 
-    def process_chapter(self, idx, title, text, book_author, book_title):
+    def process_chapter(self, idx, title, text):
         """Process a single chapter: write text (if needed) and convert to audio."""
         try:
             logger.info(f"Processing chapter {idx}: {title}")
@@ -75,7 +103,8 @@ class AudiobookGenerator:
                 return True
 
             audio_tags = AudioTags(
-                title, book_author, book_title, idx
+                title, self.book_author, self.book_title, idx,
+                self.cover,
             )
             tts_provider.text_to_speech(text, output_file, audio_tags)
 
@@ -88,8 +117,8 @@ class AudiobookGenerator:
 
     def process_chapter_wrapper(self, args):
         """Wrapper for process_chapter to handle unpacking args for imap."""
-        idx, title, text, book_author, book_title = args
-        return idx, self.process_chapter(idx, title, text, book_author, book_title)
+        idx, title, text = args
+        return idx, self.process_chapter(idx, title, text)
 
     def run(self):
         try:
@@ -98,6 +127,21 @@ class AudiobookGenerator:
             tts_provider = get_tts_provider(self.config)
 
             os.makedirs(self.config.output_folder, exist_ok=True)
+
+            # Log and save book metadata
+            self.book_title = book_parser.get_book_title()
+            self.book_author = book_parser.get_book_author()
+            logger.info(f"Book title: {self.book_title}")
+            logger.info(f"Book author: {self.book_author}")
+
+            self.cover = book_parser.get_book_cover()
+            if self.cover:
+                ext = _ext_for_mime(self.cover.mime)
+                cover_path = os.path.join(self.config.output_folder, f"cover.{ext}")
+                with open(cover_path, 'wb') as f:
+                    f.write(self.cover.data)
+                logger.info(f"Cover saved: {cover_path}")
+
             chapters = book_parser.get_chapters(tts_provider.get_break_string())
             # Filter out empty or very short chapters
             chapters = [(title, text) for title, text in chapters if text.strip()]
@@ -140,18 +184,12 @@ class AudiobookGenerator:
             else:
                 confirm_conversion()
 
-            # Prepare chapters for processing
-            # Extract book metadata once up-front instead of passing the whole
-            # book_parser (and its underlying parsed EPUB, including all embedded
-            # images/binary resources) into every per-chapter task. Doing so would
-            # cause the entire book to be re-pickled and sent to worker processes
-            # once per chapter, causing memory usage to balloon for large books.
-            book_author = book_parser.get_book_author()
-            book_title = book_parser.get_book_title()
-
+            # Prepare chapters for processing. Tasks carry only per-chapter data; book
+            # metadata travels on self (resolved once above) rather than passing the
+            # whole book_parser, which would re-pickle the parsed EPUB per chapter.
             chapters_to_process = chapters[self.config.chapter_start - 1 : self.config.chapter_end]
             tasks = [
-                (idx, title, text, book_author, book_title)
+                (idx, title, text)
                 for idx, (title, text) in enumerate(
                     chapters_to_process, start=self.config.chapter_start
                 )
