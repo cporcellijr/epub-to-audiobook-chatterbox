@@ -1,0 +1,216 @@
+# Local patches to devnen/Chatterbox-TTS-Server (MIT) at commit 915ae28, as deployed on the owner's server.
+# Context for reviewers of epub-to-audiobook-chatterbox; this code is NOT part of this repo.
+# Deployed via Dockerfile (speed patch at build) + Dockerfile.bookorbit-tuning (thin image: FROM 915ae28-build, COPY server.py).
+
+diff --git a/Dockerfile b/Dockerfile
+index 763dafe..a0075a4 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -47,6 +47,9 @@ RUN pip3 install --no-cache-dir --upgrade pip && \
+ # Copy the rest of the application code
+ COPY . .
+ 
++# Local speed patch for the installed chatterbox package (see patches/apply_speed_patches.py)
++RUN python3 patches/apply_speed_patches.py
++
+ # Create required directories for the application (fixed syntax error)
+ RUN mkdir -p model_cache reference_audio outputs voices logs hf_cache
+ 
+diff --git a/engine.py b/engine.py
+index a2be1e9..c35e142 100644
+--- a/engine.py
++++ b/engine.py
+@@ -506,6 +506,15 @@ def synthesize(
+                     cfg_weight=cfg_weight,
+                 )
+ 
++        # TEMP: leak investigation 2026-09-26. A fresh T3HuggingfaceBackend wrapper is
++        # built on every call inside T3.inference (self.compiled is reset to False at
++        # the top of that function every time), and this whole generate() runs inside
++        # torch.autocast above. Autocast keeps its own cache of casted weight tensors
++        # keyed off the wrapper module, which does not always get released when the
++        # wrapper itself is discarded. Force-clear it here as the suspected fix.
++        if BF16_ENABLED:
++            torch.clear_autocast_cache()
++
+         # Store conds in cache after first compute for this voice.
+         if conds_key is not None and effective_prompt is not None:
+             if chatterbox_model.conds is not None:
+diff --git a/server.py b/server.py
+index e435185..8a61da7 100644
+--- a/server.py
++++ b/server.py
+@@ -77,7 +77,7 @@ class OpenAISpeechRequest(BaseModel):
+     model: str
+     input_: str = Field(..., alias="input")
+     voice: str
+-    response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
++    response_format: Literal["wav", "opus", "mp3", "aac", "flac"] = "wav"
+     speed: float = 1.0
+     seed: Optional[int] = None
+     language: Optional[str] = None
+@@ -1423,8 +1423,11 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
+             request.seed if request.seed is not None else get_gen_default_seed()
+         )
+ 
+-        # Split long text into chunks for better quality (same as /tts endpoint)
+-        DEFAULT_CHUNK_SIZE = 120
++        # Split long text into chunks for better quality (same as /tts endpoint).
++        # Raised from the upstream default of 120: BookOrbit sends whole
++        # paragraphs per request, and one generation pass per paragraph is
++        # faster than several (Original, 426 chars warm: ~13.0s -> ~10.6s).
++        DEFAULT_CHUNK_SIZE = 500 if engine.loaded_model_type == "original" else 400
+         text_chunks = utils.chunk_text_by_sentences(request.input_, DEFAULT_CHUNK_SIZE)
+         if not text_chunks:
+             raise HTTPException(
+@@ -1501,7 +1504,9 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
+         if encoded_audio is None:
+             raise HTTPException(status_code=500, detail="Failed to encode audio.")
+ 
+-        media_type = f"audio/{request.response_format}"
++        media_type = {"aac": "audio/aac", "flac": "audio/flac"}.get(
++            request.response_format, f"audio/{request.response_format}"
++        )
+ 
+         # Optional: Save to disk if enabled
+         if config_manager.get_bool("audio_output.save_to_disk", False):
+diff --git a/utils.py b/utils.py
+index ec99d5f..3a83cc0 100644
+--- a/utils.py
++++ b/utils.py
+@@ -9,6 +9,7 @@ import re
+ import time
+ import io
+ import uuid
++import subprocess
+ from pathlib import Path
+ from typing import Optional, Tuple, Dict, Any, Set, List
+ from pydub import AudioSegment
+@@ -349,6 +350,21 @@ def encode_audio(
+             )
+             audio_segment.export(output_buffer, format="mp3")
+ 
++        elif output_format == "aac":
++            # ADTS-framed AAC, the same container OpenAI's /audio/speech returns for "aac".
++            audio_clipped = np.clip(audio_array, -1.0, 1.0)
++            audio_int16 = (audio_clipped * 32767).astype(np.int16)
++            audio_segment = AudioSegment(
++                audio_int16.tobytes(),
++                frame_rate=sample_rate,
++                sample_width=2,
++                channels=1,
++            )
++            audio_segment.export(output_buffer, format="adts", codec="aac", bitrate="96k")
++
++        elif output_format == "flac":
++            sf.write(output_buffer, np.clip(audio_array, -1.0, 1.0), rate_to_write, format="flac")
++
+         else:
+             logger.error(
+                 f"Unsupported output format requested for encoding: {output_format}"
+@@ -478,6 +494,41 @@ def save_audio_tensor_to_file(
+ 
+ 
+ # --- Audio Manipulation Utilities ---
++def _ffmpeg_atempo(audio_np: np.ndarray, sample_rate: int, speed_factor: float) -> Optional[np.ndarray]:
++    """Time-stretch mono float32 audio with ffmpeg's atempo (WSOLA) filter.
++
++    librosa.effects.time_stretch is a plain phase vocoder, which smears speech
++    into a metallic, "tin can" sound even at modest rates like 1.25x. atempo keeps
++    speech clean. It accepts 0.5-100 per stage, so slower rates are chained.
++    Returns None if ffmpeg is unavailable or fails.
++    """
++    stages = []
++    remaining = speed_factor
++    while remaining < 0.5:
++        stages.append(0.5)
++        remaining /= 0.5
++    stages.append(remaining)
++    filter_arg = ",".join(f"atempo={stage:.6f}" for stage in stages)
++    try:
++        proc = subprocess.run(
++            [
++                "ffmpeg", "-hide_banner", "-loglevel", "error",
++                "-f", "f32le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0",
++                "-filter:a", filter_arg,
++                "-f", "f32le", "-ar", str(sample_rate), "-ac", "1", "pipe:1",
++            ],
++            input=np.ascontiguousarray(audio_np, dtype=np.float32).tobytes(),
++            capture_output=True,
++            timeout=60,
++            check=True,
++        )
++    except (OSError, subprocess.SubprocessError) as e:
++        logger.warning(f"ffmpeg atempo failed for speed factor {speed_factor}: {e}", exc_info=True)
++        return None
++    stretched = np.frombuffer(proc.stdout, dtype=np.float32)
++    return stretched.copy() if stretched.size else None
++
++
+ def apply_speed_factor(
+     audio_tensor: torch.Tensor, sample_rate: int, speed_factor: float
+ ) -> Tuple[torch.Tensor, int]:
+@@ -523,6 +574,13 @@ def apply_speed_factor(
+         )
+         return audio_tensor, sample_rate
+ 
++    stretched_ffmpeg = _ffmpeg_atempo(audio_tensor_cpu.numpy(), sample_rate, speed_factor)
++    if stretched_ffmpeg is not None:
++        logger.info(
++            f"Applied speed factor {speed_factor} using ffmpeg atempo. Original SR: {sample_rate}"
++        )
++        return torch.from_numpy(stretched_ffmpeg), sample_rate
++
+     if LIBROSA_AVAILABLE:
+         try:
+             audio_np = audio_tensor_cpu.numpy()
+diff --git a/Dockerfile.bookorbit-tuning b/Dockerfile.bookorbit-tuning
+new file mode 100644
+index 0000000..4bd55b4
+--- /dev/null
++++ b/Dockerfile.bookorbit-tuning
+@@ -0,0 +1,2 @@
++FROM chatterbox-tts-server:915ae28
++COPY server.py /app/server.py
+diff --git a/patches/apply_speed_patches.py b/patches/apply_speed_patches.py
+new file mode 100644
+index 0000000..94dd0af
+--- /dev/null
++++ b/patches/apply_speed_patches.py
+@@ -0,0 +1,36 @@
++"""Local speed patches for the pip-installed chatterbox package (run at image build).
++
++1. T3.inference asks the transformer for attention weights on every sampling
++   step. Only the multilingual model's AlignmentStreamAnalyzer reads them; for
++   the English model they are discarded, yet requesting them forces transformers'
++   SDPA attention onto the slower eager path. Request them only when an analyzer
++   is attached.
++
++Measured on the RTX 4070 (in-process A/B, identical tokens): 13-23% more tokens/s.
++Also tried and rejected: EOS check every 8 steps (no gain), fp16/bf16 autocast (slower).
++"""
++import pathlib
++import sys
++
++import chatterbox.models.t3.t3 as t3_module
++
++PATCHES = [
++    (
++        "output_attentions=True,",
++        "output_attentions=self.patched_model.alignment_stream_analyzer is not None,",
++        2,
++    ),
++]
++
++path = pathlib.Path(t3_module.__file__)
++src = path.read_text(encoding="utf-8")
++for needle, replacement, expected in PATCHES:
++    if replacement in src:
++        print(f"already applied: {replacement.strip()[:60]}")
++        continue
++    found = src.count(needle)
++    if found != expected:
++        sys.exit(f"expected {expected} occurrence(s) of {needle.strip()!r}, found {found}; upstream changed, review by hand")
++    src = src.replace(needle, replacement)
++    print(f"applied: {replacement.strip()[:60]}")
++path.write_text(src, encoding="utf-8")
