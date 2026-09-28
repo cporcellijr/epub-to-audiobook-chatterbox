@@ -130,6 +130,33 @@ class TestSegmentMoods(unittest.TestCase):
         self.assertEqual(moods, {1: MOOD_SOFT, 2: MOOD_SOFT})
 
 
+class TestParagraphMood(unittest.TestCase):
+    """A speech tag's cue sets the manner for the rest of its paragraph."""
+
+    def moods(self, text):
+        return delivery.segment_moods(chapter_segments(text))
+
+    def test_a_whisper_carries_to_the_untagged_quotation_after_it(self):
+        text = '\u201cTom, are you awake?\u201d she whispered. \u201cDon\u2019t wake Mother.\u201d'
+        self.assertEqual(self.moods(text), {1: "soft", 2: "soft"})
+
+    def test_a_shout_carries_to_the_untagged_quotation_before_it(self):
+        text = '\u201cNo.\u201d He stood up. \u201cGet out,\u201d he shouted.'
+        self.assertEqual(self.moods(text), {1: "excited", 2: "excited"})
+
+    def test_a_quotation_with_its_own_tag_keeps_its_own_mood(self):
+        text = '\u201cHush,\u201d she whispered. \u201cWhy?\u201d he asked.'
+        self.assertEqual(self.moods(text), {1: "soft", 2: "normal"})
+
+    def test_conflicting_cues_lend_nothing(self):
+        text = '\u201cHush,\u201d she whispered. \u201cNo,\u201d he shouted. \u201cWell.\u201d'
+        self.assertEqual(self.moods(text), {1: "soft", 2: "excited", 3: "normal"})
+
+    def test_a_cue_does_not_cross_into_the_next_paragraph(self):
+        text = f'\u201cHush,\u201d she whispered.{M}\u201cWhat?\u201d'
+        self.assertEqual(self.moods(text), {1: "soft", 2: "normal"})
+
+
 class TestSavedChatterboxDefaults(unittest.TestCase):
 
     def test_no_config_path_returns_the_approved_baseline(self):

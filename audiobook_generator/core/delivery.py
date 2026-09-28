@@ -14,6 +14,7 @@ import yaml
 from pydub import AudioSegment
 
 from audiobook_generator.core.dialogue import DIALOGUE, NARRATION, Segment
+from audiobook_generator.core.speech_tags import has_speech_tag
 
 MOOD_SOFT = "soft"
 MOOD_NORMAL = "normal"
@@ -106,6 +107,17 @@ def mood_of(before: str, quote_text: str, after: str) -> str:
     return MOOD_NORMAL
 
 
+def _cue_mood(before: str, after: str) -> Optional[str]:
+    """The mood a speech tag's verb or adverb sets ("she whispered", "he shouted"), ignoring the
+    quotation's own text and '!'; None when the tag carries no cue."""
+    lead_in = before if before.rstrip().endswith((",", ":")) else ""
+    if _has_soft_cue(lead_in) or _has_soft_cue(after):
+        return MOOD_SOFT
+    if _has_excited_cue(lead_in) or _has_excited_cue(after):
+        return MOOD_EXCITED
+    return None
+
+
 def segment_moods(paragraphs: List[List[Segment]]) -> Dict[int, str]:
     """{line id: mood} from rule-based cues alone for every dialogue line of a chapter (no LLM
     involved): a continued line (Segment.continues) inherits the previous line's mood; narration is
@@ -113,6 +125,7 @@ def segment_moods(paragraphs: List[List[Segment]]) -> Dict[int, str]:
     quotation itself."""
     moods: Dict[int, str] = {}
     for segments in paragraphs:
+        cues, untagged = set(), []
         for i, piece in enumerate(segments):
             if piece.kind != DIALOGUE:
                 continue
@@ -122,6 +135,19 @@ def segment_moods(paragraphs: List[List[Segment]]) -> Dict[int, str]:
             before = segments[i - 1].text if i > 0 and segments[i - 1].kind == NARRATION else ""
             after = segments[i + 1].text if i + 1 < len(segments) and segments[i + 1].kind == NARRATION else ""
             moods[piece.line_id] = mood_of(before, piece.text, after)
+            cue = _cue_mood(before, after)
+            if cue:
+                cues.add(cue)
+            elif not has_speech_tag(before, after):
+                untagged.append(piece.line_id)
+        # One speaker's manner holds for the paragraph: "Tom, are you awake?" she whispered. "Don't
+        # wake Mother." reads the second quotation softly too. Only quotations with no tag of their
+        # own and no mood of their own borrow it, and only when the paragraph's cues agree.
+        if len(cues) == 1:
+            lent = next(iter(cues))
+            for line_id in untagged:
+                if moods[line_id] == MOOD_NORMAL:
+                    moods[line_id] = lent
     return moods
 
 

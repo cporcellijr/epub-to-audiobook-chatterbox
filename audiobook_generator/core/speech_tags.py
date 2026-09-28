@@ -99,6 +99,12 @@ def _has_pronoun_tag(before: str, after: str) -> bool:
     return bool(_AFTER_PRONOUN.match(after) or _BEFORE_PRONOUN.search(before))
 
 
+def has_speech_tag(before: str, after: str) -> bool:
+    """True if the narration right around a quotation tags it at all: a named tag ("said Tom") or a
+    pronoun tag ("she said")."""
+    return bool(_tag_after(after) or _tag_before(before) or _has_pronoun_tag(before, after))
+
+
 def tagged_speakers(paragraphs: List[List[Segment]]) -> Dict[int, str]:
     """{line id: name} for every dialogue line whose speaker a speech tag names, plus the untagged
     quotations of a paragraph whose named tags all name the same person. Lines that continue a
