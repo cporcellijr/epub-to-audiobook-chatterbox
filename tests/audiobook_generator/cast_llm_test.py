@@ -3,7 +3,9 @@ all with a scripted stand-in for the chat endpoint."""
 import json
 import logging
 import unittest
+from unittest.mock import patch
 
+from audiobook_generator.core import cast_llm as cast_llm_module
 from audiobook_generator.core.cast_llm import (
     PROMPTS, WINDOW_LINES, AttributionError, Roster, attribute_chapter, build_windows, parse_reply,
 )
@@ -31,8 +33,11 @@ class ScriptedChat:
         return json.dumps(reply) if isinstance(reply, dict) else reply
 
 
-def _reply(speakers, characters=()):
-    return {"speakers": {str(k): v for k, v in speakers.items()}, "characters": list(characters)}
+def _reply(speakers, characters=(), moods=None):
+    reply = {"speakers": {str(k): v for k, v in speakers.items()}, "characters": list(characters)}
+    if moods is not None:
+        reply["moods"] = {str(k): v for k, v in moods.items()}
+    return reply
 
 
 class TestWindows(unittest.TestCase):
@@ -72,10 +77,11 @@ class TestWindows(unittest.TestCase):
 class TestParseReply(unittest.TestCase):
 
     def test_good_json(self):
-        speakers, characters = parse_reply(json.dumps(_reply({1: "Ada Marsh", 2: "unknown"}, [
+        speakers, characters, moods = parse_reply(json.dumps(_reply({1: "Ada Marsh", 2: "unknown"}, [
             {"name": "Ada Marsh", "gender": "female", "age": "adult", "aliases": ["Ada"]}])), [1, 2])
         self.assertEqual(speakers, {1: "Ada Marsh", 2: None})
         self.assertEqual(characters, [{"name": "Ada Marsh", "gender": "female", "age": "adult", "aliases": ["Ada"]}])
+        self.assertEqual(moods, {1: "normal", 2: "normal"})  # no "moods" in the reply: every id defaults normal
 
     def test_fenced_json_and_hash_ids_are_tolerated(self):
         reply = "Here you go:\n```json\n{\"speakers\": {\"#1\": \"Tom\", \"[#2]\": \"Ada\"}}\n```"
@@ -100,9 +106,21 @@ class TestParseReply(unittest.TestCase):
             parse_reply(json.dumps({"speakers": {"1": ["Tom"]}}), [1])
 
     def test_bad_gender_or_age_become_unknown_and_nameless_characters_are_dropped(self):
-        _, characters = parse_reply(json.dumps(_reply({1: "Tom"}, [
+        _, characters, _ = parse_reply(json.dumps(_reply({1: "Tom"}, [
             {"name": "Tom", "gender": "boy", "age": "teen"}, {"gender": "male"}, {"name": "  "}])), [1])
         self.assertEqual(characters, [{"name": "Tom", "gender": "unknown", "age": "unknown", "aliases": []}])
+
+    def test_moods_are_parsed_and_invalid_or_missing_ones_become_normal(self):
+        reply = json.dumps({"speakers": {"1": "Tom", "2": "Ada", "3": "Bea"},
+                            "moods": {"1": "soft", "2": "not-a-mood", "9": "excited"}})
+        _, _, moods = parse_reply(reply, [1, 2, 3])
+        # id 1: valid; id 2: invalid value -> normal; id 3: no entry at all -> normal; id 9 (not asked) ignored.
+        self.assertEqual(moods, {1: "soft", 2: "normal", 3: "normal"})
+
+    def test_a_non_dict_moods_value_is_tolerated_and_ignored(self):
+        reply = json.dumps({"speakers": {"1": "Tom"}, "moods": "soft"})
+        _, _, moods = parse_reply(reply, [1])
+        self.assertEqual(moods, {1: "normal"})
 
 
 class TestRoster(unittest.TestCase):
@@ -182,7 +200,7 @@ class TestAttributeChapter(unittest.TestCase):
             {"name": "Tom", "gender": "male", "age": "child"},
             {"name": "Mrs. Marsh", "gender": "female", "age": "adult", "aliases": ["their mother"]}]))
         roster, stats = Roster(), {}
-        lines = attribute_chapter(self.paragraphs, roster, chat, stats, self.log)
+        lines, moods = attribute_chapter(self.paragraphs, roster, chat, stats, self.log)
         self.assertEqual(lines, {1: "ada marsh", 2: "tom", 3: "ada marsh", 4: "tom", 5: "marsh", 6: "tom"})
         self.assertEqual({k: c["lines"] for k, c in roster.characters.items()}, {"ada marsh": 2, "tom": 3, "marsh": 1})
         self.assertEqual((stats["windows"], stats["invalid_json"], stats["lines"], stats["unknown_lines"]), (1, 0, 6, 0))
@@ -191,14 +209,14 @@ class TestAttributeChapter(unittest.TestCase):
     def test_a_broken_reply_is_retried_once_and_the_retry_can_succeed(self):
         chat = ScriptedChat("not json at all", _reply({n: "Ada" for n in range(1, 7)}))
         stats = {}
-        lines = attribute_chapter(self.paragraphs, Roster(), chat, stats, self.log)
+        lines, moods = attribute_chapter(self.paragraphs, Roster(), chat, stats, self.log)
         self.assertEqual(set(lines.values()), {"ada", "tom"})  # lines 2 and 6 are tagged "said Tom"
         self.assertEqual((stats["invalid_json"], stats.get("invalid_after_retry", 0), len(chat.prompts)), (1, 0, 2))
 
     def test_two_bad_replies_leave_the_window_unknown(self):
         chat = ScriptedChat(_reply({1: "Ada"}), _reply({n: "Ada" for n in range(1, 8)}))  # missing ids, then an invented id
         stats = {}
-        lines = attribute_chapter(self.paragraphs, Roster(), chat, stats, self.log)
+        lines, moods = attribute_chapter(self.paragraphs, Roster(), chat, stats, self.log)
         # The tagged lines ("said Tom") never depended on the model.
         self.assertEqual(lines, {1: None, 2: "tom", 3: None, 4: None, 5: None, 6: "tom"})
         self.assertEqual((stats["invalid_json"], stats["invalid_after_retry"], stats["unknown_lines"]), (1, 1, 4))
@@ -206,7 +224,7 @@ class TestAttributeChapter(unittest.TestCase):
     def test_unknown_speakers_stay_unknown_and_known_names_reach_the_next_prompt(self):
         chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "unknown", 3: "Ada Marsh", 4: "", 5: "narrator", 6: "Tom"}))
         roster = Roster()
-        lines = attribute_chapter(self.paragraphs, roster, chat, {}, self.log)
+        lines, moods = attribute_chapter(self.paragraphs, roster, chat, {}, self.log)
         # Line 2 is tagged "said Tom", so the model's "unknown" for it is not even asked for.
         self.assertEqual(lines, {1: "ada marsh", 2: "tom", 3: "ada marsh", 4: None, 5: None, 6: "tom"})
         next_chat = ScriptedChat(_reply({1: "Tom"}))
@@ -217,7 +235,7 @@ class TestAttributeChapter(unittest.TestCase):
         text = f'“First part of the speech.{M}“Second part,” said Ada.{M}“New line,” said Tom.'
         chat = ScriptedChat(_reply({1: "Ada", 3: "Tom"}))
         roster = Roster()
-        lines = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)
+        lines, moods = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)
         self.assertEqual(lines, {1: "ada", 2: "ada", 3: "tom"})
         self.assertEqual(roster.characters["ada"]["lines"], 2)
 
@@ -237,7 +255,7 @@ class TestTaggedLines(unittest.TestCase):
     def test_the_model_is_not_asked_about_tagged_lines_and_their_answers_are_ignored(self):
         chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "Somebody Else", 3: "Ada Marsh", 4: "Tom", 5: "Mrs. Marsh",
                                     6: "Somebody Else"}))
-        lines = attribute_chapter(chapter_segments(CHAPTER), Roster(), chat, {}, self.log)
+        lines, moods = attribute_chapter(chapter_segments(CHAPTER), Roster(), chat, {}, self.log)
         prompt = chat.prompts[0][1]["content"]
         self.assertIn("Ids to answer: 1, 3, 4, 5", prompt)
         self.assertEqual((lines[2], lines[6]), ("tom", "tom"))
@@ -247,7 +265,7 @@ class TestTaggedLines(unittest.TestCase):
         chat = ScriptedChat(_reply({3: "Mrs. Marsh"}, [
             {"name": "Mrs. Marsh", "gender": "female", "age": "adult", "aliases": ["Mother"]}]))
         roster = Roster()
-        lines = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)
+        lines, moods = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)
         self.assertEqual(lines[1], lines[3])
         self.assertEqual(roster.characters[lines[1]]["name"], "Mrs. Marsh")
 
@@ -267,5 +285,55 @@ class TestTaggedLines(unittest.TestCase):
         text = f'"Hello," said Ada.{M}"Hello yourself," Tom said.'
         chat = ScriptedChat()
         stats = {}
-        lines = attribute_chapter(chapter_segments(text), Roster(), chat, stats, self.log)
+        lines, moods = attribute_chapter(chapter_segments(text), Roster(), chat, stats, self.log)
         self.assertEqual((lines, chat.prompts, stats["tagged_lines"]), ({1: "ada", 2: "tom"}, [], 2))
+
+
+class TestAttributeChapterMoods(unittest.TestCase):
+    """Moods combine core.delivery's rule cues with the LLM's own guess: a rule cue always wins."""
+
+    def setUp(self):
+        self.log = logging.getLogger("test-cast")
+
+    def test_moods_are_not_requested_in_the_prompt_by_default(self):
+        # ASK_LLM_FOR_MOODS is off by default: measured 2026-09-28 (WORKLOG #14) to cost speaker
+        # accuracy (221/270 -> 198/270 on the labelled fixture), well past the 219/270 floor.
+        self.assertFalse(cast_llm_module.ASK_LLM_FOR_MOODS)
+        chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "Tom", 3: "Ada", 4: "Tom", 5: "Mrs. Marsh", 6: "Tom"}))
+        attribute_chapter(chapter_segments(CHAPTER), Roster(), chat, {}, self.log)
+        self.assertNotIn('"moods"', chat.prompts[0][1]["content"])
+
+    def test_moods_are_requested_when_the_module_constant_is_switched_on(self):
+        chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "Tom", 3: "Ada", 4: "Tom", 5: "Mrs. Marsh", 6: "Tom"}))
+        with patch.object(cast_llm_module, "ASK_LLM_FOR_MOODS", True):
+            attribute_chapter(chapter_segments(CHAPTER), Roster(), chat, {}, self.log)
+        self.assertIn('"moods"', chat.prompts[0][1]["content"])
+
+    def test_llm_moods_flow_through_when_rules_are_silent(self):
+        chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "Tom", 3: "Ada", 4: "Tom", 5: "Mrs. Marsh", 6: "Tom"},
+                                   moods={1: "excited", 3: "soft", 4: "not-a-mood"}))
+        _, moods = attribute_chapter(chapter_segments(CHAPTER), Roster(), chat, {}, self.log)
+        # CHAPTER has no rule cues anywhere, so every asked line's mood is the LLM's guess (an
+        # invalid value defaults to normal); lines 2 and 6 are tagged ("said Tom") and never asked.
+        self.assertEqual(moods, {1: "excited", 2: "normal", 3: "soft", 4: "normal", 5: "normal", 6: "normal"})
+
+    def test_a_rule_cue_overrides_the_llms_mood(self):
+        text = f'"Go now," she whispered.{M}"Fine."'
+        chat = ScriptedChat(_reply({1: "Ada", 2: "Ada"}, moods={1: "excited", 2: "excited"}))
+        _, moods = attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
+        # Line 1 has a rule cue (whispered): soft wins over the LLM's "excited". Line 2 has none,
+        # so the LLM's guess is used.
+        self.assertEqual(moods, {1: "soft", 2: "excited"})
+
+    def test_lines_never_asked_get_rule_moods_only(self):
+        text = f'"Go now," Ada whispered.{M}"Get out!" Tom shouted.'  # both tagged: neither is asked
+        chat = ScriptedChat()
+        _, moods = attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
+        self.assertEqual(chat.prompts, [])
+        self.assertEqual(moods, {1: "soft", 2: "excited"})
+
+    def test_continued_lines_inherit_the_previous_lines_final_combined_mood(self):
+        text = f'She whispered, "First part.{M}"Second part," he said.'
+        chat = ScriptedChat(_reply({1: "Ada"}, moods={1: "excited"}))  # the rule cue overrides this for line 1
+        _, moods = attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
+        self.assertEqual(moods, {1: "soft", 2: "soft"})

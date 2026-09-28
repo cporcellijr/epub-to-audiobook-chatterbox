@@ -102,6 +102,19 @@ class TestAnalyseBook(unittest.TestCase):
         cast = analyse_book(self.settings, chat=ScriptedChat({"speakers": {"1": "Mother", "2": "Tom"}}))
         self.assertEqual([ch["number"] for ch in cast["chapters"].values()], [2])
 
+    def test_moods_are_saved_per_chapter(self):
+        chat = ScriptedChat(
+            {"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}, "moods": {"1": "excited"}},
+            {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}},
+        )
+        cast = analyse_book(self.settings, chat=chat)
+        chapter_one = next(ch for ch in cast["chapters"].values() if ch["number"] == 1)
+        # Line 1's rule mood is normal (no cues), so the LLM's "excited" flows through; lines 2/3
+        # were never asked (2 is tagged "said Tom", 3 has no cue) so they default to normal.
+        self.assertEqual(chapter_one["moods"], {"1": "excited", "2": "normal", "3": "normal"})
+        saved = cast_store.load_cast(self.settings["cast_file"])
+        self.assertEqual(saved["chapters"], cast["chapters"])
+
 
 class TestRunCastAnalysisOrder(unittest.TestCase):
     """The queue's process target: Chatterbox is unloaded before the LLM pass and reloaded after,

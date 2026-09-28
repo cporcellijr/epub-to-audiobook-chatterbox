@@ -46,7 +46,9 @@ sys.path.insert(0, "/app_src")
 
 from audiobook_generator.config.general_config import GeneralConfig  # noqa: E402
 from audiobook_generator.core import cast as cast_store  # noqa: E402
+from audiobook_generator.core import cast_llm  # noqa: E402
 from audiobook_generator.core import chatterbox_control  # noqa: E402
+from audiobook_generator.core import delivery  # noqa: E402
 from audiobook_generator.core.cast_llm import ChatClient, Roster, _same_person, attribute_chapter, llm_api_key, \
     llm_base_url, llm_model  # noqa: E402
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK, chapter_segments, dialogue_lines  # noqa: E402
@@ -127,18 +129,27 @@ def run_attribution(passages: List[Passage], chat) -> Tuple[dict, List[dict]]:
             sys.exit(1)
         roster = Roster()
         started = time.monotonic()
-        attributed = attribute_chapter(paragraphs, roster, chat, stats, label=f" {passage.name}")
+        attributed, moods = attribute_chapter(paragraphs, roster, chat, stats, label=f" {passage.name}")
         seconds = time.monotonic() - started
+        rule_moods = delivery.segment_moods(paragraphs)
         confusion = Counter()
         correct = 0
+        mood_counts = Counter()
+        llm_added_moods = Counter()
         for line, label in zip(lines, passage.labels):
             key = attributed.get(line.line_id)
             character = roster.characters.get(key) if key else None
             ok = matches(passage, label, character)
             correct += ok
             confusion[(label, label_of(passage, character))] += 1
+            rule_mood = rule_moods.get(line.line_id, delivery.MOOD_NORMAL)
+            final_mood = moods.get(line.line_id, delivery.MOOD_NORMAL)
+            mood_counts[rule_mood] += 1
+            if rule_mood == delivery.MOOD_NORMAL and final_mood != delivery.MOOD_NORMAL:
+                llm_added_moods[final_mood] += 1
         results.append({"passage": passage, "correct": correct, "total": len(lines), "seconds": seconds,
-                        "confusion": confusion, "roster": roster, "lines": attributed})
+                        "confusion": confusion, "roster": roster, "lines": attributed, "moods": moods,
+                        "mood_counts": mood_counts, "llm_added_moods": llm_added_moods})
     return stats, results
 
 
@@ -152,6 +163,14 @@ def print_report(stats: dict, results: List[dict], unloaded_during: Optional[boo
         total_lines += r["total"]
     overall = 100.0 * total_correct / max(1, total_lines)
     print(f"  {'overall':<36} {total_correct:>3}/{total_lines:<3} {overall:5.1f}%")
+
+    print(f"\n=== Delivery moods (adaptive delivery, ASK_LLM_FOR_MOODS={cast_llm.ASK_LLM_FOR_MOODS}) ===")
+    rule_totals, llm_totals = Counter(), Counter()
+    for r in results:
+        rule_totals.update(r["mood_counts"])
+        llm_totals.update(r["llm_added_moods"])
+    print(f"  from rules: {dict(rule_totals)}")
+    print(f"  added by the LLM (lines rules called normal): {dict(llm_totals)}")
 
     print("\n=== Confusion (rows: true speaker, columns: predicted), top characters per passage ===")
     for r in results:

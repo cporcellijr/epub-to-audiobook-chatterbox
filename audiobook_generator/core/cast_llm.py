@@ -20,6 +20,7 @@ import time
 from typing import Callable, Collection, Dict, List, NamedTuple, Optional, Tuple
 
 from audiobook_generator.core.cast import AGES, GENDERS, display_name, normalize_name
+from audiobook_generator.core.delivery import MOOD_NORMAL, MOODS, segment_moods
 from audiobook_generator.core.dialogue import DIALOGUE, Segment
 from audiobook_generator.core.speech_tags import tagged_speakers
 
@@ -30,6 +31,13 @@ WINDOW_MAX_CHARS = 6000    # passage text per request (about 1,500 tokens): a 7-
 CONTEXT_PARAGRAPHS = 6     # paragraphs repeated before a window, with their known speakers, for context
 LLM_TIMEOUT_SECONDS = 300  # one request; a small local model on a busy GPU can be slow
 LLM_TEMPERATURE = 0.0
+
+# Ask the LLM to guess each line's delivery mood alongside its speaker (adaptive delivery, see
+# core.delivery). Measured against the labelled multivoice fixture 2026-09-28 (WORKLOG #14):
+# speaker accuracy fell from 221/270 to 198/270 with the moods clause in the prompt, well past the
+# 219/270 floor, so this stays False (rules-only moods) until a differently-worded prompt is
+# measured not to cost accuracy.
+ASK_LLM_FOR_MOODS = False
 
 UNKNOWN_SPEAKER_WORDS = frozenset({"", "unknown", "narrator", "none", "n/a", "?", "nobody", "unclear"})
 
@@ -46,7 +54,7 @@ PROMPTS = {
         "who is talking, but do not answer for them. Quotations without a mark need no answer:\n\n"
         "{passage}\n\n"
         "Reply with exactly this shape, one entry per id:\n"
-        "{{\"speakers\": {{\"N\": \"Full Name\"}}, "
+        "{{\"speakers\": {{\"N\": \"Full Name\"}}{moods_shape}, "
         "\"characters\": [{{\"name\": \"Full Name\", \"gender\": \"female|male|unknown\", "
         "\"age\": \"child|adult|elderly|unknown\", \"aliases\": [\"other names used for this person\"]}}]}}\n"
         "Rules:\n"
@@ -56,9 +64,13 @@ PROMPTS = {
         "the same person, not a new character;\n"
         "- \"characters\" lists only speakers who are not in the known list, plus known characters whose "
         "gender or age the passage now reveals.\n"
+        "{moods_rule}"
         "Ids to answer: {ids}"
     ),
     "roster_empty": "(none yet)",
+    "moods_shape": ', "moods": {"N": "soft|normal|excited"}',
+    "moods_rule": ("- moods is your best guess how each marked line sounds: \"soft\" (whispered or quiet), "
+                  "\"excited\" (shouted or urgent), or \"normal\" otherwise;\n"),
 }
 
 
@@ -221,13 +233,16 @@ def _speaker_or_none(value) -> Optional[str]:
 
 
 def parse_reply(reply: str, expected_ids: List[int],
-                ignore_ids: Collection[int] = ()) -> Tuple[Dict[int, Optional[str]], List[dict]]:
-    """Validate one window's reply: ({line id: speaker name or None}, new/updated characters).
+                ignore_ids: Collection[int] = ()) -> Tuple[Dict[int, Optional[str]], List[dict], Dict[int, str]]:
+    """Validate one window's reply: ({line id: speaker name or None}, new/updated characters,
+    {line id: mood}).
 
     Raises AttributionError for anything but a JSON object whose "speakers" cover exactly the
     expected ids (a missing id, an invented id, a non-string name). Answers for ignore_ids (lines
     shown with a known speaker) are dropped rather than refused. Characters with a bad gender or
-    age are kept with "unknown" there; a character without a usable name is dropped.
+    age are kept with "unknown" there; a character without a usable name is dropped. "moods" is
+    optional guidance, never required: a missing or invalid mood for an expected id becomes
+    "normal", and an id outside expected_ids is ignored rather than raising (unlike "speakers").
     """
     data = _extract_json(reply)
     raw = data.get("speakers")
@@ -255,7 +270,17 @@ def parse_reply(reply: str, expected_ids: List[int],
             "age": item.get("age") if item.get("age") in AGES else "unknown",
             "aliases": aliases,
         })
-    return speakers, characters
+    moods: Dict[int, str] = {}
+    raw_moods = data.get("moods")
+    if isinstance(raw_moods, dict):
+        for key, value in raw_moods.items():
+            line_id = _line_id(key)
+            if line_id is None or line_id not in expected_ids:
+                continue
+            moods[line_id] = value if value in MOODS else MOOD_NORMAL
+    for line_id in expected_ids:
+        moods.setdefault(line_id, MOOD_NORMAL)
+    return speakers, characters, moods
 
 
 # ---- the running character list ----
@@ -403,31 +428,43 @@ class Roster:
 
 def _messages(window: Window, roster: Roster) -> List[dict]:
     names = roster.names_for_prompt()
+    moods_shape = PROMPTS["moods_shape"] if ASK_LLM_FOR_MOODS else ""
+    moods_rule = PROMPTS["moods_rule"] if ASK_LLM_FOR_MOODS else ""
     return [
         {"role": "system", "content": PROMPTS["system"]},
         {"role": "user", "content": PROMPTS["window"].format(
             roster=", ".join(names) if names else PROMPTS["roster_empty"], passage=window.passage,
-            ids=", ".join(str(i) for i in window.ids))},
+            ids=", ".join(str(i) for i in window.ids), moods_shape=moods_shape, moods_rule=moods_rule)},
     ]
 
 
 def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Chat, stats: dict,
-                      log: logging.Logger = logger, label: str = "") -> Dict[int, Optional[str]]:
-    """Attribute every dialogue line of one chapter: {line id: character key or None}.
+                      log: logging.Logger = logger, label: str = "") -> Tuple[Dict[int, Optional[str]], Dict[int, str]]:
+    """Attribute every dialogue line of one chapter: ({line id: character key or None},
+    {line id: mood}).
 
     Lines a speech tag names are not asked (core.speech_tags); the model sees them, and every line
     decided so far, as [Name] "...". Each window is asked once and, when its reply fails
     validation, once more; a second failure leaves its lines unknown. New names become roster characters (aliases merged). A line that
-    continues the previous paragraph's quotation takes the previous line's speaker. stats is
-    updated in place: windows asked, invalid_json (windows whose first reply was unusable),
-    invalid_after_retry (windows whose retry was unusable too), lines, tagged_lines, unknown_lines,
-    seconds.
+    continues the previous paragraph's quotation takes the previous line's speaker (and, for moods,
+    the previous line's final mood).
+
+    Moods combine core.delivery's rule-based cues (whispered/shouted-style cues, a line ending in
+    "!") with the LLM's own guess for lines it was asked about (module constant ASK_LLM_FOR_MOODS;
+    when off, or for a line never asked, the LLM contributes nothing): a rule cue always overrides
+    the LLM's guess, never the reverse.
+
+    stats is updated in place: windows asked, invalid_json (windows whose first reply was
+    unusable), invalid_after_retry (windows whose retry was unusable too), lines, tagged_lines,
+    unknown_lines, seconds.
     """
     result: Dict[int, Optional[str]] = {}
+    llm_moods: Dict[int, str] = {}
     for field in ("windows", "invalid_json", "invalid_after_retry", "lines", "tagged_lines", "unknown_lines"):
         stats.setdefault(field, 0)
     stats.setdefault("seconds", 0.0)
     anchors = tagged_speakers(paragraphs)
+    rule_moods = segment_moods(paragraphs)
     windows = build_windows(paragraphs, known=anchors)
     started = time.monotonic()
 
@@ -439,11 +476,11 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
 
     for number, window in enumerate(windows, 1):
         window = window._replace(passage=render_window(paragraphs, window, known_now()))
-        speakers, characters = None, []
+        speakers, characters, window_moods = None, [], {}
         for attempt in (1, 2):
             reply = chat(_messages(window, roster))
             try:
-                speakers, characters = parse_reply(reply, window.ids, ignore_ids=anchors)
+                speakers, characters, window_moods = parse_reply(reply, window.ids, ignore_ids=anchors)
                 break
             except AttributionError as e:
                 if attempt == 1:
@@ -456,12 +493,14 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
         stats["windows"] = stats.get("windows", 0) + 1
         if speakers is None:
             speakers = {line_id: None for line_id in window.ids}
+            window_moods = {}
         for character in characters:
             roster.add(character["name"], character["gender"], character["age"], character["aliases"])
         for line_id in window.ids:
             name = speakers.get(line_id)
             key = roster.add(name) if name else None
             result[line_id] = key
+        llm_moods.update(window_moods)
         # Tag names resolve after the model's character list, so "Mother" can land on the
         # character the model gave that alias instead of becoming a character of its own.
         for line_id in window.anchored:
@@ -474,12 +513,18 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
             result[line_id] = roster.add(name)
     # Lines the windows never covered (none expected) and continued lines' counts
     all_lines = [s for p in paragraphs for s in p if s.kind == DIALOGUE]
+    moods: Dict[int, str] = {}
     for line in all_lines:
         result.setdefault(line.line_id, result.get(line.line_id - 1) if line.continues else None)
         if result[line.line_id]:
             roster.count_line(result[line.line_id])
+        if line.continues:
+            moods[line.line_id] = moods.get(line.line_id - 1, MOOD_NORMAL)
+        else:
+            rule_mood = rule_moods.get(line.line_id, MOOD_NORMAL)
+            moods[line.line_id] = rule_mood if rule_mood != MOOD_NORMAL else llm_moods.get(line.line_id, MOOD_NORMAL)
     stats["lines"] = stats.get("lines", 0) + len(all_lines)
     stats["tagged_lines"] = stats.get("tagged_lines", 0) + len(anchors)
     stats["unknown_lines"] = stats.get("unknown_lines", 0) + sum(1 for v in result.values() if v is None)
     stats["seconds"] = round(stats.get("seconds", 0.0) + time.monotonic() - started, 2)
-    return result
+    return result, moods

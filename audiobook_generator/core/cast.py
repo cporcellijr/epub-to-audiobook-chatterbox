@@ -112,6 +112,26 @@ def chapter_lines(cast: dict, chapter_hash: str) -> Optional[Dict[int, Optional[
     return {int(line_id): speaker for line_id, speaker in chapter.get("lines", {}).items()}
 
 
+def chapter_moods(cast: dict, chapter_hash: str) -> Optional[Dict[int, str]]:
+    """{line id: mood} for the chapter with this text hash, or None when the chapter was never
+    analysed. A chapter analysed before adaptive delivery existed has no "moods" key, so every
+    line comes back "normal" rather than missing."""
+    chapter = cast.get("chapters", {}).get(chapter_hash)
+    if not isinstance(chapter, dict):
+        return None
+    return {int(line_id): mood for line_id, mood in (chapter.get("moods") or {}).items()}
+
+
+def mood_counts(cast: dict) -> Dict[str, int]:
+    """{mood: line count} across every analysed chapter's saved moods (soft/normal/excited)."""
+    counts = {"soft": 0, "normal": 0, "excited": 0}
+    for chapter in cast.get("chapters", {}).values():
+        for mood in (chapter.get("moods") or {}).values():
+            if mood in counts:
+                counts[mood] += 1
+    return counts
+
+
 def character_voice(cast: dict, speaker: Optional[str]) -> Optional[str]:
     """The voice chosen for a speaker key, or None (unknown speaker, or no voice picked yet)."""
     if not speaker:

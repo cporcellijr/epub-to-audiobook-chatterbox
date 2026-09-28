@@ -57,10 +57,11 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
             paragraphs = chapter_segments(text)
             line_count = sum(1 for p in paragraphs for s in p if s.kind == "dialogue")
             log.info(f"Cast: chapter {number} ({title}): {line_count} dialogue lines in {len(paragraphs)} paragraphs")
-            lines = attribute_chapter(paragraphs, roster, chat, stats, log, label=f" ch{number}")
+            lines, moods = attribute_chapter(paragraphs, roster, chat, stats, log, label=f" ch{number}")
             cast["chapters"][cast_store.text_hash(text)] = {
                 "number": number, "title": title,
                 "lines": {str(line_id): speaker for line_id, speaker in sorted(lines.items())},
+                "moods": {str(line_id): mood for line_id, mood in sorted(moods.items())},
                 "unknown": sum(1 for speaker in lines.values() if speaker is None),
             }
             cast["characters"] = dict(roster.characters)
