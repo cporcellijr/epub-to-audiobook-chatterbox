@@ -44,6 +44,12 @@ class GeneralConfig:
         self.paced_unit_mode = getattr(args, 'paced_unit_mode', None)
         # Merge finished chapters into one <title>.m4b (chapter markers, cover) instead of loose files
         self.output_m4b = getattr(args, 'output_m4b', None)
+        # Multi-voice narration: "single" (default, one voice), "dialogue" (voice_name narrates,
+        # dialogue_voice speaks every quoted line) or "cast" (cast_file, a saved cast analysis,
+        # gives each attributed speaker a voice; unknown speakers get dialogue_voice)
+        self.voice_mode = getattr(args, 'voice_mode', None)
+        self.dialogue_voice = getattr(args, 'dialogue_voice', None)
+        self.cast_file = getattr(args, 'cast_file', None)
 
         # TTS provider: Azure & Edge TTS specific arguments
         self.break_duration = getattr(args, 'break_duration', None)

@@ -44,6 +44,9 @@ def get_openai_config():
         model_name='tts-1',
         speed=1.0,
         paced_unit_mode=None,
-        openai_base_url=None
+        openai_base_url=None,
+        voice_mode=None,
+        dialogue_voice=None,
+        cast_file=None,
     )
     return GeneralConfig(args)

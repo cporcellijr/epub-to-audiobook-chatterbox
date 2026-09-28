@@ -1,10 +1,11 @@
 import base64
+import hashlib
 import io
 import logging
 import math
 import subprocess
 import time
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from pydub import AudioSegment
 from sentencex import segment
@@ -17,6 +18,8 @@ from mutagen.id3._frames import TIT2, TPE1, TALB, TRCK, APIC
 from openai import APIConnectionError, APIStatusError, OpenAI
 
 from audiobook_generator.core.audio_tags import AudioTags
+from audiobook_generator.core import cast as cast_store
+from audiobook_generator.core.dialogue import DIALOGUE, PARAGRAPH_MARK, Segment, chapter_segments
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.utils.utils import split_text, split_long_sentence, set_audio_tags, merge_audio_segments
 from audiobook_generator.tts_providers.base_tts_provider import BaseTTSProvider
@@ -24,7 +27,13 @@ from audiobook_generator.tts_providers.base_tts_provider import BaseTTSProvider
 
 logger = logging.getLogger(__name__)
 
-PARAGRAPH_MARK = "@BRK#"
+__all__ = ["PARAGRAPH_MARK", "OpenAITTSProvider", "paced_units", "paragraph_mode_units", "voiced_units",
+           "voiced_paragraph_units"]
+
+# Voice modes (config.voice_mode): one voice for everything (today's behaviour), a narrator plus one
+# voice for every quoted line, or a cast where each attributed speaker has their own voice.
+VOICE_MODE_SINGLE, VOICE_MODE_DIALOGUE, VOICE_MODE_CAST = "single", "dialogue", "cast"
+VOICE_MODES = (VOICE_MODE_SINGLE, VOICE_MODE_DIALOGUE, VOICE_MODE_CAST)
 MIN_UNIT_CHARS = 40   # shorter sentences join the next one: tiny inputs make TTS models stumble
 MAX_UNIT_CHARS = 400  # a trailing short sentence joins the previous unit only if it stays under this
 # A unit over this goes through split_long_sentence (F-07): the server's ~1000-token cap silently
@@ -106,6 +115,35 @@ def _stretch_pcm(raw_pcm: bytes, frame_rate: int, channels: int, sample_width: i
     return proc.stdout
 
 
+def _sentence_units(text: str, language: str) -> List[Tuple[str, bool]]:
+    """(text, continues_previous) sentence-sized units of one span of text: sentences under
+    MIN_UNIT_CHARS join the next one, a short trailing sentence joins the previous unit while
+    that stays under MAX_UNIT_CHARS, unspeakable units are dropped and oversized ones are split
+    (F-07) into pieces marked continues_previous."""
+    pending, packed = "", []
+    for sentence in segment(language, text):
+        sentence = str(sentence).strip()
+        if not sentence:
+            continue
+        pending = f"{pending} {sentence}".strip()
+        if len(pending) >= MIN_UNIT_CHARS:
+            packed.append(pending)
+            pending = ""
+    if pending:
+        if packed and len(packed[-1]) + len(pending) < MAX_UNIT_CHARS:
+            packed[-1] = f"{packed[-1]} {pending}"
+        else:
+            packed.append(pending)
+    units: List[Tuple[str, bool]] = []
+    for unit in packed:
+        if not _is_speakable(unit):
+            continue
+        pieces = _split_oversized_unit(unit)
+        units.append((pieces[0], False))
+        units.extend((piece, True) for piece in pieces[1:])
+    return units
+
+
 def paced_units(text: str, language: str) -> List[Tuple[int, str, bool]]:
     """(paragraph number, text, continues_previous) units of one or more whole sentences, in
     reading order. continues_previous is True only for a piece produced by splitting an
@@ -114,26 +152,37 @@ def paced_units(text: str, language: str) -> List[Tuple[int, str, bool]]:
     units: List[Tuple[int, str, bool]] = []
     paragraphs = [" ".join(p.split()) for p in text.split(PARAGRAPH_MARK)]
     for number, paragraph in enumerate(p for p in paragraphs if p):
-        pending, paragraph_units = "", []
-        for sentence in segment(language, paragraph):
-            sentence = str(sentence).strip()
-            if not sentence:
-                continue
-            pending = f"{pending} {sentence}".strip()
-            if len(pending) >= MIN_UNIT_CHARS:
-                paragraph_units.append(pending)
-                pending = ""
-        if pending:
-            if paragraph_units and len(paragraph_units[-1]) + len(pending) < MAX_UNIT_CHARS:
-                paragraph_units[-1] = f"{paragraph_units[-1]} {pending}"
-            else:
-                paragraph_units.append(pending)
-        for unit in paragraph_units:
-            if not _is_speakable(unit):
-                continue
-            pieces = _split_oversized_unit(unit)
-            units.append((number, pieces[0], False))
-            units.extend((number, piece, True) for piece in pieces[1:])
+        units.extend((number, unit, continues) for unit, continues in _sentence_units(paragraph, language))
+    return units
+
+
+def _paragraph_units(text: str, language: str) -> List[Tuple[str, int, bool]]:
+    """(text, sentence_count, continues_previous) units of one span of text for paragraph mode:
+    whole sentences packed into one request each, splitting only at sentence boundaries when
+    the span would otherwise exceed MAX_REQUEST_CHARS."""
+    sentences = [s for s in (str(raw).strip() for raw in segment(language, text)) if s and _is_speakable(s)]
+    units: List[Tuple[str, int, bool]] = []
+
+    def flush(bin_sentences: List[str]) -> None:
+        if bin_sentences:
+            units.append((" ".join(bin_sentences), len(bin_sentences), False))
+
+    current_bin: List[str] = []
+    for sentence in sentences:
+        if len(sentence) > MAX_REQUEST_CHARS:
+            flush(current_bin)
+            current_bin = []
+            pieces = _split_oversized_unit(sentence)
+            units.append((pieces[0], 1, False))
+            units.extend((piece, 1, True) for piece in pieces[1:])
+            continue
+        candidate = current_bin + [sentence]
+        if current_bin and len(" ".join(candidate)) > MAX_REQUEST_CHARS:
+            flush(current_bin)
+            current_bin = [sentence]
+        else:
+            current_bin = candidate
+    flush(current_bin)
     return units
 
 
@@ -149,30 +198,36 @@ def paragraph_mode_units(text: str, language: str) -> List[Tuple[int, str, int, 
     units: List[Tuple[int, str, int, bool]] = []
     paragraphs = [" ".join(p.split()) for p in text.split(PARAGRAPH_MARK)]
     for number, paragraph in enumerate(p for p in paragraphs if p):
-        sentences = [s for s in (str(raw).strip() for raw in segment(language, paragraph)) if s and _is_speakable(s)]
-        if not sentences:
-            continue
+        units.extend((number, unit, count, continues) for unit, count, continues in _paragraph_units(paragraph, language))
+    return units
 
-        def flush(bin_sentences: List[str]) -> None:
-            if bin_sentences:
-                units.append((number, " ".join(bin_sentences), len(bin_sentences), False))
 
-        current_bin: List[str] = []
-        for sentence in sentences:
-            if len(sentence) > MAX_REQUEST_CHARS:
-                flush(current_bin)
-                current_bin = []
-                pieces = _split_oversized_unit(sentence)
-                units.append((number, pieces[0], 1, False))
-                units.extend((number, piece, 1, True) for piece in pieces[1:])
-                continue
-            candidate = current_bin + [sentence]
-            if current_bin and len(" ".join(candidate)) > MAX_REQUEST_CHARS:
-                flush(current_bin)
-                current_bin = [sentence]
-            else:
-                current_bin = candidate
-        flush(current_bin)
+VoiceOf = Callable[[Segment], str]
+
+
+def voiced_units(text: str, language: str, voice_of: VoiceOf) -> List[Tuple[int, str, bool, str]]:
+    """(paragraph number, text, continues_previous, voice) sentence-mode units for multi-voice
+    narration. Units are built inside each narration or dialogue segment, never across two, so a
+    unit can never span a change of voice; the joining and splitting rules of paced_units apply
+    within a segment. The first unit of a segment is a normal sentence boundary (sentence pause,
+    or the paragraph pause when the paragraph changes)."""
+    units: List[Tuple[int, str, bool, str]] = []
+    for number, segments in enumerate(chapter_segments(text)):
+        for piece in segments:
+            voice = voice_of(piece)
+            units.extend((number, unit, continues, voice) for unit, continues in _sentence_units(piece.text, language))
+    return units
+
+
+def voiced_paragraph_units(text: str, language: str, voice_of: VoiceOf) -> List[Tuple[int, str, int, bool, str]]:
+    """(paragraph number, text, sentence_count, continues_previous, voice) paragraph-mode units
+    for multi-voice narration: each segment is packed like a paragraph of its own."""
+    units: List[Tuple[int, str, int, bool, str]] = []
+    for number, segments in enumerate(chapter_segments(text)):
+        for piece in segments:
+            voice = voice_of(piece)
+            units.extend((number, unit, count, continues, voice)
+                         for unit, count, continues in _paragraph_units(piece.text, language))
     return units
 
 
@@ -350,6 +405,7 @@ class OpenAITTSProvider(BaseTTSProvider):
         config.instructions = config.instructions or None
         config.output_format = config.output_format or "mp3"
         config.paced_unit_mode = config.paced_unit_mode or "sentence"
+        config.voice_mode = config.voice_mode or VOICE_MODE_SINGLE  # jobs from before multi-voice existed
 
         self.price = get_price(config.model_name)
         super().__init__(config)
@@ -357,6 +413,34 @@ class OpenAITTSProvider(BaseTTSProvider):
         # base_url=None falls back to OPENAI_BASE_URL exactly as before; a per-config URL (e.g.
         # Kokoro's) must win over that env var, since both can be set at once.
         self.client = OpenAI(max_retries=4, base_url=config.openai_base_url)  # OPENAI_API_KEY env var still required
+        self.cast: Optional[dict] = None
+        if config.voice_mode == VOICE_MODE_CAST:
+            self.cast = cast_store.load_cast(config.cast_file) if config.cast_file else None
+            if self.cast is None:
+                raise ValueError(f"OpenAI: cast mode needs a readable cast file, got {config.cast_file!r}")
+
+    def _voice_of(self, text: str) -> VoiceOf:
+        """The per-segment voice rule for one chapter: narration is the narrator's voice; a
+        quoted line is its attributed character's voice when the cast knows the speaker and has
+        given them a voice, else the dialogue voice (else the narrator's, so a mode without a
+        dialogue voice degrades to single voice rather than failing)."""
+        narrator = self.config.voice_name
+        dialogue_voice = self.config.dialogue_voice or narrator
+        if self.cast is None:
+            return lambda piece: dialogue_voice if piece.kind == DIALOGUE else narrator
+        # Attributions are keyed by the chapter text's hash (the same hash the chapter manifest
+        # uses), so they survive renumbering and a different chapter selection.
+        lines = cast_store.chapter_lines(self.cast, hashlib.sha1(text.encode("utf-8")).hexdigest())
+        if lines is None:
+            logger.warning("OpenAI: this chapter is not in the cast (text changed or chapter not analysed); "
+                           "every quoted line gets the dialogue voice")
+            lines = {}
+
+        def voice_of(piece: Segment) -> str:
+            if piece.kind != DIALOGUE:
+                return narrator
+            return cast_store.character_voice(self.cast, lines.get(piece.line_id)) or dialogue_voice
+        return voice_of
 
     def __str__(self) -> str:
         return super().__str__()
@@ -458,45 +542,19 @@ class OpenAITTSProvider(BaseTTSProvider):
         19 s of ffmpeg process spawns alone. Instead, if speed != 1.0, one atempo pass stretches
         the whole finished chapter (speech and pauses together) at the end, which shrinks the
         pauses by the same proportion the server's per-unit approach did.
+
+        Single voice mode sends exactly the units of paced_units() with the one configured voice;
+        the other voice modes build units inside the narration/dialogue segments (voiced_units)
+        and send each with its own voice.
         """
-        speed = float(self.config.speed or 1.0)
-        sentence_gap_ms = int(self.config.sentence_pause_ms or 0)
-        paragraph_gap_ms = int(self.config.paragraph_pause_ms or 0)
-        units = paced_units(text, self.config.language or "en")
-        if not units:
-            raise ValueError("No speakable text in this chapter")
-
-        pieces: List[bytes] = []
-        audio_format = None
-        previous_paragraph = None
-        for number, (paragraph, unit, continues_previous) in enumerate(units, 1):
-            chunk_id = f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{number}_of_{len(units)}"
-            logger.info(f"Processing {chunk_id}, length={len(unit)}")
-            logger.debug(f"Processing {chunk_id}, length={len(unit)}, text=[{unit}]")
-            response = self._create_speech(
-                model=self.config.model_name,
-                voice=self.config.voice_name,
-                speed=1.0,
-                instructions=self.config.instructions,
-                input=unit,
-                response_format="wav",
-            )
-            audio = AudioSegment.from_file(io.BytesIO(response.content), format="wav")
-            if audio_format is None:
-                audio_format = (audio.frame_rate, audio.channels, audio.sample_width)
-            else:
-                audio = (audio.set_frame_rate(audio_format[0]).set_channels(audio_format[1])
-                         .set_sample_width(audio_format[2]))
-                if continues_previous:
-                    gap_ms = 0
-                else:
-                    gap_ms = paragraph_gap_ms if paragraph != previous_paragraph else sentence_gap_ms
-                gap_frames = int(audio_format[0] * gap_ms / 1000)
-                pieces.append(b"\0" * gap_frames * audio_format[1] * audio_format[2])
-            pieces.append(audio.raw_data)
-            previous_paragraph = paragraph
-
-        self._combine_and_export(pieces, audio_format, speed, output_file, audio_tags)
+        language = self.config.language or "en"
+        if self.config.voice_mode == VOICE_MODE_SINGLE:
+            units = [(paragraph, unit, 1, continues, self.config.voice_name)
+                     for paragraph, unit, continues in paced_units(text, language)]
+        else:
+            units = [(paragraph, unit, 1, continues, voice)
+                     for paragraph, unit, continues, voice in voiced_units(text, language, self._voice_of(text))]
+        self._speak_units(units, output_file, audio_tags)
 
     def _paced_text_to_speech_paragraph(self, text: str, output_file: str, audio_tags: AudioTags) -> None:
         """Paragraph-unit mode (F-05, opt-in: paced_unit_mode="paragraph").
@@ -506,25 +564,40 @@ class OpenAITTSProvider(BaseTTSProvider):
         requests per 30-minute chapter each pay a ~0.35 s fixed server cost regardless of how
         short the text is. The model's own inter-sentence gaps inside a multi-sentence request
         are found and stretched to sentence_pause_ms (_stretch_sentence_gaps); paragraph pauses
-        and the F-27 one-shot speed change work exactly as in sentence mode.
+        and the F-27 one-shot speed change work exactly as in sentence mode. In a multi-voice
+        mode each narration or dialogue segment is packed as a paragraph of its own.
         """
+        language = self.config.language or "en"
+        if self.config.voice_mode == VOICE_MODE_SINGLE:
+            units = [(paragraph, unit, count, continues, self.config.voice_name)
+                     for paragraph, unit, count, continues in paragraph_mode_units(text, language)]
+        else:
+            units = voiced_paragraph_units(text, language, self._voice_of(text))
+        self._speak_units(units, output_file, audio_tags)
+
+    def _speak_units(self, units: List[Tuple[int, str, int, bool, str]], output_file: str,
+                     audio_tags: AudioTags) -> None:
+        """Request each (paragraph, text, sentence_count, continues_previous, voice) unit at speed
+        1.0, insert the configured pauses between them and export the chapter once."""
         speed = float(self.config.speed or 1.0)
         sentence_gap_ms = int(self.config.sentence_pause_ms or 0)
         paragraph_gap_ms = int(self.config.paragraph_pause_ms or 0)
-        units = paragraph_mode_units(text, self.config.language or "en")
         if not units:
             raise ValueError("No speakable text in this chapter")
 
         pieces: List[bytes] = []
         audio_format = None
         previous_paragraph = None
-        for number, (paragraph, unit, sentence_count, continues_previous) in enumerate(units, 1):
+        for number, (paragraph, unit, sentence_count, continues_previous, voice) in enumerate(units, 1):
             chunk_id = f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{number}_of_{len(units)}"
-            logger.info(f"Processing {chunk_id}, length={len(unit)}, sentences={sentence_count}")
+            detail = f", sentences={sentence_count}" if self.config.paced_unit_mode == "paragraph" else ""
+            if self.config.voice_mode != VOICE_MODE_SINGLE:
+                detail += f", voice={voice}"
+            logger.info(f"Processing {chunk_id}, length={len(unit)}{detail}")
             logger.debug(f"Processing {chunk_id}, length={len(unit)}, text=[{unit}]")
             response = self._create_speech(
                 model=self.config.model_name,
-                voice=self.config.voice_name,
+                voice=voice,
                 speed=1.0,
                 instructions=self.config.instructions,
                 input=unit,
@@ -577,6 +650,8 @@ class OpenAITTSProvider(BaseTTSProvider):
             raise ValueError(f"OpenAI: Instructions are only supported for 'gpt-4o-mini-tts' model")
         if self.config.paced_unit_mode not in ("sentence", "paragraph"):
             raise ValueError(f"OpenAI: Unsupported paced_unit_mode: {self.config.paced_unit_mode}")
+        if self.config.voice_mode not in VOICE_MODES:
+            raise ValueError(f"OpenAI: Unsupported voice_mode: {self.config.voice_mode}")
 
     def estimate_cost(self, total_chars):
         return math.ceil(total_chars / 1000) * self.price
