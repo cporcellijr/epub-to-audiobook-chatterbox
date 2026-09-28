@@ -81,6 +81,12 @@ class OpenAISpeechRequest(BaseModel):
     speed: float = 1.0
     seed: Optional[int] = None
     language: Optional[str] = None
+    # Adaptive delivery (audiobook_generator's Chatterbox-only feature): per-request overrides of
+    # the saved generation defaults, sent via the OpenAI SDK's extra_body. None (the default, for
+    # every existing caller) keeps today's behaviour of falling back to the saved default.
+    exaggeration: Optional[float] = Field(None, ge=0.25, le=2.0)
+    cfg_weight: Optional[float] = Field(None, ge=0.0, le=1.0)
+    temperature: Optional[float] = Field(None, ge=0.05, le=5.0)
 
 
 # --- Logging Configuration ---
@@ -1505,9 +1511,9 @@ def openai_speech_endpoint(request: OpenAISpeechRequest):
             audio_tensor, sr = engine.synthesize(
                 text=chunk_text,
                 audio_prompt_path=str(audio_prompt_path),
-                temperature=get_gen_default_temperature(),
-                exaggeration=get_gen_default_exaggeration(),
-                cfg_weight=get_gen_default_cfg_weight(),
+                temperature=request.temperature if request.temperature is not None else get_gen_default_temperature(),
+                exaggeration=request.exaggeration if request.exaggeration is not None else get_gen_default_exaggeration(),
+                cfg_weight=request.cfg_weight if request.cfg_weight is not None else get_gen_default_cfg_weight(),
                 seed=chunk_seed,
                 language=request.language or get_gen_default_language(),
             )
