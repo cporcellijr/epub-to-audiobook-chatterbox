@@ -11,7 +11,7 @@ class TestOpenAiVoiceChoices(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        for name in ("love poem.wav", "Elena.wav", "Teen.mp3", "notes.txt"):
+        for name in ("narrator two.wav", "Elena.wav", "Old Radio.mp3", "notes.txt"):
             open(os.path.join(self.tmp.name, name), "wb").close()
 
     def tearDown(self):
@@ -20,7 +20,7 @@ class TestOpenAiVoiceChoices(unittest.TestCase):
     def test_voices_listed_from_mounted_folder(self):
         with patch.dict(os.environ, {"TTS_VOICES_DIR": self.tmp.name}):
             choices = openai_voice_choices()
-        self.assertEqual(choices, [("Elena", "Elena.wav"), ("love poem", "love poem.wav"), ("Teen", "Teen.mp3")])
+        self.assertEqual(choices, [("Elena", "Elena.wav"), ("narrator two", "narrator two.wav"), ("Old Radio", "Old Radio.mp3")])
 
     def test_folder_listing_does_not_call_the_tts_server(self):
         env = {"TTS_VOICES_DIR": self.tmp.name, "OPENAI_BASE_URL": "http://busy-server:8004/v1"}
@@ -34,9 +34,9 @@ class TestOpenAiVoiceChoices(unittest.TestCase):
         self.assertEqual(values, list(get_openai_supported_voices()))
 
     def test_default_voice_prefers_configured_voice(self):
-        choices = [("Elena", "Elena.wav"), ("Teen", "Teen.mp3")]
-        with patch.dict(os.environ, {"OPENAI_DEFAULT_VOICE": "Teen.mp3"}):
-            self.assertEqual(default_openai_voice(choices), "Teen.mp3")
+        choices = [("Elena", "Elena.wav"), ("Old Radio", "Old Radio.mp3")]
+        with patch.dict(os.environ, {"OPENAI_DEFAULT_VOICE": "Old Radio.mp3"}):
+            self.assertEqual(default_openai_voice(choices), "Old Radio.mp3")
         with patch.dict(os.environ, {"OPENAI_DEFAULT_VOICE": "missing.wav"}):
             self.assertEqual(default_openai_voice(choices), "Elena.wav")
 

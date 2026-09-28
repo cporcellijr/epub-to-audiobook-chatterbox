@@ -124,12 +124,12 @@ class TestPreviewVoice(unittest.TestCase):
     def test_preview_sends_sliders_and_returns_audio_file(self):
         with patch.dict(os.environ, {"CHATTERBOX_URL": "http://cb:8004"}), \
                 patch("urllib.request.urlopen", return_value=_fake_response(b"mp3-bytes")) as urlopen:
-            path = chatterbox_ui.preview_voice("love poem.wav", "Hello there.", 0.8, 0.45, 0.61, 1.25)
+            path = chatterbox_ui.preview_voice("narrator two.wav", "Hello there.", 0.8, 0.45, 0.61, 1.25)
         try:
             request = urlopen.call_args[0][0]
             payload = json.loads(request.data)
             self.assertEqual(request.full_url, "http://cb:8004/tts")
-            self.assertEqual(payload["predefined_voice_id"], "love poem.wav")
+            self.assertEqual(payload["predefined_voice_id"], "narrator two.wav")
             self.assertEqual(payload["text"], "Hello there.")
             self.assertEqual((payload["exaggeration"], payload["cfg_weight"], payload["temperature"]),
                              (0.8, 0.45, 0.61))
@@ -450,12 +450,12 @@ class TestQueueView(unittest.TestCase):
         queue.jobs.return_value = [
             {"id": "a", "title": "Book A", "voice": "Elena.wav", "chapters": 4, "estimate_seconds": 3600,
              "status": "done", "finished": "2026-09-27 10:00", "note": "", "settings": {}},
-            {"id": "b", "title": "Book B", "voice": "love poem.wav", "chapters": 5, "estimate_seconds": 1800,
+            {"id": "b", "title": "Book B", "voice": "narrator two.wav", "chapters": 5, "estimate_seconds": 1800,
              "status": "queued", "note": "", "settings": {}},
         ]
         rows, ids, status = chatterbox_ui.queue_view(queue)
         self.assertEqual(ids, ["a", "b"])
-        self.assertEqual(rows[1][:4], [2, "Book B", "love poem", 5])
+        self.assertEqual(rows[1][:4], [2, "Book B", "narrator two", 5])
         self.assertIn("done", rows[0][4])
         self.assertIn("1 book(s) to go", status)
         self.assertIn("30 min", status)

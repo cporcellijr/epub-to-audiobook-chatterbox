@@ -6,6 +6,14 @@ audiobooks with a self-hosted [Chatterbox-TTS-Server](https://github.com/devnen/
 single-file M4B output and a book queue. The upstream README follows below; the command-line tool
 still works as documented there.
 
+> **Local network only.** Neither the web UI nor Chatterbox has any login. Anyone who can reach port
+> 7860 can queue books, write into your audiobook folder and add or delete voices; anyone who can reach
+> port 8004 can use and reconfigure Chatterbox. Run it on a home network or behind a VPN, never with
+> those ports open to the internet.
+
+This is a personal setup shared as-is: it is tuned for one machine (an RTX 4070 on Docker Desktop for
+Windows) and issues or pull requests may not get a response.
+
 The repo holds the whole stack:
 
 | Path | What |
