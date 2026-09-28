@@ -12,7 +12,6 @@ services:
     image: chatterbox-tts-server:local
     container_name: chatterbox
     restart: unless-stopped
-    runtime: nvidia
     environment:
       - TZ=${TZ:-UTC}
       - HF_HUB_ENABLE_HF_TRANSFER=1

@@ -29,7 +29,7 @@ corrections to F-03, F-10, F-22, F-24 and F-45 below.
 | Outcome | Findings |
 |---|---|
 | Fixed | F-01 to F-42, F-44, F-52 to F-57, F-61 to F-63, F-66, F-67, F-69; F-64 through F-03's new config file, which has no `ui_state` |
-| Partly fixed | F-39: `chatterbox/.dockerignore` added; build tools stay in the image and compose still requests the GPU two ways. F-43: patterns are validated (F-15); no timeout, since the owner writes the patterns |
+| Partly fixed | F-39: `chatterbox/.dockerignore` added, and compose now requests the GPU once (`runtime: nvidia` removed on 2026-09-28: it left no `libcuda.so` for Triton to link, so F-45 could not compile); the build tools stay, since torch.compile needs a C compiler at run time. F-43: patterns are validated (F-15); no timeout, since the owner writes the patterns |
 | Not done: needs a GPU to build and measure | F-46 to F-48, F-59, F-60 |
 | Fixed (validated on the GPU, on in the owner's deployment) | F-45: compiled token loop (`chatterbox/fast_t3.py`, `TTS_COMPILE`), whole requests 2.37x faster with the same model output (`WORKLOG.md` section 12) |
 | Not done: upstream utilities this deployment doesn't use | F-65, F-68 |
