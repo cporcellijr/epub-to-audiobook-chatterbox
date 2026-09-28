@@ -282,4 +282,31 @@ does page load.
 
 Live-verified against the real `kokoro` container over `blackcat-net` (measurement + one smoke
 run through the production `build_config` -> `get_tts_provider` -> `text_to_speech` path): 775
-characters sent in total. Tests: 293 passing (was 241; +52), plus 19 for `chatterbox/` (unchanged).
+characters sent in total. Tests: 294 passing (was 241; +53), plus 19 for `chatterbox/` (unchanged).
+
+## 12. F-45 measured: a compiled token loop (2026-09-28)
+
+Measured in a throwaway container from the production image, through the production engine (BF16,
+autocast, voice cache) with the book settings (Elena, seed 888); the live server was not touched.
+Scripts: `experiments/f45/`.
+
+- **Baseline.** Token sampling is 5.09 s of a 5.55 s request (92%): 21.1 ms per token. The audio decode
+  is 0.44 s.
+- **Prototype.** The stock token loop, unchanged except that the per-token transformer step reads a
+  static KV cache (transformers `StaticCache`, 2,048 positions) and runs through
+  `torch.compile(mode="reduce-overhead")`, i.e. CUDA graphs.
+- **Speed.** Token step 20-25 ms to 7.7-8.3 ms (about 2.6x). Whole requests (`engine.synthesize`, three
+  texts, three runs each): 1.75x to 4.12x real time, **2.35x faster**. That is about 58% less
+  generation time: a 10-hour book drops from about 6 hours to about 2.5. The review's guess of 15-30%
+  was far too low. Compile is a one-time 17 s; peak VRAM in the test process was 3.2 GB.
+- **Same model.** With the stock token sequence forced through both paths, the compiled path's top
+  token matched stock at 94-97% of steps and was always in stock's top five (mean KL 0.0017). An
+  uncompiled run on the same static cache differs from stock by the same amount, so the difference is
+  bf16 rounding from the cache layout, not compilation. Sampled output drifts from stock after a few
+  tokens (same distribution, different draws); durations stayed within about 5%.
+
+Before building it for real: keep the compiled step and cache in `engine.py` for the life of the
+process, for the Original model only, behind an on/off setting that falls back to the stock loop;
+compile during model load (about 17 s more start-up); run synthesis on one dedicated thread, since the
+server now synthesizes on a threadpool (F-10) and torch.compile's CUDA graphs are recorded per thread
+(check); listen to A/B samples of the same text before switching it on.
