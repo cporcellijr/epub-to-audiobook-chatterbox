@@ -1055,6 +1055,19 @@ class TestDeleteVoiceWiring(unittest.TestCase):
             self.assertNotIn("value", update)
             self.assertNotIn("choices", update)
 
+    def test_nothing_picked_skips_the_dialog_and_says_so(self):
+        ui = chatterbox_ui.build_ui()
+        delete_button_id = next(block._id for block in ui.blocks.values()
+                                if getattr(block, "value", None) == "Delete voice")
+        trigger = next(fn for fn in ui.fns.values()
+                       for target_id, event in getattr(fn, "targets", [])
+                       if target_id == delete_button_id and event == "click")
+        self.assertIn("!name ? ['', lab, mk, eng]", trigger.js)
+        with tempfile.TemporaryDirectory() as voices, patch.dict(os.environ, {"TTS_VOICES_DIR": voices}):
+            with self.assertRaises(gr.Error) as ctx:
+                trigger.fn("", "Elena.wav", "Elena.wav", "chatterbox")
+        self.assertIn("Pick a voice", str(ctx.exception))
+
 
 class TestHostUiProcessFactory(unittest.TestCase):
     """F-19: job processes are forked from a multithreaded server; host_ui must use the spawn

@@ -1004,7 +1004,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                         with gr.Column(scale=0, min_width=100):
                             sample_button = gr.Button("▶ Sample", size="sm")
                     sample_audio = gr.Audio(label="Sample", show_label=False, autoplay=True,
-                                            interactive=False)
+                                            interactive=False, visible=False)
                     speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed",
                                       info="1.0 recommended (other speeds are stretched after generation).")
             with gr.Row(equal_height=True):
@@ -1147,7 +1147,9 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         engine.change(engine_changed, inputs=engine, outputs=voice)
         voice.input(_sync_if_chatterbox, inputs=[voice, engine], outputs=lab_voice)
         lab_voice.input(_sync_if_chatterbox, inputs=[lab_voice, engine], outputs=voice)
-        sample_button.click(sample_voice, inputs=[engine, voice, speed], outputs=sample_audio)
+        # The player stays hidden until the first sample, then shows before the audio arrives.
+        sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
+            .then(sample_voice, inputs=[engine, voice, speed], outputs=sample_audio)
         play_button.click(preview_voice, inputs=[lab_voice, phrase, exaggeration, cfg_weight, temperature, speed],
                           outputs=preview_audio)
         save_button.click(save_settings, inputs=[exaggeration, cfg_weight, temperature], outputs=lab_status)
@@ -1159,7 +1161,10 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             delete_voice,
             inputs=[delete_voice_dropdown, lab_voice, voice, engine],
             outputs=[delete_voice_status, lab_voice, voice, delete_voice_dropdown],
-            js="(name, lab, mk, eng) => confirm(`Delete voice '${name}'? This can't be undone.`)"
+            # Nothing picked: skip the dialog and send "" so the handler can say so; a cancelled
+            # dialog sends null, which the handler treats as "change nothing".
+            js="(name, lab, mk, eng) => !name ? ['', lab, mk, eng]"
+               " : confirm(`Delete the voice '${name.replace(/\\.(wav|mp3)$/i, '')}'? This can't be undone.`)"
                " ? [name, lab, mk, eng] : [null, lab, mk, eng]",
         )
 
