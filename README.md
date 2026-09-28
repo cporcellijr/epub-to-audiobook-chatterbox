@@ -47,6 +47,18 @@ The repo holds the whole stack:
 **Narration and output**
 - **Paced narration**: paragraphs are taken from the EPUB's HTML, text is sent a sentence at a time,
   and real pauses are inserted after sentences and between paragraphs (adjustable).
+- **Multi-voice narration** (Voice mode on the Make tab). *Single voice* reads everything with one
+  voice, exactly as before. *Narrator + dialogue voice* gives every quoted line a second voice; no LLM
+  needed. *Cast* asks a local LLM (any OpenAI-compatible chat endpoint: Ollama, llama.cpp, LM Studio;
+  book text never leaves the machine) who speaks each line: **Analyse cast** queues the pass as a job
+  of its own, Chatterbox's model is unloaded from the GPU while it runs and reloaded after, and the
+  result is an editable cast table (character, lines, gender, voice, sample button). Voices are
+  suggested by gender (Kokoro ids carry it; Chatterbox voices get theirs from a **Voice gender**
+  setting in the Voice lab) with the main characters kept distinct from each other and the narrator;
+  lines whose speaker the LLM couldn't tell get the dialogue voice. The cast is saved per book under
+  `casts/` in the app data folder, and **Add to queue** carries a snapshot of it with the job. Units
+  never span a change of voice; the pause between narration and a quote is the sentence pause.
+  Validation on a real LLM: `docs/chatterbox-edition/experiments/multivoice/`.
 - **Single M4B** per book with chapter markers, cover art, title/author tags. Chapters are generated in a
   hidden `.chapters` folder and merged only when all succeed, so a library scanner never sees a
   half-finished book; a failed book can be resumed with "Skip chapters already made".
@@ -112,6 +124,10 @@ Settings the app reads (the compose file sets them):
 | `EBOOK_LIBRARY_DIR` | Ebook library for the book picker |
 | `KOKORO_BASE_URL` | Optional second engine's OpenAI endpoint, e.g. `http://kokoro:8880/v1`. Leave unset to hide the Engine choice entirely |
 | `KOKORO_DEFAULT_VOICE` | Kokoro voice id selected by default (default: the server's own `default_voice`, else `af_heart`) |
+| `LLM_BASE_URL` | Optional local OpenAI-compatible chat endpoint for multi-voice cast analysis, e.g. `http://ollama:11434/v1`. Leave unset to hide the Cast voice mode |
+| `LLM_MODEL` | Chat model name for cast analysis |
+| `LLM_API_KEY` | Key for that endpoint, if it wants one |
+| `LLM_UNLOAD_CHATTERBOX` | `on` (default) frees Chatterbox's GPU memory during a cast analysis and reloads it after; `off` leaves it loaded |
 
 Books are written to `audiobook_output/<title>/` inside the container; mount your audiobook library there.
 

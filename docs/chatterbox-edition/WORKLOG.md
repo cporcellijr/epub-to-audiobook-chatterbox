@@ -142,7 +142,7 @@ non-story after one fix (a novel stored as a single section that begins with its
 | Same passage, A/B | Before: 83 s audio, 0 pauses ≥ 0.6 s. After: 98 s, 14 pauses ≥ 0.6 s |
 | Very short inputs ("Yes.", "Hmm?") | 0.36–1.32 s of audio; no runaway generations |
 | Library index | 1,517 EPUBs; first build ~13 s; refresh ~5 s; parsing one book 0.04–0.19 s |
-| Tests | 293 passing (241 before Kokoro + voice deletion, section 11), plus 19 for `chatterbox/` (135 before the review fixes; upstream baseline: 28 tests, 2 erroring on a mock that closed stdout) |
+| Tests | 404 passing (294 before multi-voice, section 13; 241 before Kokoro + voice deletion, section 11), plus 44 for `chatterbox/` (135 before the review fixes; upstream baseline: 28 tests, 2 erroring on a mock that closed stdout) |
 
 ## 7. Known limitations and open questions
 
@@ -340,3 +340,117 @@ warm-up 14.9 s; repeated 200-character requests over HTTP 3.5-3.7x real time; a 
 chapter through the app 18.7 s (the old estimate said 36 s). The app's estimate now assumes the
 compiled loop: 3.87x real time for one long request, and sentence-sized requests take 1.26 times as long.
 
+
+## 13. Multi-voice narration (2026-09-28)
+
+Built from `docs/chatterbox-edition/MULTIVOICE_BUILD_BRIEF.md` on branch `feature/multivoice`, without a
+GPU or an LLM: code, 110 unit tests and a validation script for the owner's machine. Nothing here has
+run against a real LLM or Chatterbox yet; section 13.4 says what to run.
+
+### 13.1 What it does
+
+A **Voice mode** on the Make tab: *Single voice* (default; sends exactly the requests it sent before,
+proven by a fixture test that pins the pre-change unit list), *Narrator + dialogue voice* (every quoted
+line in a second voice, no LLM), and *Cast* (shown only when `LLM_BASE_URL` is set). Cast mode adds an
+**Analyse cast** button that queues the LLM pass as a queue job of its own kind (`kind: "cast"`); the
+queue shows its progress ("analysing cast · 3 of 12 chapters"), and books queued after it wait. When it
+finishes the panel shows the cast table (character, lines, gender, age, voice, other names); clicking a
+row opens a small editor (gender, voice dropdown for the job's engine, the existing Sample button) and
+**Save** writes the change to the cast file. **Add to queue** validates the cast (finished; voices
+belong to the engine), records the narrator voice in it and copies a snapshot into `queue_uploads/`
+for the job, so later edits or a re-analysis never change a queued book.
+
+### 13.2 Design
+
+- **Dialogue splitting** (`core/dialogue.py`, no LLM): per chapter, the quote style is detected once
+  (double, single, em-dash, or none; the style with more openings wins, and the other mark is plain
+  text, so a single quote nested in double-quoted speech stays inside it). Straight quotes open only
+  after a separator, so apostrophes never open speech; a single-quote mark followed by a letter is an
+  apostrophe, and one straight after a letter is a possessive when the speech still has a closing mark
+  later (`James' hat`). A quotation left open at a paragraph's end continues into a next paragraph that
+  opens with speech; the continuation is a separate line marked `continues`, and attribution gives it the
+  previous line's speaker without asking. Output: ordered `Segment(kind, line_id, text, continues)` per
+  paragraph, line ids 1.. within the chapter; paragraph numbering matches `paced_units` exactly.
+- **Units follow speakers** (`openai_tts_provider.py`): the sentence packer and the paragraph-mode
+  packer were factored out (`_sentence_units`, `_paragraph_units`) and `paced_units` /
+  `paragraph_mode_units` call them per paragraph as before. `voiced_units` / `voiced_paragraph_units`
+  call them per *segment* and tag each unit with a voice, so a unit can never span two voices; the
+  40/400/450-character rules apply inside a segment. Both paced paths now feed one `_speak_units` loop
+  that requests each unit with its own voice; single voice mode still calls the untouched `paced_units`
+  and the fixture test compares the resulting requests to the recorded pre-change list.
+- **Per-unit voice rule** (`OpenAITTSProvider._voice_of`): narration -> `voice_name`; a quoted line ->
+  its character's voice when the cast knows the speaker and the character has a voice, else
+  `dialogue_voice`, else the narrator. Attributions are looked up by the chapter text's SHA-1, the same
+  hash the chapter manifest (F-11) uses, so a different chapter selection or renumbering still finds
+  them; an unanalysed chapter logs one warning and speaks its quotes with the dialogue voice. Tagging,
+  M4B, resume and retry are untouched (the provider is built per chapter exactly as before).
+- **Attribution** (`core/cast_llm.py`): windows of `WINDOW_LINES = 20` asked lines (or
+  `WINDOW_MAX_CHARS = 6000` of text, whichever comes first) of consecutive paragraphs, preceded by
+  `CONTEXT_PARAGRAPHS = 2` unmarked paragraphs; asked lines are rendered `[#12] "..."`. All prompt text is
+  in `PROMPTS`. The reply must be a JSON object whose `speakers` cover exactly the asked ids (missing or
+  invented id, non-string name, no JSON: `AttributionError`); code fences and `#12`/`[#12]` keys are
+  tolerated, bad gender/age values become `unknown`. One retry, then the window's lines are unknown.
+  `ChatClient` uses `response_format: json_object` until the server rejects it (HTTP 400), then goes on
+  without. Temperature 0, one request at a time, 300 s timeout.
+- **Aliases** (`Roster`): keys are the normalized first-seen name (titles like Mr./Mrs./Dr. stripped,
+  unless that would leave nothing: "Mother" stays "Mother"); the display name grows to the fullest form
+  seen. Merging is deliberately conservative: a first name and its fuller form merge (prefix, or a table
+  of common English short forms so that Tom / Thomas, Bill / Will / William, Peggy / Margaret meet), two
+  people of different known genders never merge, an ambiguous first name (two Annes) stays separate, and a
+  bare surname is never merged by code ("Mrs. Marsh" next to "Ada Marsh" is usually the mother). The
+  model is asked for aliases, which do merge. Reasoning: a wrong merge gives a main character the wrong
+  voice for a whole book; a split shows two rows the owner can give the same voice.
+- **Cast file** (`core/cast.py`): `casts/<key>.json` in the app data folder, key = SHA-1 of the EPUB's
+  bytes (an upload and a library copy share one cast). Holds book title/author, engine, narrator voice,
+  status (running/done/failed + error), progress, characters (name, aliases, gender, age, lines, voice),
+  per-chapter `{text hash: {number, title, lines {id: key|null}, unknown}}` and stats (windows, first
+  replies unusable, still unusable after retry, lines, unknown lines, seconds). Rewritten atomically after
+  every chapter, so the UI can show progress and a crash keeps what was done.
+- **Voice suggestions** (`suggest_voices`): characters by line count; each gets an unused voice of its
+  gender (neutral fits anyone, unknown takes anything), never the narrator's; only when the suitable
+  voices run out is one shared, least-used first. Kokoro genders come from the id prefix; Chatterbox
+  genders from `voice_genders.json` (app data), set in the Voice lab's new "Voice gender" row; an unset
+  voice is neutral. No gender is ever guessed from a name.
+- **Unload / reload** (`core/chatterbox_control.py`, `core/cast_analysis.py`): the analysis process
+  POSTs `/api/unload` when `LLM_UNLOAD_CHATTERBOX` is on (default), runs the pass, and in `finally`
+  POSTs `/restart_server` (which blocks until the model is loaded) and then polls `/api/model-info`
+  until `loaded` (up to 900 s: a cold cache downloads the model). The queue asks
+  `ready_for_book(settings)` before starting a Chatterbox book: if `/api/model-info` says unloaded it
+  refuses and kicks off one background reload (covers an analysis killed before its reload); an
+  unreachable Chatterbox does not hold the queue (the book's own F-02 wait covers a restart). Kokoro
+  books never wait.
+- **Settings**: `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_UNLOAD_CHATTERBOX` through compose as
+  `${VAR:-}` (`on` default for the last), documented in `.env.example` and the README, read per call.
+- **Estimates**: the analysis job's queue time is `dialogue lines x ANALYSIS_SECONDS_PER_LINE (0.5)`,
+  a placeholder until the validation script reports the real speed; `chapter_stats` gained a fourth
+  element (dialogue lines) and older 3-element stats still work.
+
+### 13.3 Build or borrow
+
+Everything was built fresh; the licence stays MIT. prakharsr/audiobook-creator (GPL-3.0, checked) was
+read for ideas only: its per-line attribution loop with a running character list and structured
+outputs, its "insert / update / merge" character operations (here: `Roster.add` with alias merging), and
+its lesson that small models drift from the schema (here: strict validation, one retry, then unknown).
+Its code depends on pydantic-ai and a different text pipeline (whole-book JSONL of lines), so borrowing
+would have meant heavy rework plus relicensing a public MIT repo for no saving.
+
+### 13.4 Tests, and what is not verified
+
+404 app tests pass (294 before; the 110 new ones are in `tests/audiobook_generator/dialogue_test.py`,
+`multivoice_provider_test.py`, `cast_llm_test.py`, `cast_test.py`, `cast_analysis_test.py`, plus new
+cases in `job_queue_test.py` and `chatterbox_ui_test.py`). They cover: quote splitting on invented
+passages (straight/curly/single/dash, apostrophes, possessives, nesting, multi-paragraph speech, style
+detection); units never spanning a voice change and the pre-change unit list for single voice; per-unit
+voices through the provider (dialogue, cast, unknown speaker, unanalysed chapter, pauses); window
+building by line count and character budget; reply parsing (good, fenced, broken, missing/invented ids);
+alias merging rules; retry-then-unknown and continued lines; cast persistence and suggestions; the unload
+-> analyse -> reload order including a failing analysis; the queue never starting a book while unloaded;
+old jobs (no `kind`, no voice-mode keys) building as single-voice books; `queue_settings` validation and
+the cast snapshot; the cast panel and editor.
+
+Not verified without a GPU or an LLM: attribution quality of any real model, the `response_format`
+fallback against a real server, the real unload/reload timing, how a two-voice book actually sounds
+(short narration fragments such as "he said." are now their own requests, which Chatterbox may read
+less steadily than a 40-character unit), and the analysis speed behind `ANALYSIS_SECONDS_PER_LINE`.
+`experiments/multivoice/validate_multivoice.py` measures all of that: run it as its README says before
+using cast mode on a book.
