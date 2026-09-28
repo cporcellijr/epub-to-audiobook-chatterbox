@@ -670,3 +670,84 @@ click-to-profile text and the progress line. Not verified by clicking through a 
 page's config carries the new columns, and the same UI functions were run over the live casts
 inside the container.
 
+
+## 16. Voices matched to character profiles (2026-09-28)
+
+Until now a cast's voices were the first free voice of the right gender, in alphabetical order
+(one book's two leading women got Abigail and Alice). Now the profile says what kind of voice fits and each
+Chatterbox voice is measured, so the suggestion is the closest measured voice.
+
+### 16.1 What was tried first
+
+Handing qwen2.5:14b the whole voice list (33 voices with measured descriptions) and the profiles,
+and asking it to cast. Every reply was valid (genders respected, no voice shared, narrator avoided,
+2-4 s), but the picks followed the list order. Reversing the list kept the same voice for 1 of 11
+characters and the same pitch band for 5 of 11. The same order twice gave identical picks, so this
+was position, not randomness. It also made up reasons ("clear" for a voice with no such tag).
+Asking it instead for targets per character (no voice list) and choosing in code kept 7 of 11 voices
+across orders, which is the design built.
+
+### 16.2 Measuring voices (`core/voice_measure.py`, new)
+
+Each voice speaks `MEASURE_TEXT` through Chatterbox (`/tts`, the saved delivery settings, as a book
+would), and Praat (`praat-parselmouth==0.4.7`, a new pinned dependency) gives three numbers: median
+pitch, pitch spread (10th to 90th percentile, in semitones) and harmonics-to-noise ratio. For
+matching, each becomes a percentile among the measured voices of the same gender, and the Voice lab
+shows them as words ("low for a woman, husky, even").
+
+Generated speech is measured rather than the reference clip. On the 33 voices, clip and generated
+pitch agree (r 0.96; same third of the range for 27 of 33, never the opposite third) but huskiness
+doesn't (r 0.86, same third for only 19 of 33), and the generated speech is what a listener hears.
+
+Measurements live in `voice_features.json` (app data) with each file's size and modification time,
+so a replaced voice is measured again. **Measure voices** (Voice lab) measures every voice that
+isn't; adding a voice measures it straight away, and a failure there (Chatterbox busy, unloaded or
+unreachable) only defers it. Deleting a voice drops its measurement. Kokoro voices aren't measured
+(Kokoro isn't deployed here) and are still matched by gender only.
+
+### 16.3 Targets and matching
+
+The profile reply gains `pitch` (low, medium, high), `quality` (husky, clear) and `delivery`
+(expressive, even), relative to other voices of the same gender; "either", unknown or unrecognised
+words become no target. Without a pitch target, a child wants high and an elderly character low.
+`suggest_voices` keeps its rules (most-spoken first, distinct voices, narrator never, gender first)
+and, among the voices those allow, takes the lowest `match_cost`. Pitch comes first: any voice in
+the wanted third of the range beats any voice outside it. Then huskiness and liveliness count, then
+closeness to the band's middle, so the most extreme voice isn't everyone's pick. An unmeasured
+voice costs as much as one just outside the band. With no targets or no measurements, the list
+order decides as before.
+
+UI: an **Auto-pick suggested voices** checkbox (on) next to Analyse. With it, a re-analysis carries
+over only the voices saved with **Save voice** (now marked `voice_picked`); the others get fresh
+suggestions. **Suggest voices again** (browser confirm) does the same for an existing cast without
+the LLM, for example after measuring voices. Clicking a character adds a line such as "**Voice
+match:** wants medium pitch, clear, even · Jade is medium for a woman, even".
+
+### 16.4 Measured on the owner's machine
+
+- Measure voices: 32 voices in 71 s. The pitches match the investigation's measurements (Olivia
+  172 Hz, Teen 230, Thomas 115). `Elf.wav` had been removed from the voices folder at 18:17, between
+  the investigation and this run.
+- Re-analysis with auto-pick on scratch copies of the two real casts: all 10 profiles usable, every
+  one with targets. The first matching rule weighted pitch only twice as heavily, and it put 3 of 11
+  characters a band higher than asked, for a voice that was clear and even as asked. Hence the
+  pitch-first rule. After it, all 11 characters got a voice in the band asked for, and 2 matched on
+  all three words (a young lead: Teen, high, clear, expressive; a crude minor character: Michael, low, husky, expressive).
+- `Taylor.wav` is recorded as male but speaks at 196 Hz, the female range; it is the "highest man"
+  and would go to young men. Worth a listen.
+
+Limits: three coarse measurements can't hear warmth, age or acting, so these are better first picks,
+not casting. The weights are set by reasoning, not tuned by ear. Casts saved before this have no
+`voice_picked` marks, so auto-pick or Suggest voices again replaces every voice in them, including
+earlier hand picks.
+
+### 16.5 Tests
+
+551 app tests pass (523 before; 28 new). `voice_measure_test.py` (8) runs Praat on synthetic
+voices of known pitch, glide and noise, and covers saving, staleness, which voices need measuring,
+within-gender percentiles and the words. `cast_test.py` (9) covers profile matching, the pitch-band
+rule, distinctness, the age fallback, clearing unpicked voices and carrying only picked ones.
+`cast_profiles_test.py` (1) covers target parsing. `cast_analysis_test.py` (1) covers auto-pick in a
+real re-analysis. `chatterbox_ui_test.py` (9) covers measuring on add, Measure voices (including an
+unreachable server and one bad voice), the Voice lab text, forgetting on delete, matched suggestions,
+Suggest voices again, the Voice match line and the auto-pick setting.
