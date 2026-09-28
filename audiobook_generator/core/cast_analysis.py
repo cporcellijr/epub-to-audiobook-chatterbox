@@ -1,5 +1,6 @@
-"""The cast analysis job: parse the book, attribute every dialogue line with the local LLM, save
-the cast. Runs from the queue in its own process (run_cast_analysis), never alongside a book.
+"""The cast analysis job: parse the book, attribute every dialogue line with the local LLM, write
+the main characters' profiles (core.cast_profiles), save the cast. Runs from the queue in its own
+process (run_cast_analysis), never alongside a book.
 """
 import logging
 import sys
@@ -12,6 +13,7 @@ from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import chatterbox_control
 from audiobook_generator.core.cast_llm import ChatClient, Chat, Roster, attribute_chapter, llm_api_key, llm_base_url, \
     llm_model
+from audiobook_generator.core.cast_profiles import ChapterText, profile_cast
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK, chapter_segments
 from audiobook_generator.utils.log_handler import setup_logging
 
@@ -36,7 +38,8 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
     settings: input_file, chapter_selection, the parser options (title_mode, newline_mode,
     remove_endnotes, remove_reference_numbers, search_and_replace_file), engine, voice (the
     narrator), cast_file. The cast file is rewritten after every chapter, so the UI can show
-    progress and a crash keeps what was done; the final write marks it done (or failed).
+    progress and a crash keeps what was done; the final write marks it done (or failed). Character
+    profiles are written after the last chapter; a profile problem never fails the analysis.
     """
     if chat is None:
         chat = ChatClient(llm_base_url(), llm_model(), llm_api_key())
@@ -53,6 +56,7 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
     cast_store.save_cast(path, cast)
     roster = Roster()
     stats = cast["stats"]
+    analysed = []  # the chapters' text and attributions, for the profiles
     started = time.monotonic()
     try:
         for done, number in enumerate(selection, 1):
@@ -61,6 +65,7 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
             line_count = sum(1 for p in paragraphs for s in p if s.kind == "dialogue")
             log.info(f"Cast: chapter {number} ({title}): {line_count} dialogue lines in {len(paragraphs)} paragraphs")
             lines, moods = attribute_chapter(paragraphs, roster, chat, stats, log, label=f" ch{number}")
+            analysed.append(ChapterText(number, paragraphs, lines))
             cast["chapters"][cast_store.text_hash(text)] = {
                 "number": number, "title": title,
                 "lines": {str(line_id): speaker for line_id, speaker in sorted(lines.items())},
@@ -73,6 +78,7 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
             cast_store.save_cast(path, cast)
             log.info(f"Cast: {done}/{len(selection)} chapters analysed, {len(roster.characters)} characters, "
                      f"{stats['unknown_lines']} of {stats['lines']} lines unknown so far")
+        profile_cast(cast, analysed, chat, log, save=lambda: cast_store.save_cast(path, cast))
         cast["status"] = cast_store.STATUS_DONE
     except Exception as e:
         cast["status"], cast["error"] = cast_store.STATUS_FAILED, str(e)

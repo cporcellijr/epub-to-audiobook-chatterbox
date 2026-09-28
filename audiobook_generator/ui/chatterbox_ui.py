@@ -772,7 +772,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
 # ---- Cast (multi-voice) ----
 
 CASTS_DIR = cast_store.CASTS_FOLDER  # inside the app data folder, next to queue.json
-CAST_COLUMNS = ["Character", "Lines", "Gender", "Age", "Voice", "Also called"]
+CAST_COLUMNS = ["Character", "Role", "Lines", "Gender", "Age", "Voice", "Sounds like", "Also called"]
 VOICE_MODE_CHOICES = [("Single voice", VOICE_MODE_SINGLE), ("Narrator + dialogue voice", VOICE_MODE_DIALOGUE)]
 CAST_MODE_CHOICE = ("Cast (LLM picks who speaks)", VOICE_MODE_CAST)
 # Rough placeholder for the queue's time column: the LLM's real speed is unknown until
@@ -865,16 +865,46 @@ def engine_voice_choices(engine: str) -> list:
 
 
 def cast_rows(cast: dict, engine: str) -> Tuple[list, list]:
-    """(table rows, character keys in row order), most lines first."""
+    """(table rows, character keys in row order), most lines first. Role and "Sounds like" come
+    from the character's profile and are blank for characters without one."""
     rows, keys = [], []
     labels = dict((value, label) for label, value in engine_voice_choices(engine))
     for key, character in cast_store.ranked_characters(cast):
         voice = character.get("voice") or ""
-        rows.append([character.get("name", key), int(character.get("lines", 0)), character.get("gender", "unknown"),
-                     character.get("age", "unknown"), labels.get(voice, voice) if voice else "(dialogue voice)",
+        profile = character.get("profile") or {}
+        role = profile.get("role", "")
+        rows.append([character.get("name", key), "" if role == "unknown" else role, int(character.get("lines", 0)),
+                     character.get("gender", "unknown"), character.get("age", "unknown"),
+                     labels.get(voice, voice) if voice else "(dialogue voice)", profile.get("voice", ""),
                      ", ".join(character.get("aliases", []))])
         keys.append(key)
     return rows, keys
+
+
+def character_profile_text(character: dict) -> str:
+    """The clicked character's profile as Markdown: who they are, how they might sound, and the
+    first line they speak."""
+    profile = character.get("profile") or {}
+    facts = [f"**{character.get('name', '')}**"]
+    if profile.get("role") and profile["role"] != "unknown":
+        facts.append(profile["role"])
+    facts.append(f"{character.get('gender', 'unknown')}, {character.get('age', 'unknown')}")
+    lines = int(character.get("lines", 0))
+    facts.append(f"{lines} line{'' if lines == 1 else 's'}")
+    parts = [" · ".join(facts)]
+    if profile.get("description"):
+        parts.append(profile["description"])
+    else:
+        parts.append("*No profile: they are written for the characters with the most lines when the cast is "
+                     "analysed (a cast analysed before profiles existed has none until it is analysed again).*")
+    if profile.get("voice"):
+        parts.append(f"**Sounds like:** {profile['voice']}")
+    if profile.get("relationships"):
+        parts.append(f"**Relationships:** {profile['relationships']}")
+    first = profile.get("first_line")
+    if isinstance(first, dict) and first.get("text"):
+        parts.append(f"**First line** (chapter {first.get('chapter', '?')}): {first['text']}")
+    return "\n\n".join(parts)
 
 
 def _fill_missing_voices(cast: dict, path: str, engine: str, narrator_voice: Optional[str]) -> dict:
@@ -901,7 +931,12 @@ def _cast_summary(cast: dict) -> str:
         parts.append(f"{moods.get('soft', 0)} soft, {moods.get('excited', 0)} excited")
     if stats.get("invalid_after_retry"):
         parts.append(f"{stats['invalid_after_retry']} window(s) the LLM never answered usably")
-    return " · ".join(parts) + ". Click a row to change its gender or voice, then **Add to queue**."
+    if stats.get("profiles"):
+        parts.append(f"{stats['profiles']} character profile{'' if stats['profiles'] == 1 else 's'}")
+    if cast.get("profile_error"):
+        parts.append(f"profiles stopped early ({cast['profile_error']})")
+    return (" · ".join(parts) + ". Click a row to see who they are and change their gender or voice, "
+            "then **Add to queue**.")
 
 
 def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional[str], seen: Optional[list]) -> tuple:
@@ -926,9 +961,12 @@ def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional
         return gr.update(), gr.update(), gr.update(), seen
     if cast.get("status") == cast_store.STATUS_RUNNING:
         done, total = cast_store.analysis_progress(cast)
-        return (gr.update(value=None, visible=False), [],
-                f"⏳ **Analysing cast**: {done} of {total} chapters done, {len(cast['characters'])} characters so far.",
-                stamp)
+        profiled, to_profile = cast_store.profile_progress(cast)
+        if to_profile and done >= total:
+            text = f"⏳ **Writing character profiles**: {profiled} of {to_profile} done."
+        else:
+            text = f"⏳ **Analysing cast**: {done} of {total} chapters done, {len(cast['characters'])} characters so far."
+        return gr.update(value=None, visible=False), [], text, stamp
     if cast.get("status") == cast_store.STATUS_FAILED:
         return (gr.update(value=None, visible=False), [],
                 f"✗ The cast analysis failed: {cast.get('error') or 'see the log'}. Press **Analyse selected chapters** to try again.",
@@ -940,17 +978,19 @@ def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional
 
 
 def select_cast_row(cast_key: Optional[str], keys: list, engine: str, evt: gr.SelectData) -> tuple:
-    """Clicking a row loads that character into the editor (name, gender, voice)."""
+    """Clicking a row loads that character into the editor (name, gender, voice) and shows their
+    profile."""
     row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     if not cast_key or not (0 <= row < len(keys)):
-        return None, "", gr.update(), gr.update()
+        return None, "", gr.update(), gr.update(), ""
     cast = cast_store.load_cast(cast_file_for(cast_key)) or {"characters": {}}
     character = cast["characters"].get(keys[row])
     if not character:
-        return None, "", gr.update(), gr.update()
+        return None, "", gr.update(), gr.update(), ""
     return (keys[row], f"Editing **{character.get('name', keys[row])}**",
             gr.update(value=character.get("gender", "unknown")),
-            gr.update(choices=engine_voice_choices(engine), value=character.get("voice") or None))
+            gr.update(choices=engine_voice_choices(engine), value=character.get("voice") or None),
+            character_profile_text(character))
 
 
 def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gender: str, voice: Optional[str],
@@ -1508,10 +1548,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 with gr.Row(equal_height=True):
                     analyse_button = gr.Button("🎭 Analyse selected chapters", scale=0, min_width=210)
                     cast_status = gr.Markdown("Choose chapters above, then press **Analyse selected chapters**.")
-                cast_table = gr.Dataframe(headers=CAST_COLUMNS, datatype=["str", "number", "str", "str", "str", "str"],
+                cast_table = gr.Dataframe(headers=CAST_COLUMNS,
+                                          datatype=["str", "str", "number", "str", "str", "str", "str", "str"],
                                           interactive=False, wrap=True, visible=False,
-                                          label="Cast: click a character to change its gender or voice",
-                                          column_widths=["22%", "8%", "10%", "10%", "22%", "28%"], max_height=400)
+                                          label="Cast: click a character to see who they are and change their gender or voice",
+                                          column_widths=["15%", "10%", "6%", "8%", "7%", "14%", "24%", "16%"],
+                                          max_height=400)
                 with gr.Row(equal_height=True):
                     cast_editing = gr.Markdown("Click a character in the table.")
                     cast_gender = gr.Dropdown(_GENDER_CHOICES, value="unknown", label="Gender", scale=1)
@@ -1519,6 +1561,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                     with gr.Column(scale=0, min_width=100):
                         cast_sample_button = gr.Button("▶ Sample", size="sm")
                         cast_apply_button = gr.Button("Save voice", size="sm")
+                cast_profile = gr.Markdown("")
                 cast_key_state = gr.State(None)
                 cast_keys_state = gr.State([])
                 cast_selected = gr.State(None)
@@ -1632,7 +1675,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                      search_and_replace_file, log_level],
                              outputs=[*queue_outputs, cast_key_state, cast_status])
         cast_table.select(select_cast_row, inputs=[cast_key_state, cast_keys_state, engine],
-                          outputs=[cast_selected, cast_editing, cast_gender, cast_voice])
+                          outputs=[cast_selected, cast_editing, cast_gender, cast_voice, cast_profile])
         cast_apply_button.click(apply_cast_edit, inputs=[cast_key_state, cast_selected, cast_gender, cast_voice, engine],
                                 outputs=[cast_table, cast_keys_state, cast_status])
         cast_sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \

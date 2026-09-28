@@ -60,7 +60,10 @@ The repo holds the whole stack:
   result is an editable cast table (character, lines, gender, voice, sample button). Voices are
   suggested by gender (Kokoro ids carry it; Chatterbox voices get theirs from a **Voice gender**
   setting in the Voice lab) with the main characters kept distinct from each other and the narrator;
-  lines whose speaker the LLM couldn't tell get the dialogue voice. The cast is saved per book under
+  lines whose speaker the LLM couldn't tell get the dialogue voice. To help pick voices, the same
+  analysis writes a short profile of each of the most-spoken characters from the book's own
+  passages (role, who they are, relationships, and a "sounds like" casting note), shown in the table
+  and under it when you click a character, with the first line they speak. The cast is saved per book under
   `casts/` in the app data folder, and **Add to queue** carries a snapshot of it with the job. Units
   never span a change of voice; the pause between narration and a quote is the sentence pause.
   Validation on a real LLM: `docs/chatterbox-edition/experiments/multivoice/`.

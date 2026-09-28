@@ -1357,9 +1357,10 @@ class TestCastPanel(unittest.TestCase):
         self.assertEqual(keys, ["anne", "bob"])
         rows = table["value"]
         self.assertEqual([r[0] for r in rows], ["Anne", "Bob"])
-        self.assertEqual(rows[0][4], "Ada")     # first female voice; Elena (the narrator) is never suggested
-        self.assertEqual(rows[1][4], "Cal")
-        self.assertEqual(rows[0][5], "Annie")
+        self.assertEqual(rows[0][5], "Ada")     # first female voice; Elena (the narrator) is never suggested
+        self.assertEqual(rows[1][5], "Cal")
+        self.assertEqual(rows[0][7], "Annie")
+        self.assertEqual((rows[0][1], rows[0][6]), ("", ""))  # no profile: blank role and "sounds like"
         saved = self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))
         self.assertEqual((saved["characters"]["anne"]["voice"], saved["characters"]["bob"]["voice"]), ("Ada.wav", "Cal.wav"))
         self.assertIn("9 of 10 lines attributed", status)
@@ -1388,11 +1389,56 @@ class TestCastPanel(unittest.TestCase):
         self.assertNotIn("soft", status)
         self.assertNotIn("excited", status)
 
+    def test_profiles_fill_the_role_and_sounds_like_columns_and_the_summary(self):
+        cast = self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav",
+                     "profile": {"role": "protagonist", "description": "A ferry pilot.", "voice": "calm, low, wry",
+                                 "first_line": {"chapter": 1, "text": '"Hold on."'}}},
+            "bob": {"name": "Bob", "aliases": [], "gender": "male", "age": "adult", "lines": 3, "voice": "Cal.wav",
+                    "profile": {"role": "unknown", "description": "Her deckhand."}},
+        })
+        cast["stats"]["profiles"] = 2
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        table, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        rows = table["value"]
+        self.assertEqual((rows[0][1], rows[0][6]), ("protagonist", "calm, low, wry"))
+        self.assertEqual((rows[1][1], rows[1][6]), ("", ""))
+        self.assertIn("2 character profiles", status)
+        cast["profile_error"] = "LLM down"
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        self.assertIn("profiles stopped early (LLM down)", chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)[2])
+
+    def test_clicking_a_row_shows_the_profile(self):
+        self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav",
+                     "profile": {"role": "protagonist", "description": "A ferry pilot.", "voice": "calm, low, wry",
+                                 "relationships": "Bob's captain", "first_line": {"chapter": 2, "text": '"Hold on."'}}},
+            "bob": {"name": "Bob", "aliases": [], "gender": "male", "age": "adult", "lines": 1, "voice": "Cal.wav"},
+        })
+        evt = MagicMock(index=[0, 0])
+        key, editing, _, _, profile = chatterbox_ui.select_cast_row("k", ["anne", "bob"], "chatterbox", evt)
+        self.assertEqual(key, "anne")
+        self.assertIn("**Anne** · protagonist · female, adult · 9 lines", profile)
+        for text in ("A ferry pilot.", "**Sounds like:** calm, low, wry", "**Relationships:** Bob's captain",
+                     '**First line** (chapter 2): "Hold on."'):
+            self.assertIn(text, profile)
+        _, _, _, _, profile = chatterbox_ui.select_cast_row("k", ["anne", "bob"], "chatterbox", MagicMock(index=[1, 0]))
+        self.assertIn("**Bob** · male, adult · 1 line", profile)
+        self.assertIn("No profile", profile)
+        self.assertEqual(chatterbox_ui.select_cast_row("k", ["anne"], "chatterbox", MagicMock(index=[5, 0]))[4], "")
+
+    def test_running_analysis_shows_profile_progress_once_the_chapters_are_done(self):
+        cast = self._save("k", self.cast_store.STATUS_RUNNING, {})
+        cast.update(chapters_done=1, profiles_total=4, profiles_done=3)
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        _, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertIn("Writing character profiles**: 3 of 4", status)
+
     def test_editing_a_character_saves_and_refreshes(self):
         self._save("k", self.cast_store.STATUS_DONE, {
             "anne": {"name": "Anne", "aliases": [], "gender": "unknown", "age": "adult", "lines": 9, "voice": "Ada.wav"}})
         table, keys, message = chatterbox_ui.apply_cast_edit("k", "anne", "female", "Bea.wav", "chatterbox")
-        self.assertEqual(table["value"][0][2:5], ["female", "adult", "Bea"])
+        self.assertEqual(table["value"][0][3:6], ["female", "adult", "Bea"])
         self.assertIn("Bea.wav", message)
         with self.assertRaises(gr.Error):
             chatterbox_ui.apply_cast_edit("k", "anne", "female", "af_heart", "chatterbox")

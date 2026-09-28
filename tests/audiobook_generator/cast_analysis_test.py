@@ -117,6 +117,30 @@ class TestAnalyseBook(unittest.TestCase):
         cast = analyse_book(self.settings, chat=ScriptedChat({"speakers": {"1": "Mother", "2": "Tom"}}))
         self.assertEqual([ch["number"] for ch in cast["chapters"].values()], [2])
 
+    @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 2)
+    def test_profiles_are_written_after_the_chapters_and_an_llm_error_there_still_finishes(self):
+        attribution = [{"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"},
+                        "characters": [{"name": "Tom", "gender": "unknown", "age": "unknown"}]},
+                       {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}}]
+        profile = {"role": "protagonist", "gender": "female", "age": "adult", "description": "Runs the farm.",
+                   "relationships": "Tom's sister", "voice": "firm young woman"}
+        chat = ScriptedChat(*attribution, profile, dict(profile, gender="male", description="Her brother."))
+        cast = analyse_book(self.settings, chat=chat)
+        self.assertEqual(cast["status"], "done")
+        self.assertEqual(len(chat.prompts), 4)
+        self.assertEqual(cast["characters"]["ada marsh"]["profile"]["voice"], "firm young woman")
+        self.assertEqual(cast["characters"]["tom"]["gender"], "male")
+        self.assertEqual(cast["characters"]["marsh"]["profile"], {"first_line": {"chapter": 2, "text": '"The goats are in the beans,"'}})
+        self.assertEqual(cast_store.load_cast(self.settings["cast_file"])["characters"], cast["characters"])
+
+        class FailingProfiles(ScriptedChat):
+            def __call__(self, messages):
+                if not self.replies:
+                    raise ConnectionError("LLM down")
+                return super().__call__(messages)
+        cast = analyse_book(self.settings, chat=FailingProfiles(*attribution))
+        self.assertEqual((cast["status"], cast["profile_error"], cast["profiles_done"]), ("done", "LLM down", 0))
+
     @patch("audiobook_generator.core.cast_llm.ASK_LLM_FOR_MOODS", True)
     def test_moods_are_saved_per_chapter(self):
         chat = ScriptedChat(

@@ -2,7 +2,9 @@
 
 A cast is one JSON file per book under CASTS_FOLDER (inside the app's data folder, next to
 queue.json), keyed by a hash of the EPUB's bytes so the same book always finds its cast again and
-can be re-analysed. It holds the characters (gender, age, line counts, the chosen voice), the
+can be re-analysed. It holds the characters (gender, age, line counts, the chosen voice, and a
+"profile" from core.cast_profiles: first line, and for main characters role, description,
+relationships and a voice note), the
 narrator voice, and every chapter's per-line attributions keyed by the chapter text's SHA-1 (the
 same hash the chapter manifest uses), so a different chapter selection or renumbering still finds
 them.
@@ -94,10 +96,10 @@ def new_cast(key: str, input_file: str, title: str, author: str, engine: str, na
         "engine": engine, "narrator_voice": narrator_voice,
         "status": STATUS_RUNNING, "error": "", "created": _now(), "finished": None,
         "chapter_selection": list(chapter_selection), "chapters_total": len(chapter_selection),
-        "chapters_done": 0,
+        "chapters_done": 0, "profiles_total": 0, "profiles_done": 0, "profile_error": "",
         "characters": {}, "chapters": {},
         "stats": {"windows": 0, "invalid_json": 0, "invalid_after_retry": 0, "lines": 0, "unknown_lines": 0,
-                  "seconds": 0.0},
+                  "profiles": 0, "profiles_unusable": 0, "seconds": 0.0},
     }
 
 
@@ -314,3 +316,11 @@ def analysis_progress(cast: Optional[dict]) -> Tuple[int, int]:
     if not cast:
         return 0, 0
     return int(cast.get("chapters_done", 0)), int(cast.get("chapters_total", 0))
+
+
+def profile_progress(cast: Optional[dict]) -> Tuple[int, int]:
+    """(character profiles written or skipped, profiles to write); (0, 0) before the profile
+    stage starts and for casts analysed before profiles existed."""
+    if not cast:
+        return 0, 0
+    return int(cast.get("profiles_done", 0)), int(cast.get("profiles_total", 0))
