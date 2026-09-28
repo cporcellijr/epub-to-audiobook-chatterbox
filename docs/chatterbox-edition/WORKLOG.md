@@ -331,3 +331,12 @@ warning; peak VRAM 3.2 GB. Two bugs in the first version of the script itself (t
 by threads started one after another; a dead weakref proxy crashing the tensor count) were fixed
 before this run. The owner's blind A/B listen preferred the compiled takes on 2 of 3.
 
+Deploying it needed one compose change: with `runtime: nvidia` as well as the `deploy.resources` GPU
+reservation, the container got the driver's `libcuda.so.1` only inside a WSL driver folder and no
+`libcuda.so`, so Triton could not link its helper ("cannot find -lcuda") and the server fell back to
+the stock loop, as designed. The reservation alone provides `/usr/lib/x86_64-linux-gnu/libcuda.so`,
+the same as `docker run --gpus all` in the validation runs; `runtime: nvidia` is gone. Live afterwards:
+warm-up 14.9 s; repeated 200-character requests over HTTP 3.5-3.7x real time; a paced 1,159-character
+chapter through the app 18.7 s (the old estimate said 36 s). The app's estimate now assumes the
+compiled loop: 3.87x real time for one long request, and sentence-sized requests take 1.26 times as long.
+

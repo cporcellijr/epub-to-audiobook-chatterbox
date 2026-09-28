@@ -324,7 +324,8 @@ class TestQueueSettings(unittest.TestCase):
     def test_generation_estimate_counts_ticked_chapters_only(self):
         stats = [[20, 1, 1], [36360, 1, 1], [36360, 1, 1]]  # 36,360 chars = 30 min of speech
         seconds = chatterbox_ui.generation_estimate(TABLE, stats)
-        self.assertAlmostEqual(seconds, 2 * 1800 / 1.8 * 1.14, delta=1)
+        self.assertAlmostEqual(seconds, 2 * 1800 / chatterbox_ui.GENERATION_SPEED
+                               * chatterbox_ui.PACED_GENERATION_OVERHEAD, delta=1)
 
 
 class TestOutputDirSafety(unittest.TestCase):

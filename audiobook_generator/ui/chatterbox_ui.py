@@ -713,12 +713,14 @@ def queue_view(queue: JobQueue) -> tuple:
 
 # ---- Chapter list ----
 
-# Measured on a finished book (Elena, speed 1.0): 20.2 characters of text per second of speech,
-# generated at ~1.8x real time; sentence-sized requests add ~14% generation time (A/B, 2026-09-27).
-# Other voices read at somewhat different paces.
+# Measured on a finished book (Elena, speed 1.0): 20.2 characters of text per second of speech.
+# Generation assumes Chatterbox's compiled token loop (F-45, TTS_COMPILE=on): 3.87x real time for one
+# long request, and sentence-sized requests take 26% longer than that, since the fixed per-request cost
+# weighs more once tokens are fast (live, 2026-09-28, a 1,159-character chapter). Without it: 1.8x
+# and 14% (A/B, 2026-09-27). Other voices read at somewhat different paces.
 CHARS_PER_AUDIO_SECOND = 20.2
-GENERATION_SPEED = 1.8
-PACED_GENERATION_OVERHEAD = 1.14
+GENERATION_SPEED = 3.87
+PACED_GENERATION_OVERHEAD = 1.26
 
 # Measured live 2026-09-28 against Kokoro's af_heart voice through the real paced path
 # (paced_units + OpenAITTSProvider, sentence pause 0.35s / paragraph pause 0.9s, speed 1.0): two
