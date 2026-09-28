@@ -109,7 +109,14 @@ def compile_counts() -> tuple:
 
 def cuda_tensor_count() -> int:
     gc.collect()
-    return sum(1 for obj in gc.get_objects() if torch.is_tensor(obj) and obj.is_cuda)
+    count = 0
+    for obj in gc.get_objects():
+        try:  # a weakref proxy whose referent is gone raises on any access
+            if torch.is_tensor(obj) and obj.is_cuda:
+                count += 1
+        except ReferenceError:
+            continue
+    return count
 
 
 def save_wav(path: str, wav: torch.Tensor, sr: int) -> None:
@@ -227,20 +234,27 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         report("no_recompiles", False, error=repr(e))
 
-    # Threads: requests from 8 different threads, one at a time (a pool would reuse one idle
-    # thread, so each request gets its own); no re-recording, no latency spike.
+    # Threads: requests from 8 different threads, one at a time; no re-recording, no latency spike.
+    # All 8 threads are alive at once (a thread started after another has exited can get the same
+    # ident), and a semaphore lets their requests through one by one.
     try:
         worker_before = fast_t3.worker.thread_ident
         frames_before, recompiles_before = compile_counts()
         latencies, idents = [], []
 
-        def one_request() -> None:
-            idents.append(threading.get_ident())
-            latencies.append(timed_request(TEXTS[1])[0])
+        all_started = threading.Barrier(8)
+        one_at_a_time = threading.Semaphore(1)
 
-        for _ in range(8):
-            thread = threading.Thread(target=one_request)
+        def one_request() -> None:
+            all_started.wait()
+            with one_at_a_time:
+                idents.append(threading.get_ident())
+                latencies.append(timed_request(TEXTS[1])[0])
+
+        threads = [threading.Thread(target=one_request) for _ in range(8)]
+        for thread in threads:
             thread.start()
+        for thread in threads:
             thread.join()
         median = statistics.median(latencies)
         frames_after, recompiles_after = compile_counts()
