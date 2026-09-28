@@ -49,3 +49,4 @@ htmlcov/
 
 # Local-only scratch / notes (never committed)
 _local/
+hf_cache/
