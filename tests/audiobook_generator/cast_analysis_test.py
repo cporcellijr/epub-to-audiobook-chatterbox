@@ -87,7 +87,7 @@ class TestAnalyseBook(unittest.TestCase):
         saved = cast_store.load_cast(self.settings["cast_file"])
         self.assertEqual(saved["chapters"], cast["chapters"])
         self.assertEqual(saved["stats"]["lines"], 5)
-        self.assertEqual(len(chat.prompts), 2)
+        self.assertEqual(len(chat.prompts), 3)  # two windows, then the book-tone request (left unanswered)
 
     def test_a_failure_is_recorded_in_the_cast_file_and_raised(self):
         def chat(messages):
@@ -138,7 +138,7 @@ class TestAnalyseBook(unittest.TestCase):
         chat = ScriptedChat(*attribution, profile, dict(profile, gender="male", description="Her brother."))
         cast = analyse_book(self.settings, chat=chat)
         self.assertEqual(cast["status"], "done")
-        self.assertEqual(len(chat.prompts), 4)
+        self.assertEqual(len(chat.prompts), 5)  # two windows, two profiles, the book-tone request
         self.assertEqual(cast["characters"]["ada marsh"]["profile"]["voice"], "firm young woman")
         self.assertEqual(cast["characters"]["tom"]["gender"], "male")
         self.assertEqual(cast["characters"]["marsh"]["profile"], {"first_line": {"chapter": 2, "text": '"The goats are in the beans,"'}})

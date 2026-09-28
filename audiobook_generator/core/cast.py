@@ -266,6 +266,115 @@ def match_cost(character: dict, traits: Optional[dict]) -> float:
     return cost
 
 
+# ---- delivery per character and for the narrator (adaptive delivery, Chatterbox) ----
+
+# An "even" character reads a little flatter and an "expressive" one a little livelier than the
+# book's baseline, before the line's own mood preset (core.delivery) applies: about half of what
+# "excited" adds. Set by reasoning, not tuned by ear.
+CHARACTER_EXAGGERATION_STEP = 0.12
+# The narrator: restrained or dramatic narration moves exaggeration, slow or brisk prose moves CFG
+# (lower is slower and more deliberate), around the owner's saved sliders. Also not tuned by ear.
+NARRATOR_EXAGGERATION_STEP = 0.1
+NARRATOR_CFG_STEP = 0.05
+DELIVERIES = ("auto", "even", "book", "expressive")  # a character's delivery setting in the cast editor
+
+
+def character_delivery(character: dict) -> Optional[str]:
+    """"even", "expressive", or None for the book's own delivery: the owner's setting
+    (character["delivery"]) when it isn't "auto", else the profile's delivery target."""
+    chosen = character.get("delivery") or "auto"
+    if chosen in ("even", "expressive"):
+        return chosen
+    if chosen == "book":
+        return None
+    return ((character.get("profile") or {}).get("voice_targets") or {}).get("delivery")
+
+
+def exaggeration_offset(character: dict) -> float:
+    """One character's offset on its own (-step even, 0 as the book, +step expressive), uncentred."""
+    return {"even": -CHARACTER_EXAGGERATION_STEP, "expressive": CHARACTER_EXAGGERATION_STEP}.get(
+        character_delivery(character) or "", 0.0)
+
+
+def exaggeration_offsets(cast: dict) -> Dict[str, float]:
+    """{character key: exaggeration offset}. A delivery the owner set is applied as it is (+/-
+    CHARACTER_EXAGGERATION_STEP, or 0 for "as the book"). One from the profile is centred on the
+    cast's line-weighted average and capped at the step: measured 2026-09-28, the model called 5 of
+    6 characters of a dramatic book "expressive", and uncentred that made nearly all its dialogue
+    louder instead of making characters differ. The book's tone sets the level (the narrator's
+    sliders); characters differ around it. A character with no delivery at all (no profile) stays
+    as the book and doesn't count in the average."""
+    characters = cast.get("characters", {})
+    owner_set = {key for key, c in characters.items() if (c.get("delivery") or "auto") != "auto"}
+    scores = {key: exaggeration_offset(c) / CHARACTER_EXAGGERATION_STEP for key, c in characters.items()}
+    centred = [key for key in characters if key not in owner_set and character_delivery(characters[key])]
+    weights = {key: max(1, int(characters[key].get("lines", 0))) for key in centred}
+    total = sum(weights.values())
+    mean = sum(scores[k] * weights[k] for k in centred) / total if total else 0.0
+    offsets = {}
+    for key in characters:
+        if key in owner_set:
+            offsets[key] = round(scores[key] * CHARACTER_EXAGGERATION_STEP, 2)
+        elif key in weights:
+            step = CHARACTER_EXAGGERATION_STEP * (scores[key] - mean)
+            offsets[key] = round(max(-CHARACTER_EXAGGERATION_STEP, min(CHARACTER_EXAGGERATION_STEP, step)), 2)
+        else:
+            offsets[key] = 0.0
+    return offsets
+
+
+def voice_exaggeration_offsets(cast: dict, narrator_voice: Optional[str]) -> Dict[str, float]:
+    """{voice: exaggeration offset} for the voices the cast gives its characters (exaggeration_offsets).
+    Units carry a voice, not a character, so this is looked up by voice: the narrator's voice never
+    has an offset, and neither does a voice shared by characters whose offsets differ."""
+    by_character = exaggeration_offsets(cast)
+    offsets: Dict[str, float] = {}
+    mixed = set()
+    for key, character in cast.get("characters", {}).items():
+        voice = character.get("voice")
+        if not voice or voice == narrator_voice:
+            continue
+        offset = by_character[key]
+        if voice in offsets and offsets[voice] != offset:
+            mixed.add(voice)
+        offsets.setdefault(voice, offset)
+    return {voice: offset for voice, offset in offsets.items() if offset and voice not in mixed}
+
+
+def narrator_delivery(book_tone: Optional[dict], base: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """(exaggeration, cfg_weight, temperature) for the narrator: the base sliders nudged by the
+    book's intensity and pace; unchanged when the book tone says nothing about them."""
+    tone = book_tone or {}
+    exaggeration, cfg_weight, temperature = base
+    exaggeration += {"restrained": -NARRATOR_EXAGGERATION_STEP, "dramatic": NARRATOR_EXAGGERATION_STEP}.get(
+        tone.get("intensity") or "", 0.0)
+    cfg_weight += {"slow": -NARRATOR_CFG_STEP, "brisk": NARRATOR_CFG_STEP}.get(tone.get("pace") or "", 0.0)
+    return (round(min(2.0, max(0.25, exaggeration)), 2), round(min(1.0, max(0.1, cfg_weight)), 2),
+            round(temperature, 2))
+
+
+def suggest_narrator(cast: dict, voices: List[Tuple[str, str]], traits: Dict[str, dict],
+                     exclude: Tuple[str, ...] = ()) -> Optional[str]:
+    """The measured voice that best fits the narrator the book's tone asks for (cast["book_tone"]),
+    or None when there is no tone, nothing measured, or nothing asked for (the owner's voice then
+    stays). A first-person book's narrator takes the viewpoint character's known gender."""
+    tone = cast.get("book_tone") or {}
+    wants = tone.get("narrator") or {}
+    targets = {key: wants.get(key) for key in ("pitch", "quality", "delivery")}
+    if not traits or not any(targets.values()):
+        return None
+    gender = wants.get("gender")
+    pov = cast.get("characters", {}).get(tone.get("pov_key") or "")
+    if pov and pov.get("gender") in ("female", "male"):
+        gender = pov["gender"]
+    candidates = [voice for voice, voice_gender in voices if voice not in exclude and voice in traits
+                  and (gender not in ("female", "male") or voice_gender in (gender, "neutral"))]
+    if not candidates:
+        return None
+    narrator = {"profile": {"voice_targets": targets}}
+    return min(candidates, key=lambda voice: (match_cost(narrator, traits[voice]), candidates.index(voice)))
+
+
 def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Optional[str],
                    traits: Optional[Dict[str, dict]] = None) -> Dict[str, str]:
     """Pick a voice for every character that has none yet: {character key: voice}.

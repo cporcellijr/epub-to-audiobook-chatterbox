@@ -873,6 +873,8 @@ CAST_MODE_CHOICE = ("Cast (LLM picks who speaks)", VOICE_MODE_CAST)
 # experiments/multivoice/validate_multivoice.py reports time per 1,000 lines on the owner's machine.
 ANALYSIS_SECONDS_PER_LINE = 0.5
 _GENDER_CHOICES = [("female", "female"), ("male", "male"), ("unknown", "unknown")]
+DELIVERY_CHOICES = [("from the profile", "auto"), ("a little more even", "even"), ("as the book", "book"),
+                    ("a little more expressive", "expressive")]
 VOICE_GENDER_CHOICES = [("not set", ""), ("female", "female"), ("male", "male"), ("neutral (fits anyone)", "neutral")]
 
 
@@ -989,7 +991,20 @@ def voice_match_text(character: dict, voice_label: str = "", voice_words: str = 
     return "**Voice match:** " + " · ".join(parts)
 
 
-def character_profile_text(character: dict, voice_match: str = "") -> str:
+def character_delivery_text(character: dict, offset: Optional[float] = None) -> str:
+    """How the character's lines are delivered against the book's sliders (adaptive delivery);
+    offset is the character's within its cast (core.cast.exaggeration_offsets)."""
+    offset = cast_store.exaggeration_offset(character) if offset is None else offset
+    if offset > 0:
+        how = f"a little more expressive than the book (exaggeration {offset:+.2f})"
+    elif offset < 0:
+        how = f"a little more even than the book (exaggeration {offset:+.2f})"
+    else:
+        how = "as the book"
+    return f"**Delivery:** {how}" + (" (your setting)" if character.get("delivery") not in (None, "auto") else "")
+
+
+def character_profile_text(character: dict, voice_match: str = "", delivery_offset: Optional[float] = None) -> str:
     """The clicked character's profile as Markdown: who they are, how they might sound, how their
     voice matches, and the first line they speak."""
     profile = character.get("profile") or {}
@@ -1009,6 +1024,7 @@ def character_profile_text(character: dict, voice_match: str = "") -> str:
         parts.append(f"**Sounds like:** {profile['voice']}")
     if voice_match:
         parts.append(voice_match)
+    parts.append(character_delivery_text(character, delivery_offset))
     if profile.get("relationships"):
         parts.append(f"**Relationships:** {profile['relationships']}")
     first = profile.get("first_line")
@@ -1039,25 +1055,60 @@ def _fill_missing_voices(cast: dict, path: str, engine: str, narrator_voice: Opt
     return cast
 
 
+def _fill_narrator_suggestion(cast: dict, path: str, engine: str) -> Optional[dict]:
+    """The narrator the book's tone asks for (cast["narrator_suggestion"]: voice and delivery
+    sliders), worked out once and saved; None when there is no book tone, the engine's voices aren't
+    measured (Kokoro), or nothing fits. Voices the owner picked for characters are never offered."""
+    if cast.get("narrator_suggestion"):
+        return cast["narrator_suggestion"]
+    if engine == "kokoro" or not cast.get("book_tone"):
+        return None
+    voices = engine_voices_with_gender(engine)
+    picked = tuple(c["voice"] for c in cast["characters"].values() if c.get("voice_picked") and c.get("voice"))
+    voice = cast_store.suggest_narrator(cast, voices, engine_voice_traits(engine, voices), picked)
+    if not voice:
+        return None
+    saved = read_saved_settings()
+    exaggeration, cfg_weight, temperature = cast_store.narrator_delivery(
+        cast["book_tone"], (saved["exaggeration"], saved["cfg_weight"], saved["temperature"]))
+    cast["narrator_suggestion"] = {"voice": voice, "exaggeration": exaggeration, "cfg_weight": cfg_weight,
+                                   "temperature": temperature}
+    cast_store.save_cast(path, cast)
+    return cast["narrator_suggestion"]
+
+
+def _narrator_updates(suggestion: Optional[dict]) -> tuple:
+    """Updates for the Make tab's Voice and the Voice lab's three sliders (all four unchanged
+    without a suggestion): Add to queue takes the narrator and the book's delivery from them."""
+    if not suggestion:
+        return gr.update(), gr.update(), gr.update(), gr.update()
+    return (gr.update(value=suggestion["voice"]), gr.update(value=suggestion["exaggeration"]),
+            gr.update(value=suggestion["cfg_weight"]), gr.update(value=suggestion["temperature"]))
+
+
 def resuggest_cast_voices(cast_key: Optional[str], engine: str, narrator_voice: Optional[str],
                           confirmed: Optional[bool] = True) -> tuple:
-    """Suggest again every voice the owner didn't pick with Save voice (the browser confirms
-    first; a falsy `confirmed` means cancelled). Returns the refreshed table, keys and a status
-    line."""
+    """Suggest again the narrator and every voice the owner didn't pick with Save (the browser
+    confirms first; a falsy `confirmed` means cancelled). Returns the refreshed table, keys, a status
+    line, and the narrator's Voice and slider updates."""
     if not confirmed:
-        return gr.update(), gr.update(), gr.update()
+        return (gr.update(),) * 7
     path, cast = _finished_cast(cast_key)
+    cast.pop("narrator_suggestion", None)
+    suggestion = _fill_narrator_suggestion(cast, path, engine)
     cleared = cast_store.clear_suggested_voices(cast)
-    cast = _fill_missing_voices(cast, path, engine, narrator_voice)
+    cast = _fill_missing_voices(cast, path, engine, suggestion["voice"] if suggestion else narrator_voice)
     cast_store.save_cast(path, cast)
     kept = sum(1 for c in cast["characters"].values() if c.get("voice_picked"))
     rows, keys = cast_rows(cast, engine)
     message = f"Suggested voices again for {cleared} character{'' if cleared == 1 else 's'}"
     message += f"; kept the {kept} you picked." if kept else "."
+    if suggestion:
+        message += f" Narrator: {os.path.splitext(suggestion['voice'])[0]}."
     if not engine_voice_traits(engine):
         message += (" No voices are measured yet, so this matched by gender only: press **Measure voices** "
                     "in the Voice lab to match by sound.")
-    return gr.update(value=rows, visible=True), keys, message
+    return (gr.update(value=rows, visible=True), keys, message, *_narrator_updates(suggestion))
 
 
 def _cast_summary(cast: dict) -> str:
@@ -1076,16 +1127,34 @@ def _cast_summary(cast: dict) -> str:
         parts.append(f"{stats['profiles']} character profile{'' if stats['profiles'] == 1 else 's'}")
     if cast.get("profile_error"):
         parts.append(f"profiles stopped early ({cast['profile_error']})")
-    return (" · ".join(parts) + ". Click a row to see who they are and change their gender or voice, "
-            "then **Add to queue**.")
+    text = " · ".join(parts) + ". Click a character to see who they are, then **Add this book to queue**."
+    return text + "\n\n" + book_tone_text(cast) if cast.get("book_tone") else text
 
 
-def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional[str], seen: Optional[list]) -> tuple:
+def book_tone_text(cast: dict) -> str:
+    """The book's narration and the narrator picked for it, in one line."""
+    tone = cast.get("book_tone") or {}
+    facts = [w for w in (f"{tone['point_of_view']} person" if tone.get("point_of_view") else "",
+                         f"narrated by {tone['pov_character']}" if tone.get("pov_character") else "",
+                         tone.get("tone") or "", f"{tone['pace']} pace" if tone.get("pace") else "",
+                         f"{tone['intensity']} narration" if tone.get("intensity") else "") if w]
+    text = "**Book:** " + " · ".join(facts)
+    suggestion = cast.get("narrator_suggestion")
+    if suggestion:
+        text += (f"  \n**Narrator:** {os.path.splitext(suggestion['voice'])[0]}, exaggeration "
+                 f"{suggestion['exaggeration']:.2f} · CFG {suggestion['cfg_weight']:.2f} · temperature "
+                 f"{suggestion['temperature']:.2f}, picked from the book's tone")
+    return text
+
+
+def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional[str], seen: Optional[list],
+                  auto_pick: bool = False) -> tuple:
     """(table update, character keys, status text, seen) for the picked book's cast.
 
-    `seen` is [path, mtime, status] of what the table currently shows; when the cast file hasn't
-    changed since, the table is left alone (gr.update()) so a 3-second refresh never disturbs a
-    row the owner has selected.
+    `seen` is [path, mtime, status, engine, narrator] of what the table currently shows; when the
+    cast file hasn't changed since, the table is left alone (gr.update()) so a 3-second refresh
+    never disturbs a row the owner has selected. With auto_pick, the narrator the book's tone asks
+    for is worked out first, and characters' voices are suggested around it.
     """
     if not cast_key:
         return gr.update(value=None, visible=False), [], "Pick a book, tick its chapters, then press **Analyse selected chapters**.", None
@@ -1112,10 +1181,25 @@ def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional
         return (gr.update(value=None, visible=False), [],
                 f"✗ The cast analysis failed: {cast.get('error') or 'see the log'}. Press **Analyse selected chapters** to try again.",
                 stamp)
-    cast = _fill_missing_voices(cast, path, engine, narrator_voice)
+    suggestion = _fill_narrator_suggestion(cast, path, engine) if auto_pick else None
+    cast = _fill_missing_voices(cast, path, engine, suggestion["voice"] if suggestion else narrator_voice)
     rows, keys = cast_rows(cast, engine)
-    stamp[1] = os.path.getmtime(path)  # _fill_missing_voices may just have saved
+    stamp[1] = os.path.getmtime(path)  # the fills may just have saved
     return gr.update(value=rows, visible=True), keys, _cast_summary(cast), stamp
+
+
+def cast_panel_update(cast_key: Optional[str], engine: str, narrator_voice: Optional[str], seen: Optional[list],
+                      auto_pick: bool) -> tuple:
+    """cast_overview, plus the narrator: the first time a finished cast is shown (this book, this
+    page) with Auto-pick on, the Make tab's Voice and the Voice lab sliders are set to the narrator
+    the book's tone asks for; Add to queue takes both from there. Later refreshes leave them alone,
+    so a change the owner makes afterwards wins."""
+    table, keys, status, stamp = cast_overview(cast_key, engine, narrator_voice, seen, auto_pick)
+    first_sight = not seen or not stamp or seen[0] != stamp[0] or seen[2] != cast_store.STATUS_DONE
+    if not (auto_pick and first_sight and stamp and stamp[2] == cast_store.STATUS_DONE):
+        return (table, keys, status, stamp, *_narrator_updates(None))
+    cast = cast_store.load_cast(stamp[0]) or {}
+    return (table, keys, status, stamp, *_narrator_updates(cast.get("narrator_suggestion")))
 
 
 def select_cast_row(cast_key: Optional[str], keys: list, engine: str, evt: gr.SelectData) -> tuple:
@@ -1123,11 +1207,11 @@ def select_cast_row(cast_key: Optional[str], keys: list, engine: str, evt: gr.Se
     profile."""
     row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     if not cast_key or not (0 <= row < len(keys)):
-        return None, "", gr.update(), gr.update(), ""
+        return None, "", gr.update(), gr.update(), "", gr.update()
     cast = cast_store.load_cast(cast_file_for(cast_key)) or {"characters": {}}
     character = cast["characters"].get(keys[row])
     if not character:
-        return None, "", gr.update(), gr.update(), ""
+        return None, "", gr.update(), gr.update(), "", gr.update()
     choices = engine_voice_choices(engine)
     voice = character.get("voice") or ""
     voices = engine_voices_with_gender(engine)
@@ -1137,12 +1221,39 @@ def select_cast_row(cast_key: Optional[str], keys: list, engine: str, evt: gr.Se
     return (keys[row], f"Editing **{character.get('name', keys[row])}**",
             gr.update(value=character.get("gender", "unknown")),
             gr.update(choices=choices, value=voice or None),
-            character_profile_text(character, voice_match_text(character, label, words)))
+            character_profile_text(character, voice_match_text(character, label, words),
+                                   cast_store.exaggeration_offsets(cast).get(keys[row])),
+            gr.update(value=character.get("delivery") or "auto"))
+
+
+def sample_character(cast_key: Optional[str], character_key: Optional[str], engine: str, voice: Optional[str],
+                     delivery_choice: str, speed: float, exaggeration: float, cfg_weight: float,
+                     temperature: float) -> str:
+    """Cast editor: the selected character's first line in the editor's voice, with the editor's
+    delivery around the book's current sliders (as a book would read it); any other text when the
+    character has no first line. Kokoro plays its usual sample."""
+    if not voice:
+        raise gr.Error("Pick a voice first.")
+    if engine == "kokoro":
+        return _kokoro_sample(voice, speed)
+    cast = (cast_store.load_cast(cast_file_for(cast_key)) if cast_key else None) or {"characters": {}}
+    character = dict(cast["characters"].get(character_key or "") or {})
+    character["delivery"] = delivery_choice or "auto"
+    first = (character.get("profile") or {}).get("first_line") or {}
+    text = first.get("text") or PREVIEW_PHRASE
+    if character_key in cast["characters"]:  # the editor's delivery, within this cast
+        cast["characters"][character_key] = character
+        offset = cast_store.exaggeration_offsets(cast)[character_key]
+    else:
+        offset = cast_store.exaggeration_offset(character)
+    return preview_voice(voice, text, round(min(2.0, max(0.25, float(exaggeration) + offset)), 2), cfg_weight,
+                         temperature, speed)
 
 
 def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gender: str, voice: Optional[str],
-                    engine: str) -> tuple:
-    """Save the editor's gender and voice for the selected character; returns the refreshed table."""
+                    engine: str, delivery_choice: str = "auto") -> tuple:
+    """Save the editor's gender, voice and delivery for the selected character; returns the
+    refreshed table."""
     if not cast_key or not character_key:
         raise gr.Error("Click a character in the cast table first.")
     path = cast_file_for(cast_key)
@@ -1159,6 +1270,7 @@ def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gende
     character["gender"] = gender if gender in cast_store.GENDERS else "unknown"
     character["voice"] = voice
     character["voice_picked"] = True  # Suggest voices again keeps it
+    character["delivery"] = delivery_choice if delivery_choice in cast_store.DELIVERIES else "auto"
     cast_store.save_cast(path, cast)
     rows, keys = cast_rows(cast, engine)
     return gr.update(value=rows, visible=True), keys, f"Saved **{character.get('name', character_key)}**: {gender}, {voice}."
@@ -1559,10 +1671,10 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         return (*refresh_queue(), job_settings["cast_key"],
                 "⏳ Cast analysis queued. This panel updates as it runs.")
 
-    def refresh_cast(voice_mode, cast_key, engine, voice, seen) -> tuple:
+    def refresh_cast(voice_mode, cast_key, engine, voice, seen, auto_pick) -> tuple:
         if voice_mode != VOICE_MODE_CAST:
-            return gr.update(), gr.update(), gr.update(), seen
-        return cast_overview(cast_key, engine, voice, seen)
+            return gr.update(), gr.update(), gr.update(), seen, *_narrator_updates(None)
+        return cast_panel_update(cast_key, engine, voice, seen, auto_pick)
 
     def delete_voice(name: Optional[str], current_lab_voice: str, current_voice: str, engine: str) -> tuple:
         """Delete an own voice after the browser confirms (see the button's js=); None means the
@@ -1696,30 +1808,35 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 search_and_replace_file = gr.File(label="Search & replace file (optional, e.g. fix pronunciations)",
                                                   file_types=[".txt"], file_count="single")
             with gr.Column(visible=False) as cast_panel:
-                gr.Markdown("**Cast workflow:** Choose chapters above → analyse cast → choose voices → "
-                            "add this book to queue. Repeat for another book, then start the queued books.")
+                gr.Markdown("**Cast workflow:** Choose chapters above → analyse cast → add this book to queue. "
+                            "The narrator, every character's voice and their delivery are picked for you. Repeat "
+                            "for another book, then start the queued books.")
                 with gr.Row(equal_height=True):
                     analyse_button = gr.Button("🎭 Analyse selected chapters", scale=0, min_width=210)
-                    auto_pick_voices = gr.Checkbox(True, label="Auto-pick suggested voices", scale=0, min_width=210,
-                                                   info="Re-analysing keeps only voices you saved; the rest "
-                                                        "are matched to the new profiles.")
-                    resuggest_button = gr.Button("🎯 Suggest voices again", scale=0, min_width=190)
                     cast_status = gr.Markdown("Choose chapters above, then press **Analyse selected chapters**.")
-                resuggest_confirmed = gr.Checkbox(False, visible=False)
                 cast_table = gr.Dataframe(headers=CAST_COLUMNS,
                                           datatype=["str", "str", "number", "str", "str", "str", "str", "str"],
                                           interactive=False, wrap=True, visible=False,
-                                          label="Cast: click a character to see who they are and change their gender or voice",
+                                          label="Cast: click a character to see who they are",
                                           column_widths=["15%", "10%", "6%", "8%", "7%", "14%", "24%", "16%"],
                                           max_height=400)
-                with gr.Row(equal_height=True):
-                    cast_editing = gr.Markdown("Click a character in the table.")
-                    cast_gender = gr.Dropdown(_GENDER_CHOICES, value="unknown", label="Gender", scale=1)
-                    cast_voice = gr.Dropdown(choices, value=None, label="Voice", allow_custom_value=True, scale=2)
-                    with gr.Column(scale=0, min_width=100):
-                        cast_sample_button = gr.Button("▶ Sample", size="sm")
-                        cast_apply_button = gr.Button("Save voice", size="sm")
                 cast_profile = gr.Markdown("")
+                with gr.Accordion("Adjust the cast (advanced)", open=False):
+                    with gr.Row(equal_height=True):
+                        auto_pick_voices = gr.Checkbox(
+                            True, label="Auto-pick suggested voices", scale=0, min_width=230,
+                            info="Picks the narrator and delivery from the book's tone when a cast is shown, and "
+                                 "re-analysing keeps only voices you saved here.")
+                        resuggest_button = gr.Button("🎯 Suggest voices again", scale=0, min_width=190)
+                    resuggest_confirmed = gr.Checkbox(False, visible=False)
+                    with gr.Row(equal_height=True):
+                        cast_editing = gr.Markdown("Click a character in the table.")
+                        cast_gender = gr.Dropdown(_GENDER_CHOICES, value="unknown", label="Gender", scale=1)
+                        cast_voice = gr.Dropdown(choices, value=None, label="Voice", allow_custom_value=True, scale=2)
+                        cast_delivery = gr.Dropdown(DELIVERY_CHOICES, value="auto", label="Delivery", scale=1)
+                        with gr.Column(scale=0, min_width=100):
+                            cast_sample_button = gr.Button("▶ Sample", size="sm")
+                            cast_apply_button = gr.Button("Save", size="sm")
                 cast_key_state = gr.State(None)
                 cast_keys_state = gr.State([])
                 cast_selected = gr.State(None)
@@ -1827,10 +1944,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         queue_outputs = [queue_table, queue_ids, queue_status, start_books_button]
 
         # Cast mode: the cast key follows the picked book; the panel follows the cast file.
-        cast_view_inputs = [cast_key_state, engine, voice, cast_seen]
-        cast_view_outputs = [cast_table, cast_keys_state, cast_status, cast_seen]
+        # Auto-pick sets the narrator: the Make tab's Voice and the Voice lab sliders (Add to queue reads both).
+        narrator_outputs = [voice, exaggeration, cfg_weight, temperature]
+        cast_view_inputs = [cast_key_state, engine, voice, cast_seen, auto_pick_voices]
+        cast_view_outputs = [cast_table, cast_keys_state, cast_status, cast_seen, *narrator_outputs]
         library_book.change(book_cast_key, inputs=[library_book, input_file], outputs=cast_key_state)
-        cast_key_state.change(cast_overview, inputs=cast_view_inputs, outputs=cast_view_outputs)
+        cast_key_state.change(cast_panel_update, inputs=cast_view_inputs, outputs=cast_view_outputs)
         voice_mode.change(voice_mode_changed, inputs=voice_mode, outputs=[dialogue_voice, cast_panel]) \
             .then(refresh_cast, inputs=[voice_mode, *cast_view_inputs], outputs=cast_view_outputs)
         queue_timer.tick(refresh_cast, inputs=[voice_mode, *cast_view_inputs], outputs=cast_view_outputs)
@@ -1846,13 +1965,15 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             js="() => confirm('Suggest voices again? Voices you saved with Save voice are kept; every other "
                "character gets a fresh suggestion.')",
         ).then(resuggest_cast_voices, inputs=[cast_key_state, engine, voice, resuggest_confirmed],
-               outputs=[cast_table, cast_keys_state, cast_status])
+               outputs=[cast_table, cast_keys_state, cast_status, *narrator_outputs])
         cast_table.select(select_cast_row, inputs=[cast_key_state, cast_keys_state, engine],
-                          outputs=[cast_selected, cast_editing, cast_gender, cast_voice, cast_profile])
-        cast_apply_button.click(apply_cast_edit, inputs=[cast_key_state, cast_selected, cast_gender, cast_voice, engine],
+                          outputs=[cast_selected, cast_editing, cast_gender, cast_voice, cast_profile, cast_delivery])
+        cast_apply_button.click(apply_cast_edit,
+                                inputs=[cast_key_state, cast_selected, cast_gender, cast_voice, engine, cast_delivery],
                                 outputs=[cast_table, cast_keys_state, cast_status])
         cast_sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
-            .then(sample_voice, inputs=[engine, cast_voice, speed], outputs=sample_audio)
+            .then(sample_character, inputs=[cast_key_state, cast_selected, engine, cast_voice, cast_delivery, speed,
+                                            exaggeration, cfg_weight, temperature], outputs=sample_audio)
         selection_outputs = [*queue_outputs, selected_job, selected_info]
         enqueue_button.click(enqueue, inputs=[library_book, input_file, chapter_table, chapter_stats_state, *settings],
                              outputs=queue_outputs)

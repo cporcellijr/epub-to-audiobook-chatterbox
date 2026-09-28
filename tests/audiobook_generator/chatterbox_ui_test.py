@@ -1499,13 +1499,13 @@ class TestCastPanel(unittest.TestCase):
             "bob": {"name": "Bob", "aliases": [], "gender": "male", "age": "adult", "lines": 1, "voice": "Cal.wav"},
         })
         evt = MagicMock(index=[0, 0])
-        key, editing, _, _, profile = chatterbox_ui.select_cast_row("k", ["anne", "bob"], "chatterbox", evt)
+        key, editing, _, _, profile, _ = chatterbox_ui.select_cast_row("k", ["anne", "bob"], "chatterbox", evt)
         self.assertEqual(key, "anne")
         self.assertIn("**Anne** · protagonist · female, adult · 9 lines", profile)
         for text in ("A ferry pilot.", "**Sounds like:** calm, low, wry", "**Relationships:** Bob's captain",
                      '**First line** (chapter 2): "Hold on."'):
             self.assertIn(text, profile)
-        _, _, _, _, profile = chatterbox_ui.select_cast_row("k", ["anne", "bob"], "chatterbox", MagicMock(index=[1, 0]))
+        _, _, _, _, profile, _ = chatterbox_ui.select_cast_row("k", ["anne", "bob"], "chatterbox", MagicMock(index=[1, 0]))
         self.assertIn("**Bob** · male, adult · 1 line", profile)
         self.assertIn("No profile", profile)
         self.assertEqual(chatterbox_ui.select_cast_row("k", ["anne"], "chatterbox", MagicMock(index=[5, 0]))[4], "")
@@ -1538,11 +1538,12 @@ class TestCastPanel(unittest.TestCase):
         })
         chatterbox_ui.apply_cast_edit("k", "bob", "male", "Cal.wav", "chatterbox")  # the owner's own pick
         self.assertEqual(chatterbox_ui.resuggest_cast_voices("k", "chatterbox", "Elena.wav", False),
-                         (gr.update(), gr.update(), gr.update()))  # cancelled in the browser
-        _, _, message = chatterbox_ui.resuggest_cast_voices("k", "chatterbox", "Elena.wav")
+                         (gr.update(),) * 7)  # cancelled in the browser
+        _, _, message, *_ = chatterbox_ui.resuggest_cast_voices("k", "chatterbox", "Elena.wav")
         self.assertIn("No voices are measured yet", message)
         self._measure({"Ada.wav": 160.0, "Bea.wav": 240.0})
-        table, keys, message = chatterbox_ui.resuggest_cast_voices("k", "chatterbox", "Elena.wav", True)
+        table, keys, message, *narrator = chatterbox_ui.resuggest_cast_voices("k", "chatterbox", "Elena.wav", True)
+        self.assertEqual(narrator, [gr.update()] * 4)  # no book tone: the narrator stays as it is
         self.assertEqual(message, "Suggested voices again for 1 character; kept the 1 you picked.")
         saved = self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))["characters"]
         self.assertEqual((saved["anne"]["voice"], saved["bob"]["voice"], saved["bob"]["voice_picked"]),
@@ -1557,6 +1558,47 @@ class TestCastPanel(unittest.TestCase):
         })
         profile = chatterbox_ui.select_cast_row("k", ["anne"], "chatterbox", MagicMock(index=[0, 0]))[4]
         self.assertIn("**Voice match:** wants high pitch, expressive · Bea is high for a woman", profile)
+
+    def _toned_cast(self):
+        self.cast_store.save_voice_gender("Elena.wav", "female")
+        self._measure({"Ada.wav": 160.0, "Bea.wav": 240.0, "Elena.wav": 200.0, "Cal.wav": 120.0})
+        cast = self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": None,
+                     "profile": {"voice_targets": {"pitch": "low"}, "first_line": {"chapter": 1, "text": '"Hold on."'}}},
+        })
+        cast["book_tone"] = {"point_of_view": "third", "pov_character": "", "tone": "wry and warm", "pace": "brisk",
+                             "intensity": "dramatic",
+                             "narrator": {"gender": "female", "pitch": "high", "quality": None, "delivery": None}}
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+
+    def test_auto_pick_sets_the_narrator_from_the_books_tone_once(self):
+        self._toned_cast()
+        with patch.object(chatterbox_ui, "read_saved_settings",
+                          return_value={"exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61}):
+            table, keys, status, seen, voice, exaggeration, cfg, temperature = chatterbox_ui.cast_panel_update(
+                "k", "chatterbox", "Elena.wav", None, True)
+        self.assertEqual((voice["value"], exaggeration["value"], cfg["value"], temperature["value"]),
+                         ("Bea.wav", 0.83, 0.55, 0.61))
+        self.assertEqual(table["value"][0][5], "Ada")  # Anne wants low; Bea is the narrator's now
+        self.assertIn("**Narrator:** Bea, exaggeration 0.83 · CFG 0.55 · temperature 0.61", status)
+        self.assertIn("**Book:** third person · wry and warm · brisk pace · dramatic narration", status)
+        # The next refresh (the owner may have changed the Voice since) leaves the narrator alone.
+        again = chatterbox_ui.cast_panel_update("k", "chatterbox", "Cal.wav", seen, True)
+        self.assertEqual(list(again[4:]), [gr.update()] * 4)
+        # Auto-pick off: never touched.
+        off = chatterbox_ui.cast_panel_update("k", "chatterbox", "Elena.wav", None, False)
+        self.assertEqual(list(off[4:]), [gr.update()] * 4)
+
+    def test_sample_speaks_the_characters_first_line_with_their_delivery(self):
+        self._toned_cast()
+        with patch.object(chatterbox_ui, "preview_voice", return_value="/tmp/x.mp3") as preview:
+            chatterbox_ui.sample_character("k", "anne", "chatterbox", "Ada.wav", "expressive", 1.0, 0.73, 0.5, 0.61)
+        self.assertEqual(preview.call_args.args[:3], ("Ada.wav", '"Hold on."', 0.85))
+        chatterbox_ui.apply_cast_edit("k", "anne", "female", "Ada.wav", "chatterbox", "even")
+        saved = self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))["characters"]["anne"]
+        self.assertEqual(saved["delivery"], "even")
+        self.assertIn("a little more even than the book (exaggeration -0.12) (your setting)",
+                      chatterbox_ui.character_profile_text(saved))
 
     def test_analysis_can_keep_every_earlier_voice_or_only_the_owners_picks(self):
         book = os.path.join(self.tmp.name, "mine.epub")

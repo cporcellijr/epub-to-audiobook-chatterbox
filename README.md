@@ -66,20 +66,24 @@ The repo holds the whole stack:
   by how each voice measures against the profile: **Measure voices** in the Voice lab has each voice
   speak one sentence and measures its pitch, huskiness and liveliness (a voice you add is measured
   straight away). The main characters stay distinct from each other and the narrator; lines whose
-  speaker the LLM couldn't tell get the dialogue voice. **Auto-pick suggested voices** (next to
-  Analyse) makes a re-analysis keep only the voices you saved yourself; **Suggest voices again**
-  re-matches an existing cast. The cast is saved per book under
+  speaker the LLM couldn't tell get the dialogue voice. The analysis also reads the book's tone
+  (point of view, mood, pace, intensity): when the cast is shown, the narrator voice and the book's
+  delivery sliders are set from it, and with adaptive delivery each character's lines are read a
+  little more even or more expressive than the book, as their profile suggests. All of this is
+  automatic; **Adjust the cast (advanced)** holds the manual controls (a character's gender, voice
+  and delivery with a Sample of their own first line, **Suggest voices again**, and the
+  **Auto-pick suggested voices** switch). The cast is saved per book under
   `casts/` in the app data folder, and **Add to queue** carries a snapshot of it with the job. Units
   never span a change of voice; the pause between narration and a quote is the sentence pause.
   Validation on a real LLM: `docs/chatterbox-edition/experiments/multivoice/`.
 - **Adaptive delivery** (Chatterbox only, Make tab checkbox, on by default): dialogue tagged
   whispered/murmured/shouted/screamed and the like (rule-based, or the cast's own read in Cast mode)
-  is spoken softer and quieter, or more excited and a little louder, around this book's baseline
+  is spoken softer and quieter, or more excited (and a little louder when the clip has headroom), around this book's baseline
   sliders (its Voice lab exaggeration/CFG/temperature, shown live under the checkbox) instead of one
   flat delivery for the whole book. A per-book baseline (the Voice lab sliders at the moment you
   **Add to queue**) is sent even with adaptive delivery switched off, so a book can have its own
-  "voice" without the mood swings. Every adaptive line gets a peak guard so an excited take can never
-  clip. Voice lab has a **▶ Play soft / normal / excited** button to audition the three deliveries
+  "voice" without the mood swings. A mood's gain is applied only as far as the headroom allows (peak
+  -1 dBFS), so an excited take can never clip (WORKLOG #17). Voice lab has a **▶ Play soft / normal / excited** button to audition the three deliveries
   around the current sliders before queuing a book. See `docs/chatterbox-edition/WORKLOG.md` #14 for
   the presets, the rule cues and a measured LLM-mood accuracy trade-off.
 - **Single M4B** per book with chapter markers, cover art, title/author tags. Chapters are generated in a

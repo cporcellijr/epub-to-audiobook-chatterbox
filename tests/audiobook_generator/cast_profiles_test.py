@@ -4,8 +4,9 @@ import json
 import unittest
 
 from audiobook_generator.core.cast_profiles import (
-    ChapterText, Passage, ProfileError, _spread, character_passages, drop_unsupported_accents, first_lines,
-    name_forms, parse_profile, profile_cast, profile_candidates, render_excerpts, select_passages,
+    ChapterText, Passage, ProfileError, _spread, character_passages, describe_book, drop_unsupported_accents,
+    first_lines, name_forms, narration_passages, parse_profile, parse_tone, profile_cast, profile_candidates,
+    render_excerpts, select_passages,
 )
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
 
@@ -200,6 +201,43 @@ class TestProfileCast(unittest.TestCase):
         self.assertEqual(cast["profiles_done"], 1)
         self.assertIn("description", cast["characters"]["ada marsh"]["profile"])
         self.assertNotIn("description", cast["characters"]["tom"]["profile"])
+
+
+class TestBookTone(unittest.TestCase):
+
+    TONE = {"point_of_view": "first person", "pov_character": "Tom", "tone": "wry and warm", "pace": "fast",
+            "intensity": "subdued", "narrator_gender": "Male", "narrator_pitch": "medium", "narrator_quality": "either",
+            "narrator_delivery": "calm"}
+
+    def test_a_reply_is_read_leniently(self):
+        tone = parse_tone(json.dumps(self.TONE))
+        self.assertEqual(tone, {"point_of_view": "first", "pov_character": "Tom", "tone": "wry and warm",
+                                "pace": "brisk", "intensity": "restrained",
+                                "narrator": {"gender": "male", "pitch": "medium", "quality": None, "delivery": "even"}})
+        third = parse_tone(json.dumps({**self.TONE, "point_of_view": "third", "pov_character": "Tom"}))
+        self.assertEqual(third["pov_character"], "")  # only a first-person book has a narrating character
+        with self.assertRaises(ProfileError):
+            parse_tone(json.dumps({**self.TONE, "tone": ""}))
+
+    def test_only_paragraphs_without_dialogue_are_the_narrators(self):
+        self.assertEqual([p.paragraph for p in narration_passages(_chapters())], [3, 4])
+
+    def test_the_book_is_described_once_and_a_narrating_character_is_found(self):
+        cast = {"characters": _characters()}
+        chat = ScriptedChat("not json", json.dumps(self.TONE))
+        describe_book(cast, _chapters(), chat)
+        self.assertEqual(cast["book_tone"]["pov_key"], "tom")
+        prompt = chat.prompts[0][1]["content"]
+        self.assertIn("Ada Marsh (female)", prompt)
+        self.assertIn("The goats were in the beans again.", prompt)
+        self.assertNotIn("You left the gate open", prompt)  # dialogue is not the narrator's
+
+    def test_a_failure_leaves_no_book_tone(self):
+        cast = {"characters": _characters()}
+        describe_book(cast, _chapters(), ScriptedChat(ConnectionError("LLM down")))
+        self.assertNotIn("book_tone", cast)
+        describe_book(cast, _chapters(), ScriptedChat("no", "still no"))
+        self.assertNotIn("book_tone", cast)
 
 
 if __name__ == "__main__":

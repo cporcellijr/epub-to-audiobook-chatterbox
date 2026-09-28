@@ -152,6 +152,49 @@ class TestAdaptiveDeliveryOn(unittest.TestCase):
         self.assertTrue(any("mood=excited" in message for message in log.output))
 
 
+class TestCharacterDelivery(unittest.TestCase):
+    """Cast mode with adaptive delivery: an even or expressive character's lines are read around a
+    shifted baseline; narration and everyone else keep the book's."""
+
+    TEXT = '"Come here," said Ada. "Fine," said Tom. "Who knows," said a stranger.'
+
+    def _cast_file(self, tmp: str) -> str:
+        from audiobook_generator.core import cast as cast_store
+        cast = cast_store.new_cast("k", "/x.epub", "T", "A", "chatterbox", "Narrator.wav", [1])
+        cast["characters"] = {
+            "ada": {"name": "Ada", "aliases": [], "gender": "female", "age": "adult", "lines": 5, "voice": "Ada.wav",
+                    "profile": {"voice_targets": {"delivery": "expressive"}}},
+            "tom": {"name": "Tom", "aliases": [], "gender": "male", "age": "adult", "lines": 4, "voice": "Tom.wav",
+                    "delivery": "even"},
+            # Not in this chapter; an even profile beside Ada's expressive one keeps the cast's centre at 0.
+            "sam": {"name": "Sam", "aliases": [], "gender": "male", "age": "adult", "lines": 5, "voice": "Sam.wav",
+                    "profile": {"voice_targets": {"delivery": "even"}}},
+        }
+        cast["chapters"][cast_store.text_hash(self.TEXT)] = {"number": 1, "lines": {"1": "ada", "2": "tom", "3": None}}
+        path = os.path.join(tmp, "cast.json")
+        cast_store.save_cast(path, cast)
+        return path
+
+    def _bodies(self, adaptive: bool) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = _provider(voice_mode="cast", dialogue_voice="Dialogue.wav", cast_file=self._cast_file(tmp),
+                                 adaptive_delivery=adaptive, delivery_exaggeration=0.73, delivery_cfg_weight=0.5,
+                                 delivery_temperature=0.61)
+            responses = _ScriptedResponses()
+            _speak(provider, self.TEXT, responses, os.path.join(tmp, "out.mp3"))
+        return {call["input"]: call["extra_body"]["exaggeration"] for call in responses.calls}
+
+    def test_each_characters_lines_get_their_delivery_around_the_book(self):
+        bodies = self._bodies(adaptive=True)
+        self.assertEqual(bodies['"Come here,"'], 0.85)   # expressive (profile): +0.12 against Sam's even
+        self.assertEqual(bodies['"Fine,"'], 0.61)        # even (the owner's setting): -0.12 as set
+        self.assertEqual(bodies['"Who knows,"'], 0.73)   # an unknown speaker: the book's own
+        self.assertEqual(bodies["said Ada."], 0.73)      # narration: the book's own
+
+    def test_without_adaptive_delivery_every_line_keeps_the_books_baseline(self):
+        self.assertEqual(set(self._bodies(adaptive=False).values()), {0.73})
+
+
 class TestKokoroIgnoresDelivery(unittest.TestCase):
 
     def test_kokoro_engine_never_sends_extra_body_or_changes_gain(self):

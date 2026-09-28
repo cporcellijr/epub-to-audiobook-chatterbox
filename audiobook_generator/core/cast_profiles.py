@@ -367,3 +367,119 @@ def profile_cast(cast: dict, chapters: List[ChapterText], chat: Chat, log: loggi
         cast["profiles_done"] = number
         save()
         log.info(f"Cast: profile {number}/{len(keys)} ({name}) {'done' if profile else 'skipped'}")
+
+
+# ---- the book's tone, for the narrator ----
+
+TONE_PROMPTS = {
+    "system": (
+        "You describe how a novel is narrated, to help an audiobook producer choose its narrator. Use only "
+        "the excerpts you are given. Answer with a single JSON object and nothing else: no prose, no markdown fences."
+    ),
+    "book": (
+        "Main characters: {characters}\n\n"
+        "Narration from the novel in reading order; [...] marks skipped text.\n\n"
+        "{excerpts}\n\n"
+        "Reply with exactly this shape:\n"
+        "{{\"point_of_view\": \"first|third|second\", \"pov_character\": \"...\", \"tone\": \"...\", "
+        "\"pace\": \"slow|measured|brisk\", \"intensity\": \"restrained|moderate|dramatic\", "
+        "\"narrator_gender\": \"female|male|either\", \"narrator_pitch\": \"low|medium|high\", "
+        "\"narrator_quality\": \"husky|clear|either\", \"narrator_delivery\": \"expressive|even|either\"}}\n"
+        "Rules:\n"
+        "- use only what the excerpts show; if you recognise the book, add nothing from elsewhere;\n"
+        "- pov_character: in a first-person book, the name of the character who says \"I\" (as written in the "
+        "list above when they are in it); otherwise \"\";\n"
+        "- tone: 3 to 6 words on the mood of the writing;\n"
+        "- pace: how quickly the prose moves; intensity: how emotionally heightened the narration is;\n"
+        "- narrator_gender: in a first-person book, the gender of the character who says \"I\"; otherwise "
+        "\"either\" unless the book clearly calls for one;\n"
+        "- narrator_pitch, narrator_quality and narrator_delivery: the narrator voice that suits the book, "
+        "pitch relative to other voices of the same gender: low for dark, serious or weighty books, high for "
+        "light or youthful ones; husky for gritty or sensual books, clear for crisp or gentle ones; expressive "
+        "for dramatic or comic books, even for calm or literary ones;\n"
+        "- write \"unknown\" or \"\" rather than guess."
+    ),
+}
+TONE_MAX_CHARS = PROFILE_MAX_CHARS
+TONE_LEAD_PASSAGES = 2
+_TONE_WORDS = {
+    "point_of_view": (("first", "first"), ("second", "second"), ("third", "third")),
+    "pace": (("slow", "slow"), ("measured", "measured"), ("moderate", "measured"), ("brisk", "brisk"),
+             ("fast", "brisk"), ("quick", "brisk")),
+    "intensity": (("restrained", "restrained"), ("subdued", "restrained"), ("moderate", "moderate"),
+                  ("dramatic", "dramatic"), ("intense", "dramatic")),
+    "narrator_gender": (("female", "female"), ("woman", "female"), ("male", "male"), ("man", "male")),
+}
+
+
+def narration_passages(chapters: List[ChapterText]) -> List[Passage]:
+    """Every paragraph without dialogue, in reading order: the narrator's own voice."""
+    return [Passage(c, p, " ".join(s.text for s in paragraph))
+            for c, chapter in enumerate(chapters) for p, paragraph in enumerate(chapter.paragraphs)
+            if paragraph and all(s.kind == NARRATION for s in paragraph)]
+
+
+def _word(value, kind: str) -> Optional[str]:
+    text = str(value or "").lower()
+    return next((word for key, word in _TONE_WORDS[kind] if key in text), None)
+
+
+def parse_tone(reply: str) -> dict:
+    """Validate the book-tone reply: {point_of_view, pov_character, tone, pace, intensity,
+    narrator: {gender, pitch, quality, delivery}}; unrecognised values become None (or "" for the
+    free text). Raises ProfileError unless it is a JSON object with a tone."""
+    try:
+        data = _extract_json(reply)
+    except AttributionError as e:
+        raise ProfileError(str(e))
+    tone = data.get("tone")
+    if not isinstance(tone, str) or tone.strip().lower() in ("", "unknown"):
+        raise ProfileError("no tone in the reply")
+    pov_character = data.get("pov_character") if isinstance(data.get("pov_character"), str) else ""
+    point_of_view = _word(data.get("point_of_view"), "point_of_view")
+    return {
+        "point_of_view": point_of_view,
+        "pov_character": _clip(pov_character, 60) if point_of_view == "first"
+        and pov_character.strip().lower() not in ("", "unknown", "none") else "",
+        "tone": _clip(tone, 80),
+        "pace": _word(data.get("pace"), "pace"),
+        "intensity": _word(data.get("intensity"), "intensity"),
+        "narrator": {"gender": _word(data.get("narrator_gender"), "narrator_gender"),
+                     "pitch": _target(data.get("narrator_pitch"), "pitch"),
+                     "quality": _target(data.get("narrator_quality"), "quality"),
+                     "delivery": _target(data.get("narrator_delivery"), "delivery")},
+    }
+
+
+def describe_book(cast: dict, chapters: List[ChapterText], chat: Chat, log: logging.Logger = logger) -> None:
+    """Ask the LLM once (and once more if the reply is unusable) how the book is narrated, from up to
+    TONE_MAX_CHARS of its dialogue-free paragraphs, and keep the answer in cast["book_tone"]. A
+    first-person narrator's name is matched to a cast character (cast["book_tone"]["pov_key"]).
+    Like the profiles, this never fails the analysis: any error leaves no book tone and is logged."""
+    passages = select_passages(narration_passages(chapters), TONE_MAX_CHARS, TONE_LEAD_PASSAGES)
+    if not passages:
+        return
+    characters = cast.get("characters", {})
+    listed = [f"{characters[k].get('name', k)} ({characters[k].get('gender', 'unknown')})"
+              for k in profile_candidates(characters, min_lines=1, limit=OTHERS_IN_PROMPT)]
+    messages = [{"role": "system", "content": TONE_PROMPTS["system"]},
+                {"role": "user", "content": TONE_PROMPTS["book"].format(
+                    characters=", ".join(listed) or PROMPTS["others_none"],
+                    excerpts=render_excerpts(passages, chapters))}]
+    try:
+        for attempt in (1, 2):
+            try:
+                tone = parse_tone(chat(messages))
+                break
+            except ProfileError as e:
+                log.warning(f"Cast: book tone reply unusable ({e})" + ("; asking again" if attempt == 1 else "; skipped"))
+        else:
+            return
+    except Exception as e:
+        log.warning(f"Cast: book tone not described: {e}")
+        return
+    if tone["pov_character"]:
+        from audiobook_generator.core.cast_llm import Roster
+        tone["pov_key"] = Roster(characters).resolve(tone["pov_character"])
+    cast["book_tone"] = tone
+    log.info(f"Cast: book tone: {tone}")

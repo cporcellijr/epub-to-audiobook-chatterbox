@@ -13,7 +13,7 @@ from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import chatterbox_control
 from audiobook_generator.core.cast_llm import ChatClient, Chat, Roster, attribute_chapter, llm_api_key, llm_base_url, \
     llm_model
-from audiobook_generator.core.cast_profiles import ChapterText, profile_cast
+from audiobook_generator.core.cast_profiles import ChapterText, describe_book, profile_cast
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK, chapter_segments
 from audiobook_generator.utils.log_handler import setup_logging
 
@@ -80,6 +80,7 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
             log.info(f"Cast: {done}/{len(selection)} chapters analysed, {len(roster.characters)} characters, "
                      f"{stats['unknown_lines']} of {stats['lines']} lines unknown so far")
         profile_cast(cast, analysed, chat, log, save=lambda: cast_store.save_cast(path, cast))
+        describe_book(cast, analysed, chat, log)
         cast["status"] = cast_store.STATUS_DONE
     except Exception as e:
         cast["status"], cast["error"] = cast_store.STATUS_FAILED, str(e)

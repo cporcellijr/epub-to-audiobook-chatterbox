@@ -251,6 +251,65 @@ class TestMatching(unittest.TestCase):
         self.assertIsNone(fresh["characters"]["bea"].get("voice"))
 
 
+class TestDelivery(unittest.TestCase):
+
+    def test_a_characters_delivery_comes_from_the_owner_then_the_profile(self):
+        character = {"profile": {"voice_targets": {"delivery": "expressive"}}}
+        self.assertEqual(cast_store.exaggeration_offset(character), cast_store.CHARACTER_EXAGGERATION_STEP)
+        self.assertEqual(cast_store.exaggeration_offset({**character, "delivery": "even"}),
+                         -cast_store.CHARACTER_EXAGGERATION_STEP)
+        self.assertEqual(cast_store.exaggeration_offset({**character, "delivery": "book"}), 0.0)
+        self.assertEqual(cast_store.exaggeration_offset({**character, "delivery": "auto"}),
+                         cast_store.CHARACTER_EXAGGERATION_STEP)
+        self.assertEqual(cast_store.exaggeration_offset({}), 0.0)
+
+    def test_profile_deliveries_are_centred_on_the_cast_and_the_owners_are_kept(self):
+        # Measured live: nearly every character of a dramatic book came back "expressive".
+        cast = _cast({f"c{n}": (10, "female", None) for n in range(5)})
+        cast["characters"]["calm"] = {"name": "Calm", "aliases": [], "gender": "male", "age": "adult", "lines": 10}
+        for n in range(5):
+            _wants(cast, f"c{n}", delivery="expressive")
+        _wants(cast, "calm", delivery="even")
+        offsets = cast_store.exaggeration_offsets(cast)
+        self.assertEqual(offsets["c0"], 0.04)    # expressive, like most: only a little above the book
+        self.assertEqual(offsets["calm"], -0.12)  # the one even character stands out (capped at the step)
+        cast["characters"]["c0"]["delivery"] = "expressive"  # the owner's own setting is applied as it is
+        self.assertEqual(cast_store.exaggeration_offsets(cast)["c0"], 0.12)
+        cast["characters"]["extra"] = {"name": "Extra", "aliases": [], "gender": "male", "age": "adult", "lines": 2}
+        self.assertEqual(cast_store.exaggeration_offsets(cast)["extra"], 0.0)  # no profile: as the book
+
+    def test_offsets_are_looked_up_by_voice_never_for_the_narrator_or_a_mixed_voice(self):
+        cast = _cast({"a": (5, "female", "A.wav"), "b": (4, "male", "B.wav"), "c": (3, "male", "B.wav"),
+                      "d": (2, "female", "Narrator.wav")})
+        for key, delivery in (("a", "expressive"), ("b", "even"), ("c", "expressive"), ("d", "even")):
+            cast["characters"][key]["delivery"] = delivery
+        self.assertEqual(cast_store.voice_exaggeration_offsets(cast, "Narrator.wav"),
+                         {"A.wav": cast_store.CHARACTER_EXAGGERATION_STEP})
+
+    def test_the_narrators_sliders_follow_the_books_intensity_and_pace(self):
+        base = (0.73, 0.5, 0.61)
+        self.assertEqual(cast_store.narrator_delivery({"intensity": "dramatic", "pace": "brisk"}, base), (0.83, 0.55, 0.61))
+        self.assertEqual(cast_store.narrator_delivery({"intensity": "restrained", "pace": "slow"}, base), (0.63, 0.45, 0.61))
+        self.assertEqual(cast_store.narrator_delivery(None, base), base)
+        self.assertEqual(cast_store.narrator_delivery({"intensity": "restrained"}, (0.3, 0.12, 0.5))[0], 0.25)
+
+    def test_the_narrator_is_the_measured_voice_that_fits_the_books_tone(self):
+        cast = _cast({"tom": (9, "male", None)})
+        cast["book_tone"] = {"narrator": {"gender": "either", "pitch": "high", "quality": "clear", "delivery": None}}
+        voices = [*FEMALE, ("Man.wav", "male")]
+        traits = {**TRAITS, "Man.wav": {"pitch": 0.9, "husky": 0.0, "expressive": 0.5}}
+        self.assertEqual(cast_store.suggest_narrator(cast, voices, traits), "Man.wav")
+        cast["book_tone"]["narrator"]["gender"] = "female"
+        self.assertEqual(cast_store.suggest_narrator(cast, voices, traits), "Light.wav")
+        self.assertEqual(cast_store.suggest_narrator(cast, voices, traits, exclude=("Light.wav",)), "Lively.wav")
+        # A first-person book: the viewpoint character's gender wins.
+        cast["book_tone"].update(point_of_view="first", pov_key="tom")
+        self.assertEqual(cast_store.suggest_narrator(cast, voices, traits), "Man.wav")
+        self.assertIsNone(cast_store.suggest_narrator(cast, voices, {}))  # nothing measured: keep the owner's
+        cast["book_tone"]["narrator"] = {"gender": "male"}
+        self.assertIsNone(cast_store.suggest_narrator(cast, voices, traits))  # nothing asked for
+
+
 class TestEngineCheck(unittest.TestCase):
 
     def test_voices_must_look_like_the_engines(self):

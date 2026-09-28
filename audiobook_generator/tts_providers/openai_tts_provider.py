@@ -566,16 +566,35 @@ class OpenAITTSProvider(BaseTTSProvider):
             temperature = saved.temperature if temperature is None else temperature
         return delivery.Baseline(exaggeration, cfg_weight, temperature)
 
-    def _delivery_extra_body(self, mood: str) -> Optional[dict]:
+    def _character_offsets(self) -> dict:
+        """{voice: exaggeration offset} from the cast's per-character delivery (cast mode with
+        adaptive delivery only; core.cast.voice_exaggeration_offsets)."""
+        if getattr(self, "_offsets", None) is None:
+            self._offsets = (cast_store.voice_exaggeration_offsets(self.cast, self.config.voice_name)
+                             if self.cast is not None and self.config.voice_mode == VOICE_MODE_CAST
+                             and self._adaptive_active() else {})
+        return self._offsets
+
+    def _voice_baseline(self, voice: Optional[str]) -> delivery.Baseline:
+        """The book's baseline, with this voice's character offset when it has one."""
+        baseline = self._delivery_baseline()
+        offset = self._character_offsets().get(voice or "", 0.0)
+        if not offset:
+            return baseline
+        return baseline._replace(exaggeration=round(min(2.0, max(0.25, baseline.exaggeration + offset)), 2))
+
+    def _delivery_extra_body(self, mood: str, voice: Optional[str] = None) -> Optional[dict]:
         """The Chatterbox-only extra_body sliders for one unit, or None when neither adaptive
         delivery nor a per-book baseline applies (today's plain request, unchanged).
 
-        Adaptive delivery sends the mood's own preset; a baseline set with adaptive delivery off
-        sends the plain baseline (preset() at "normal" reproduces it unchanged, with 0 dB gain)."""
+        Adaptive delivery sends the mood's own preset around the baseline of the unit's voice (the
+        book's, shifted for a character whose delivery is even or expressive); a baseline set with
+        adaptive delivery off sends the plain book baseline (preset() at "normal" reproduces it
+        unchanged, with 0 dB gain)."""
         if not self._is_chatterbox_engine() or not (self.config.adaptive_delivery or self._has_custom_baseline()):
             return None
         effective_mood = mood if self.config.adaptive_delivery else delivery.MOOD_NORMAL
-        exaggeration, cfg_weight, temperature, _ = delivery.preset(effective_mood, self._delivery_baseline())
+        exaggeration, cfg_weight, temperature, _ = delivery.preset(effective_mood, self._voice_baseline(voice))
         return {"exaggeration": exaggeration, "cfg_weight": cfg_weight, "temperature": temperature}
 
     def __str__(self) -> str:
@@ -762,7 +781,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                 input=unit,
                 response_format="wav",
             )
-            extra_body = self._delivery_extra_body(mood)
+            extra_body = self._delivery_extra_body(mood, voice)
             if extra_body is not None:
                 request_kwargs["extra_body"] = extra_body
             for attempt in range(_BAD_CLIP_RETRIES + 1):
