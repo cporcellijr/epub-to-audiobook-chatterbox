@@ -50,3 +50,4 @@ logs/
 queue.json
 library_index.json
 queue_uploads/
+.codegraph/

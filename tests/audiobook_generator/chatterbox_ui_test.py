@@ -500,6 +500,7 @@ class TestQueueView(unittest.TestCase):
     def test_rows_and_status(self):
         queue = MagicMock()
         queue.paused = False
+        queue.preparing = False
         queue.jobs.return_value = [
             {"id": "a", "title": "Book A", "voice": "Elena.wav", "chapters": 4, "estimate_seconds": 3600,
              "status": "done", "finished": "2026-09-27 10:00", "note": "", "settings": {}},
@@ -515,8 +516,19 @@ class TestQueueView(unittest.TestCase):
 
     def test_empty_and_paused(self):
         queue = MagicMock()
-        queue.paused, queue.jobs.return_value = True, []
+        queue.paused, queue.preparing, queue.jobs.return_value = True, False, []
         self.assertIn("empty", chatterbox_ui.queue_view(queue)[2])
+
+    def test_preparing_explains_next_step(self):
+        queue = MagicMock()
+        queue.paused, queue.preparing = False, True
+        queue.jobs.return_value = []
+        self.assertIn("Add this book to queue", chatterbox_ui.queue_view(queue)[2])
+        queue.jobs.return_value = [
+            {"id": "a", "title": "Book A", "voice": "Elena.wav", "chapters": 4,
+             "estimate_seconds": 3600, "status": "queued", "note": "", "settings": {}},
+        ]
+        self.assertIn("Start queued books", chatterbox_ui.queue_view(queue)[2])
 
 
 class TestChapterList(unittest.TestCase):
@@ -1324,7 +1336,7 @@ class TestCastPanel(unittest.TestCase):
     def test_no_cast_yet_hides_the_table(self):
         table, keys, status, seen = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
         self.assertFalse(table["visible"])
-        self.assertIn("Analyse cast", status)
+        self.assertIn("Analyse selected chapters", status)
         self.assertIsNone(chatterbox_ui.cast_overview(None, "chatterbox", "Elena.wav", None)[3])
 
     def test_running_analysis_shows_progress(self):

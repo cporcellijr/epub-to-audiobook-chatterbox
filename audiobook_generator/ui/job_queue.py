@@ -1,4 +1,4 @@
-"""Book queue for the web UI: books run one at a time, in order, each with its own settings.
+"""Book queue for the web UI: one job runs at a time, each with its own settings.
 
 The queue is saved to a JSON file, so it survives a container restart; a book that was running
 when the server stopped goes back to the front of the line and resumes from its finished chapters.
@@ -92,10 +92,11 @@ class JobQueue:
                 data = json.load(f)
             if isinstance(data, dict) and isinstance(data.get("jobs"), list):
                 data.setdefault("paused", False)
+                data.setdefault("preparing", False)
                 return data
         except (OSError, ValueError):
             pass
-        return {"paused": False, "jobs": []}
+        return {"paused": False, "preparing": False, "jobs": []}
 
     def _save(self) -> None:
         tmp = f"{self.path}.tmp"
@@ -111,6 +112,10 @@ class JobQueue:
     @property
     def paused(self) -> bool:
         return bool(self._data["paused"])
+
+    @property
+    def preparing(self) -> bool:
+        return bool(self._data["preparing"])
 
     def jobs(self) -> List[dict]:
         with self._lock:
@@ -254,6 +259,12 @@ class JobQueue:
             self._data["paused"] = bool(paused)
             self._save()
 
+    def set_preparing(self, preparing: bool) -> None:
+        """While preparing, run queued cast analyses but hold audiobook jobs."""
+        with self._lock:
+            self._data["preparing"] = bool(preparing)
+            self._save()
+
     @staticmethod
     def _finish_from_exitcode(job: dict, exitcode: int) -> None:
         """DONE/FAILED bookkeeping for a job whose process has actually exited: shared by tick()
@@ -305,7 +316,8 @@ class JobQueue:
                 self._save()
             if self.paused:
                 return
-            job = next((j for j in self._data["jobs"] if j["status"] == QUEUED), None)
+            job = next((j for j in self._data["jobs"] if j["status"] == QUEUED
+                        and (not self.preparing or job_kind(j) == CAST)), None)
             if job is None:
                 return
             if job_kind(job) == CAST:

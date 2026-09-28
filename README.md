@@ -42,7 +42,12 @@ The repo holds the whole stack:
   built-in voices can't be deleted; a browser confirmation is required, and a voice a queued or
   running book still uses is refused).
 - **Queue**: add books with their own voice, chapters and pauses; they run one at a time in order.
-  Pause, resume, stop, remove, retry. The queue survives restarts and resumes an interrupted book.
+  In Cast mode, choose chapters first, then **Analyse selected chapters**. This holds audiobook jobs
+  while cast analyses run one at a time, so you can analyse a cast, queue its book, and repeat before
+  pressing **Start queued books**. A book already generating
+  finishes before cast analysis starts; audio generation and cast analysis never overlap. Less-used
+  pause, resume, stop, remove and retry controls are under **More queue actions**. The queue survives
+  restarts and resumes an interrupted book.
 
 **Narration and output**
 - **Paced narration**: paragraphs are taken from the EPUB's HTML, text is sent a sentence at a time,
@@ -50,7 +55,7 @@ The repo holds the whole stack:
 - **Multi-voice narration** (Voice mode on the Make tab). *Single voice* reads everything with one
   voice, exactly as before. *Narrator + dialogue voice* gives every quoted line a second voice; no LLM
   needed. *Cast* asks a local LLM (any OpenAI-compatible chat endpoint: Ollama, llama.cpp, LM Studio;
-  book text never leaves the machine) who speaks each line: **Analyse cast** queues the pass as a job
+  book text never leaves the machine) who speaks each line: **Analyse selected chapters** queues the pass as a job
   of its own, Chatterbox's model is unloaded from the GPU while it runs and reloaded after, and the
   result is an editable cast table (character, lines, gender, voice, sample button). Voices are
   suggested by gender (Kokoro ids carry it; Chatterbox voices get theirs from a **Voice gender**

@@ -52,7 +52,7 @@ from audiobook_generator.tts_providers.openai_tts_provider import (
     PARAGRAPH_MARK, VOICE_MODE_CAST, VOICE_MODE_DIALOGUE, VOICE_MODE_SINGLE, VOICE_MODES,
 )
 from audiobook_generator.ui import library_index, web_ui
-from audiobook_generator.ui.job_queue import CAST, DONE, FAILED, QUEUED, RUNNING, UPLOAD_KEYS, JobQueue, job_kind
+from audiobook_generator.ui.job_queue import BOOK, CAST, DONE, FAILED, QUEUED, RUNNING, UPLOAD_KEYS, JobQueue, job_kind
 from audiobook_generator.ui.web_ui import (
     OUTPUT_ROOT,
     default_openai_voice,
@@ -720,7 +720,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         if gaps:
             raise gr.Error(f"The cast has no analysis for chapter{'s' if len(gaps) > 1 else ''} "
                            f"{', '.join(map(str, gaps))} as the book reads now (a chapter was ticked after the "
-                           "analysis, or a text option changed). Press Analyse cast again.")
+                           "analysis, or a text option changed). Press Analyse selected chapters again.")
     chosen = [voice] + ([dialogue_voice] if voice_mode != VOICE_MODE_SINGLE else [])
     if voice_mode == VOICE_MODE_CAST:
         chosen += [c.get("voice") for c in cast["characters"].values()]
@@ -807,7 +807,7 @@ def _finished_cast(cast_key: Optional[str]) -> Tuple[str, dict]:
     path = cast_file_for(cast_key)
     cast = cast_store.load_cast(path)
     if cast is None:
-        raise gr.Error("This book has no cast yet: press Analyse cast first.")
+        raise gr.Error("This book has no cast yet: press Analyse selected chapters first.")
     if cast.get("status") != cast_store.STATUS_DONE:
         raise gr.Error("The cast analysis hasn't finished yet." if cast.get("status") == cast_store.STATUS_RUNNING
                        else f"The cast analysis failed ({cast.get('error') or 'see the log'}); run it again.")
@@ -912,15 +912,15 @@ def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional
     row the owner has selected.
     """
     if not cast_key:
-        return gr.update(value=None, visible=False), [], "Pick a book, tick its chapters, then press **Analyse cast**.", None
+        return gr.update(value=None, visible=False), [], "Pick a book, tick its chapters, then press **Analyse selected chapters**.", None
     path = cast_file_for(cast_key)
     try:
         mtime = os.path.getmtime(path)
     except OSError:
-        return gr.update(value=None, visible=False), [], "No cast yet for this book: press **Analyse cast**.", None
+        return gr.update(value=None, visible=False), [], "No cast yet for this book: press **Analyse selected chapters**.", None
     cast = cast_store.load_cast(path)
     if cast is None:
-        return gr.update(value=None, visible=False), [], "The cast file could not be read; run **Analyse cast** again.", None
+        return gr.update(value=None, visible=False), [], "The cast file could not be read; run **Analyse selected chapters** again.", None
     stamp = [path, mtime, cast.get("status"), engine, narrator_voice]
     if seen == stamp:
         return gr.update(), gr.update(), gr.update(), seen
@@ -931,7 +931,7 @@ def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional
                 stamp)
     if cast.get("status") == cast_store.STATUS_FAILED:
         return (gr.update(value=None, visible=False), [],
-                f"✗ The cast analysis failed: {cast.get('error') or 'see the log'}. Press **Analyse cast** to try again.",
+                f"✗ The cast analysis failed: {cast.get('error') or 'see the log'}. Press **Analyse selected chapters** to try again.",
                 stamp)
     cast = _fill_missing_voices(cast, path, engine, narrator_voice)
     rows, keys = cast_rows(cast, engine)
@@ -1093,10 +1093,19 @@ def queue_view(queue: JobQueue) -> tuple:
         elif job["status"] == RUNNING:
             left += job["estimate_seconds"] * (1 - JobQueue.chapters_done(job) / max(1, job["chapters"]))
     to_go = sum(1 for job in jobs if job["status"] in (QUEUED, RUNNING))
-    if not jobs:
-        status = "The queue is empty. Pick a book, tick chapters, choose a voice, then **Add to queue**."
+    if not jobs and not queue.preparing:
+        status = "The queue is empty. Pick a book, choose its voice, then **Add this book to queue**."
     elif queue.paused:
-        status = f"⏸ **Queue paused** · {to_go} book(s) waiting. Press **Resume queue** to continue."
+        status = f"⏸ **Queue paused** · {to_go} job(s) waiting. Press **Resume queue** to continue."
+    elif queue.preparing:
+        waiting_books = sum(job_kind(job) == BOOK and job["status"] == QUEUED for job in jobs)
+        if waiting_books:
+            status = (f"🎭 **Preparing casts** · {waiting_books} book(s) waiting. "
+                      "Analyse and add any other books, then press **Start queued books**. "
+                      "A book already generating will finish first.")
+        else:
+            status = ("🎭 **Preparing cast** · choose voices when analysis finishes, "
+                      "then press **Add this book to queue**.")
     elif to_go:
         status = f"▶ **Working** · {to_go} book(s) to go · {_about(left)} of generating left."
     else:
@@ -1320,7 +1329,9 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
 
     def refresh_queue() -> tuple:
         rows, ids, status = queue_view(queue)
-        return gr.update(value=rows), ids, status
+        can_start = queue.preparing and any(job_kind(job) == BOOK and job["status"] == QUEUED
+                                            for job in queue.jobs())
+        return gr.update(value=rows), ids, status, gr.update(visible=can_start)
 
     def enqueue(library_book, input_file, chapter_table, stats, *settings) -> tuple:
         job_settings = queue_settings(library_book, input_file, chapter_table, *settings, active_jobs=queue.jobs())
@@ -1329,13 +1340,14 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                              generation_estimate(chapter_table, stats, job_settings["engine"]),
                              job_settings["voice"])
         queue.tick()
-        gr.Info(f"Added '{title}' to the queue" + ("." if position <= 1 else f" (#{position} in line)."))
+        gr.Info((f"Added '{title}' to the queue; it will wait for Start queued books."
+                 if queue.preparing else f"Added '{title}' to the queue" +
+                 ("." if position <= 1 else f" (#{position} in line).")))
         return refresh_queue()
 
     def queue_analysis(library_book, input_file, chapter_table, stats, engine, voice, title_mode, newline_mode,
                        remove_endnotes, remove_reference_numbers, search_and_replace_file, log_level) -> tuple:
-        """Queue the LLM pass over the ticked chapters as a job of its own (it runs when the books
-        before it are done, never alongside one)."""
+        """Analyse this cast before generating queued books; a running book finishes first."""
         job_settings = analysis_settings(library_book, input_file, chapter_table, engine, voice, title_mode,
                                          newline_mode, remove_endnotes, remove_reference_numbers,
                                          search_and_replace_file, log_level)
@@ -1345,10 +1357,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 raise gr.Error("This book's cast analysis is already in the queue.")
         book = job_settings["input_file"]
         title = f"Cast: {library_index.book_title(book, library_index.load_index()) or os.path.basename(book)}"
-        position = queue.add(title, job_settings, len(job_settings["chapter_selection"]),
-                             analysis_estimate(chapter_table, stats), voice, kind=CAST)
+        queue.set_preparing(True)
+        queue.set_paused(False)
+        queue.add(title, job_settings, len(job_settings["chapter_selection"]),
+                  analysis_estimate(chapter_table, stats), voice, kind=CAST)
         queue.tick()
-        gr.Info("Cast analysis queued" + ("." if position <= 1 else f" (#{position} in line)."))
+        gr.Info("Cast analysis queued. Audiobook jobs will wait until you start them.")
         return (*refresh_queue(), job_settings["cast_key"],
                 "⏳ Cast analysis queued. This panel updates as it runs.")
 
@@ -1403,6 +1417,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         queue.tick()
         return refresh_queue()
 
+    def start_books() -> tuple:
+        queue.set_preparing(False)
+        queue.set_paused(False)
+        queue.tick()
+        return refresh_queue()
+
     def stop_current() -> tuple:
         if queue.stop_current():
             gr.Info("Stopped. The queue is paused: press Resume queue to go on to the next book.")
@@ -1446,25 +1466,6 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                          "softer or more excited around this book's baseline, instead of one flat delivery.")
                 delivery_baseline_info = gr.Markdown(
                     delivery_baseline_text(saved["exaggeration"], saved["cfg_weight"], saved["temperature"]))
-            with gr.Column(visible=False) as cast_panel:
-                with gr.Row(equal_height=True):
-                    analyse_button = gr.Button("🎭 Analyse cast", scale=0, min_width=160)
-                    cast_status = gr.Markdown("Pick a book, tick its chapters, then press **Analyse cast**.")
-                cast_table = gr.Dataframe(headers=CAST_COLUMNS, datatype=["str", "number", "str", "str", "str", "str"],
-                                          interactive=False, wrap=True, visible=False,
-                                          label="Cast: click a character to change its gender or voice",
-                                          column_widths=["22%", "8%", "10%", "10%", "22%", "28%"], max_height=400)
-                with gr.Row(equal_height=True):
-                    cast_editing = gr.Markdown("Click a character in the table.")
-                    cast_gender = gr.Dropdown(_GENDER_CHOICES, value="unknown", label="Gender", scale=1)
-                    cast_voice = gr.Dropdown(choices, value=None, label="Voice", allow_custom_value=True, scale=2)
-                    with gr.Column(scale=0, min_width=100):
-                        cast_sample_button = gr.Button("▶ Sample", size="sm")
-                        cast_apply_button = gr.Button("Save", size="sm", variant="primary")
-                cast_key_state = gr.State(None)
-                cast_keys_state = gr.State([])
-                cast_selected = gr.State(None)
-                cast_seen = gr.State(None)
             with gr.Row(equal_height=True):
                 sentence_pause = gr.Slider(0.0, 1.5, value=0.35, step=0.05, label="Pause after sentences (s)")
                 paragraph_pause = gr.Slider(0.0, 3.0, value=0.9, step=0.1, label="Pause between paragraphs (s)")
@@ -1501,21 +1502,46 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                          "on a server this fast.")
                 search_and_replace_file = gr.File(label="Search & replace file (optional, e.g. fix pronunciations)",
                                                   file_types=[".txt"], file_count="single")
-            enqueue_button = gr.Button("➕ Add to queue", variant="primary")
+            with gr.Column(visible=False) as cast_panel:
+                gr.Markdown("**Cast workflow:** Choose chapters above → analyse cast → choose voices → "
+                            "add this book to queue. Repeat for another book, then start the queued books.")
+                with gr.Row(equal_height=True):
+                    analyse_button = gr.Button("🎭 Analyse selected chapters", scale=0, min_width=210)
+                    cast_status = gr.Markdown("Choose chapters above, then press **Analyse selected chapters**.")
+                cast_table = gr.Dataframe(headers=CAST_COLUMNS, datatype=["str", "number", "str", "str", "str", "str"],
+                                          interactive=False, wrap=True, visible=False,
+                                          label="Cast: click a character to change its gender or voice",
+                                          column_widths=["22%", "8%", "10%", "10%", "22%", "28%"], max_height=400)
+                with gr.Row(equal_height=True):
+                    cast_editing = gr.Markdown("Click a character in the table.")
+                    cast_gender = gr.Dropdown(_GENDER_CHOICES, value="unknown", label="Gender", scale=1)
+                    cast_voice = gr.Dropdown(choices, value=None, label="Voice", allow_custom_value=True, scale=2)
+                    with gr.Column(scale=0, min_width=100):
+                        cast_sample_button = gr.Button("▶ Sample", size="sm")
+                        cast_apply_button = gr.Button("Save voice", size="sm")
+                cast_key_state = gr.State(None)
+                cast_keys_state = gr.State([])
+                cast_selected = gr.State(None)
+                cast_seen = gr.State(None)
+            enqueue_button = gr.Button("➕ Add this book to queue", variant="primary")
             with gr.Accordion("Queue", open=True):
                 queue_status = gr.Markdown()
+                can_start = queue.preparing and any(job_kind(job) == BOOK and job["status"] == QUEUED
+                                                    for job in queue.jobs())
+                start_books_button = gr.Button("▶ Start queued books", variant="primary", visible=can_start)
                 queue_table = gr.Dataframe(headers=QUEUE_COLUMNS, interactive=False, wrap=True, label="Books",
                                            column_widths=["5%", "33%", "14%", "9%", "27%", "12%"])
                 queue_ids = gr.State([])
                 selected_job = gr.State(None)
                 selected_info = gr.Markdown()
-                with gr.Row():
-                    remove_button = gr.Button("Remove selected", size="sm")
-                    retry_button = gr.Button("Retry selected", size="sm")
-                    clear_button = gr.Button("Clear finished", size="sm")
-                    pause_button = gr.Button("Pause queue", size="sm")
-                    resume_button = gr.Button("Resume queue", size="sm")
-                    stop_button = gr.Button("Stop current book", variant="stop", size="sm")
+                with gr.Accordion("More queue actions", open=False):
+                    with gr.Row():
+                        remove_button = gr.Button("Remove selected", size="sm")
+                        retry_button = gr.Button("Retry selected", size="sm")
+                        clear_button = gr.Button("Clear finished", size="sm")
+                        pause_button = gr.Button("Pause queue", size="sm")
+                        resume_button = gr.Button("Resume queue", size="sm")
+                        stop_button = gr.Button("Stop current book", variant="stop", size="sm")
             queue_timer = gr.Timer(3)
             Log(str(web_ui.webui_log_file.absolute()), dark=True, xterm_font_size=12)
 
@@ -1590,7 +1616,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         input_file.change(uploaded_book_selected, inputs=input_file, outputs=[output_dir, library_book]) \
             .then(chapter_overview, inputs=overview_inputs, outputs=overview_outputs) \
             .then(book_cast_key, inputs=[library_book, input_file], outputs=cast_key_state)
-        queue_outputs = [queue_table, queue_ids, queue_status]
+        queue_outputs = [queue_table, queue_ids, queue_status, start_books_button]
 
         # Cast mode: the cast key follows the picked book; the panel follows the cast file.
         cast_view_inputs = [cast_key_state, engine, voice, cast_seen]
@@ -1619,6 +1645,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         remove_button.click(remove_selected, inputs=selected_job, outputs=selection_outputs)
         retry_button.click(retry_selected, inputs=selected_job, outputs=selection_outputs)
         clear_button.click(clear_finished, inputs=None, outputs=queue_outputs)
+        start_books_button.click(start_books, inputs=None, outputs=queue_outputs)
         pause_button.click(pause_queue, inputs=None, outputs=queue_outputs)
         resume_button.click(resume_queue, inputs=None, outputs=queue_outputs)
         stop_button.click(stop_current, inputs=None, outputs=queue_outputs)

@@ -234,7 +234,7 @@ class TestJobQueue(unittest.TestCase):
             f.write("{not json")
         self.assertEqual(self._queue().jobs(), [])
         with open(self.path) as f:
-            self.assertEqual(json.load(f), {"paused": False, "jobs": []})
+            self.assertEqual(json.load(f), {"paused": False, "preparing": False, "jobs": []})
 
 
 def _spawn_target(marker_path: str) -> None:
@@ -326,6 +326,42 @@ class TestCastJobs(unittest.TestCase):
         FakeProcess.instances[0].finish(0)
         self.queue.tick()
         self.assertEqual([j["status"] for j in self.queue.jobs()], [DONE, RUNNING])
+
+    def test_prepare_runs_casts_ahead_of_held_books_until_start(self):
+        self.queue.set_preparing(True)
+        self.queue.add("Book 1", _settings(os.path.join(self.tmp.name, "B1")), 3, 600, "Elena.wav")
+        self.queue.add("Cast 1", self._cast_settings(), 2, 30, "Elena.wav", kind=CAST)
+        self.queue.tick()
+        self.assertIs(FakeProcess.instances[0].target, run_cast_job)
+        self.queue.add("Book 2", _settings(os.path.join(self.tmp.name, "B2")), 3, 600, "Elena.wav")
+        self.queue.add("Cast 2", dict(self._cast_settings(), cast_key="k2"), 2, 30, "Elena.wav", kind=CAST)
+        FakeProcess.instances[0].finish()
+        self.queue.tick()
+        self.assertIs(FakeProcess.instances[1].target, run_cast_job)
+        FakeProcess.instances[1].finish()
+        self.queue.tick()
+        self.assertEqual(len(FakeProcess.instances), 2)  # both audiobook jobs still wait
+        self.assertTrue(self.queue.preparing)
+        self.assertTrue(self._restarted_queue().preparing)
+        self.queue.set_preparing(False)
+        self.queue.tick()
+        self.assertIs(FakeProcess.instances[2].target, run_job)
+        self.assertEqual(self.queue.jobs()[0]["status"], RUNNING)
+
+    def _restarted_queue(self):
+        return JobQueue(self.path, lambda **s: s, lambda: "/app/log.txt", process_factory=FakeProcess,
+                        engine_ready=lambda s: True)
+
+    def test_prepare_waits_for_the_current_book_before_cast_analysis(self):
+        self.queue.add("Book", _settings(os.path.join(self.tmp.name, "B")), 3, 600, "Elena.wav")
+        self.queue.tick()
+        self.queue.set_preparing(True)
+        self.queue.add("Cast", self._cast_settings(), 2, 30, "Elena.wav", kind=CAST)
+        self.queue.tick()
+        self.assertEqual(len(FakeProcess.instances), 1)
+        FakeProcess.instances[0].finish()
+        self.queue.tick()
+        self.assertIs(FakeProcess.instances[1].target, run_cast_job)
 
     def test_old_jobs_without_a_kind_are_books(self):
         with open(self.path, "w") as f:
