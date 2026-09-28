@@ -1,8 +1,10 @@
 """Speaker attribution with a local OpenAI-compatible chat model.
 
 A chapter's dialogue lines (from core.dialogue) are sent in windows: WINDOW_LINES numbered lines
-with the narration around them and a couple of preceding paragraphs for context, plus the running
-list of characters already met. The model answers with JSON mapping each line id to a speaker and
+with the narration around them and the preceding paragraphs for context, plus the running list of
+characters already met. Lines a speech tag already names (core.speech_tags: "said Tom") are not
+asked; they, and every line decided in earlier windows, are shown to the model as [Name] "..." so
+it can follow the turn-taking of the untagged lines. The model answers with JSON mapping each line id to a speaker and
 listing new characters (gender, rough age, aliases). Every reply is validated strictly; a window
 whose reply is unusable is asked once more, then its lines are left unknown (they get the
 dialogue voice).
@@ -15,16 +17,17 @@ import logging
 import os
 import re
 import time
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Collection, Dict, List, NamedTuple, Optional, Tuple
 
 from audiobook_generator.core.cast import AGES, GENDERS, display_name, normalize_name
 from audiobook_generator.core.dialogue import DIALOGUE, Segment
+from audiobook_generator.core.speech_tags import tagged_speakers
 
 logger = logging.getLogger(__name__)
 
 WINDOW_LINES = 20          # dialogue lines asked about per request
 WINDOW_MAX_CHARS = 6000    # passage text per request (about 1,500 tokens): a 7-9B model's comfort zone
-CONTEXT_PARAGRAPHS = 2     # narration/dialogue paragraphs repeated before a window for context
+CONTEXT_PARAGRAPHS = 6     # paragraphs repeated before a window, with their known speakers, for context
 LLM_TIMEOUT_SECONDS = 300  # one request; a small local model on a busy GPU can be slow
 LLM_TEMPERATURE = 0.0
 
@@ -38,8 +41,9 @@ PROMPTS = {
     "window": (
         "Known characters so far (use these exact names when the speaker is one of them):\n"
         "{roster}\n\n"
-        "Passage. Lines to attribute are marked like [#N] in front of the quotation, N being the line's id; "
-        "quotations without a mark need no answer:\n\n"
+        "Passage. Lines to attribute are marked like [#N] in front of the quotation, N being the line's id. "
+        "Lines shown as [Name] in front of the quotation already have a known speaker: use them to follow "
+        "who is talking, but do not answer for them. Quotations without a mark need no answer:\n\n"
         "{passage}\n\n"
         "Reply with exactly this shape, one entry per id:\n"
         "{{\"speakers\": {{\"N\": \"Full Name\"}}, "
@@ -117,38 +121,57 @@ class Window(NamedTuple):
     ids: List[int]          # line ids to attribute, in order
     passage: str            # rendered text: context paragraphs, then the window's paragraphs
     continued: List[int]    # line ids in this window that continue the previous line (not asked)
+    anchored: List[int] = []  # line ids in this window whose speaker a speech tag names (not asked)
+    context_start: int = 0  # paragraph index where the context begins
+    start: int = 0          # paragraph index of the window's first paragraph
+    end: int = 0            # paragraph index after the window's last paragraph
 
 
-def render_paragraph(segments: List[Segment], ask_ids: bool) -> str:
-    """One paragraph as the model sees it: dialogue marked [#id] when its speaker is wanted."""
+def render_paragraph(segments: List[Segment], ask_ids: bool, known: Optional[Dict[int, str]] = None) -> str:
+    """One paragraph as the model sees it: dialogue whose speaker is already known shown as
+    [Name], dialogue whose speaker is wanted marked [#id]."""
     parts = []
     for piece in segments:
-        if piece.kind == DIALOGUE and ask_ids and not piece.continues:
+        if piece.kind == DIALOGUE and known and piece.line_id in known:
+            parts.append(f"[{known[piece.line_id]}] {piece.text}")
+        elif piece.kind == DIALOGUE and ask_ids and not piece.continues:
             parts.append(f"[#{piece.line_id}] {piece.text}")
         else:
             parts.append(piece.text)
     return " ".join(parts)
 
 
+def render_window(paragraphs: List[List[Segment]], window: Window, known: Optional[Dict[int, str]] = None) -> str:
+    """The window's passage with the speakers known right now shown in place."""
+    return "\n\n".join([render_paragraph(p, False, known) for p in paragraphs[window.context_start:window.start]]
+                       + [render_paragraph(p, True, known) for p in paragraphs[window.start:window.end]])
+
+
 def build_windows(paragraphs: List[List[Segment]], window_lines: int = WINDOW_LINES,
-                  max_chars: int = WINDOW_MAX_CHARS, context_paragraphs: int = CONTEXT_PARAGRAPHS) -> List[Window]:
+                  max_chars: int = WINDOW_MAX_CHARS, context_paragraphs: int = CONTEXT_PARAGRAPHS,
+                  known: Optional[Dict[int, str]] = None) -> List[Window]:
     """Cut a chapter into windows of consecutive paragraphs holding up to window_lines dialogue
-    lines (continued lines aside) and up to max_chars of text, each preceded by the previous
-    context_paragraphs paragraphs as unasked context. Paragraphs without dialogue ride along with
-    the window they fall in; a stretch with no dialogue at all makes no window."""
+    lines to ask about (continued lines and lines in known aside) and up to max_chars of text,
+    each preceded by the previous context_paragraphs paragraphs as unasked context. Paragraphs
+    without asked lines ride along with the window they fall in; a stretch with none makes no
+    window."""
+    known = known or {}
     windows: List[Window] = []
     start = 0
     while start < len(paragraphs):
-        end, ids, continued, chars = start, [], [], 0
+        end, ids, continued, anchored, chars = start, [], [], [], 0
         while end < len(paragraphs):
             paragraph = paragraphs[end]
-            asked = [s.line_id for s in paragraph if s.kind == DIALOGUE and not s.continues]
+            asked = [s.line_id for s in paragraph if s.kind == DIALOGUE and not s.continues
+                     and s.line_id not in known]
+            tagged = [s.line_id for s in paragraph if s.kind == DIALOGUE and s.line_id in known]
             cont = [s.line_id for s in paragraph if s.kind == DIALOGUE and s.continues]
             length = sum(len(s.text) + 1 for s in paragraph)
             if ids and (len(ids) + len(asked) > window_lines or chars + length > max_chars):
                 break
             ids.extend(asked)
             continued.extend(cont)
+            anchored.extend(tagged)
             chars += length
             end += 1
             if len(ids) >= window_lines:
@@ -156,10 +179,8 @@ def build_windows(paragraphs: List[List[Segment]], window_lines: int = WINDOW_LI
         if end == start:  # a single paragraph over the budget still goes out on its own
             end = start + 1
         if ids:
-            context = paragraphs[max(0, start - context_paragraphs):start]
-            body = paragraphs[start:end]
-            text = "\n\n".join([render_paragraph(p, False) for p in context] + [render_paragraph(p, True) for p in body])
-            windows.append(Window(ids, text, continued))
+            window = Window(ids, "", continued, anchored, max(0, start - context_paragraphs), start, end)
+            windows.append(window._replace(passage=render_window(paragraphs, window, known)))
         start = end
     return windows
 
@@ -199,12 +220,14 @@ def _speaker_or_none(value) -> Optional[str]:
     return None if name.lower().strip(".!? ") in UNKNOWN_SPEAKER_WORDS else name
 
 
-def parse_reply(reply: str, expected_ids: List[int]) -> Tuple[Dict[int, Optional[str]], List[dict]]:
+def parse_reply(reply: str, expected_ids: List[int],
+                ignore_ids: Collection[int] = ()) -> Tuple[Dict[int, Optional[str]], List[dict]]:
     """Validate one window's reply: ({line id: speaker name or None}, new/updated characters).
 
     Raises AttributionError for anything but a JSON object whose "speakers" cover exactly the
-    expected ids (a missing id, an invented id, a non-string name). Characters with a bad gender
-    or age are kept with "unknown" there; a character without a usable name is dropped.
+    expected ids (a missing id, an invented id, a non-string name). Answers for ignore_ids (lines
+    shown with a known speaker) are dropped rather than refused. Characters with a bad gender or
+    age are kept with "unknown" there; a character without a usable name is dropped.
     """
     data = _extract_json(reply)
     raw = data.get("speakers")
@@ -213,6 +236,8 @@ def parse_reply(reply: str, expected_ids: List[int]) -> Tuple[Dict[int, Optional
     speakers: Dict[int, Optional[str]] = {}
     for key, value in raw.items():
         line_id = _line_id(key)
+        if line_id is not None and line_id in ignore_ids:
+            continue
         if line_id is None or line_id not in expected_ids:
             raise AttributionError(f"unknown line id {key!r}")
         speakers[line_id] = _speaker_or_none(value)
@@ -390,24 +415,35 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
                       log: logging.Logger = logger, label: str = "") -> Dict[int, Optional[str]]:
     """Attribute every dialogue line of one chapter: {line id: character key or None}.
 
-    Each window is asked once and, when its reply fails validation, once more; a second failure
-    leaves its lines unknown. New names become roster characters (aliases merged). A line that
+    Lines a speech tag names are not asked (core.speech_tags); the model sees them, and every line
+    decided so far, as [Name] "...". Each window is asked once and, when its reply fails
+    validation, once more; a second failure leaves its lines unknown. New names become roster characters (aliases merged). A line that
     continues the previous paragraph's quotation takes the previous line's speaker. stats is
     updated in place: windows asked, invalid_json (windows whose first reply was unusable),
-    invalid_after_retry (windows whose retry was unusable too), lines, unknown_lines, seconds.
+    invalid_after_retry (windows whose retry was unusable too), lines, tagged_lines, unknown_lines,
+    seconds.
     """
     result: Dict[int, Optional[str]] = {}
-    for field in ("windows", "invalid_json", "invalid_after_retry", "lines", "unknown_lines"):
+    for field in ("windows", "invalid_json", "invalid_after_retry", "lines", "tagged_lines", "unknown_lines"):
         stats.setdefault(field, 0)
     stats.setdefault("seconds", 0.0)
-    windows = build_windows(paragraphs)
+    anchors = tagged_speakers(paragraphs)
+    windows = build_windows(paragraphs, known=anchors)
     started = time.monotonic()
+
+    def known_now() -> Dict[int, str]:
+        """Tag names, overridden by the display name of whoever each decided line resolved to."""
+        known = dict(anchors)
+        known.update({line_id: roster.characters[key]["name"] for line_id, key in result.items() if key})
+        return known
+
     for number, window in enumerate(windows, 1):
+        window = window._replace(passage=render_window(paragraphs, window, known_now()))
         speakers, characters = None, []
         for attempt in (1, 2):
             reply = chat(_messages(window, roster))
             try:
-                speakers, characters = parse_reply(reply, window.ids)
+                speakers, characters = parse_reply(reply, window.ids, ignore_ids=anchors)
                 break
             except AttributionError as e:
                 if attempt == 1:
@@ -426,9 +462,16 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
             name = speakers.get(line_id)
             key = roster.add(name) if name else None
             result[line_id] = key
+        # Tag names resolve after the model's character list, so "Mother" can land on the
+        # character the model gave that alias instead of becoming a character of its own.
+        for line_id in window.anchored:
+            result[line_id] = roster.add(anchors[line_id])
         for line_id in window.continued:
             result[line_id] = result.get(line_id - 1)
         log.info(f"Cast{label}: window {number}/{len(windows)} done, {len(roster.characters)} characters so far")
+    for line_id, name in anchors.items():  # tagged lines in stretches that needed no window
+        if line_id not in result:
+            result[line_id] = roster.add(name)
     # Lines the windows never covered (none expected) and continued lines' counts
     all_lines = [s for p in paragraphs for s in p if s.kind == DIALOGUE]
     for line in all_lines:
@@ -436,6 +479,7 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
         if result[line.line_id]:
             roster.count_line(result[line.line_id])
     stats["lines"] = stats.get("lines", 0) + len(all_lines)
+    stats["tagged_lines"] = stats.get("tagged_lines", 0) + len(anchors)
     stats["unknown_lines"] = stats.get("unknown_lines", 0) + sum(1 for v in result.values() if v is None)
     stats["seconds"] = round(stats.get("seconds", 0.0) + time.monotonic() - started, 2)
     return result

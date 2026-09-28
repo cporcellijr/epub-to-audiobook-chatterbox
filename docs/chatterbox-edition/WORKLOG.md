@@ -454,3 +454,16 @@ fallback against a real server, the real unload/reload timing, how a two-voice b
 less steadily than a 40-character unit), and the analysis speed behind `ANALYSIS_SECONDS_PER_LINE`.
 `experiments/multivoice/validate_multivoice.py` measures all of that: run it as its README says before
 using cast mode on a book.
+
+Measured on the owner's machine (Qwen2.5 14B through Ollama, the 270 labelled fixture lines): 207
+right (76.7%) in the first build, with no unusable replies and Chatterbox unloaded and reloaded
+around the pass. Every miss was the model's own answer, not alias merging. Qwen3 14B scored 74% at
+about seven times the time, and asking the model to write its evidence per line first made it worse.
+What helped (2026-09-28): `core/speech_tags.py` names the speaker of lines with a named speech tag
+("said Tom", `Mrs. Marsh said, "..."`, and the other untagged quotations of such a paragraph)
+without the LLM; those lines, and every line decided in earlier windows, are shown to the model as
+`[Name] "..."` with six paragraphs of context, and it is asked only about the rest. Result: 221 right
+(81.9%), misses down from 61 to 49; the tag rules named 23 fixture lines, all correctly (the fixture
+is mostly untagged by design, so real books should gain more). Ten lines per request instead of 20
+scored 218, so the window stays at 20.
+

@@ -192,21 +192,23 @@ class TestAttributeChapter(unittest.TestCase):
         chat = ScriptedChat("not json at all", _reply({n: "Ada" for n in range(1, 7)}))
         stats = {}
         lines = attribute_chapter(self.paragraphs, Roster(), chat, stats, self.log)
-        self.assertEqual(set(lines.values()), {"ada"})
+        self.assertEqual(set(lines.values()), {"ada", "tom"})  # lines 2 and 6 are tagged "said Tom"
         self.assertEqual((stats["invalid_json"], stats.get("invalid_after_retry", 0), len(chat.prompts)), (1, 0, 2))
 
     def test_two_bad_replies_leave_the_window_unknown(self):
         chat = ScriptedChat(_reply({1: "Ada"}), _reply({n: "Ada" for n in range(1, 8)}))  # missing ids, then an invented id
         stats = {}
         lines = attribute_chapter(self.paragraphs, Roster(), chat, stats, self.log)
-        self.assertEqual(lines, {n: None for n in range(1, 7)})
-        self.assertEqual((stats["invalid_json"], stats["invalid_after_retry"], stats["unknown_lines"]), (1, 1, 6))
+        # The tagged lines ("said Tom") never depended on the model.
+        self.assertEqual(lines, {1: None, 2: "tom", 3: None, 4: None, 5: None, 6: "tom"})
+        self.assertEqual((stats["invalid_json"], stats["invalid_after_retry"], stats["unknown_lines"]), (1, 1, 4))
 
     def test_unknown_speakers_stay_unknown_and_known_names_reach_the_next_prompt(self):
         chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "unknown", 3: "Ada Marsh", 4: "", 5: "narrator", 6: "Tom"}))
         roster = Roster()
         lines = attribute_chapter(self.paragraphs, roster, chat, {}, self.log)
-        self.assertEqual(lines, {1: "ada marsh", 2: None, 3: "ada marsh", 4: None, 5: None, 6: "tom"})
+        # Line 2 is tagged "said Tom", so the model's "unknown" for it is not even asked for.
+        self.assertEqual(lines, {1: "ada marsh", 2: "tom", 3: "ada marsh", 4: None, 5: None, 6: "tom"})
         next_chat = ScriptedChat(_reply({1: "Tom"}))
         attribute_chapter(chapter_segments('"Again," he said.'), roster, next_chat, {}, self.log)
         self.assertIn("Ada Marsh, Tom", next_chat.prompts[0][1]["content"])
@@ -218,3 +220,52 @@ class TestAttributeChapter(unittest.TestCase):
         lines = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)
         self.assertEqual(lines, {1: "ada", 2: "ada", 3: "tom"})
         self.assertEqual(roster.characters["ada"]["lines"], 2)
+
+
+class TestTaggedLines(unittest.TestCase):
+    """Lines a speech tag names are not asked; the model sees them, and earlier decisions, as [Name]."""
+
+    def setUp(self):
+        self.log = logging.getLogger("test-cast")
+
+    def test_tagged_lines_are_shown_as_known_and_not_asked(self):
+        windows = build_windows(chapter_segments(CHAPTER), known={2: "Tom", 6: "Tom"})
+        self.assertEqual((windows[0].ids, windows[0].anchored), ([1, 3, 4, 5], [2, 6]))
+        self.assertIn('[Tom] "I did not,"', windows[0].passage)
+        self.assertNotIn("[#2]", windows[0].passage)
+
+    def test_the_model_is_not_asked_about_tagged_lines_and_their_answers_are_ignored(self):
+        chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "Somebody Else", 3: "Ada Marsh", 4: "Tom", 5: "Mrs. Marsh",
+                                    6: "Somebody Else"}))
+        lines = attribute_chapter(chapter_segments(CHAPTER), Roster(), chat, {}, self.log)
+        prompt = chat.prompts[0][1]["content"]
+        self.assertIn("Ids to answer: 1, 3, 4, 5", prompt)
+        self.assertEqual((lines[2], lines[6]), ("tom", "tom"))
+
+    def test_a_tag_name_joins_the_character_the_model_gave_that_alias(self):
+        text = f'"Supper is ready," said Mother.{M}"Coming," said Ada.{M}"Wash your hands first."'
+        chat = ScriptedChat(_reply({3: "Mrs. Marsh"}, [
+            {"name": "Mrs. Marsh", "gender": "female", "age": "adult", "aliases": ["Mother"]}]))
+        roster = Roster()
+        lines = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)
+        self.assertEqual(lines[1], lines[3])
+        self.assertEqual(roster.characters[lines[1]]["name"], "Mrs. Marsh")
+
+    def test_later_windows_see_earlier_decisions_as_context(self):
+        exchange = [f'"Line {n}."' for n in range(1, 31)]
+        text = M.join(exchange)
+        first = _reply({n: ("Ada" if n % 2 else "Tom") for n in range(1, 21)})
+        second = _reply({n: ("Ada" if n % 2 else "Tom") for n in range(21, 31)})
+        chat = ScriptedChat(first, second)
+        attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
+        second_prompt = chat.prompts[1][1]["content"]
+        self.assertIn('[Tom] "Line 20."', second_prompt)
+        self.assertIn('[Ada] "Line 19."', second_prompt)
+        self.assertIn('[#21] "Line 21."', second_prompt)
+
+    def test_a_chapter_where_every_line_is_tagged_needs_no_request(self):
+        text = f'"Hello," said Ada.{M}"Hello yourself," Tom said.'
+        chat = ScriptedChat()
+        stats = {}
+        lines = attribute_chapter(chapter_segments(text), Roster(), chat, stats, self.log)
+        self.assertEqual((lines, chat.prompts, stats["tagged_lines"]), ({1: "ada", 2: "tom"}, [], 2))
