@@ -1,15 +1,20 @@
 """Personal web UI: EPUB -> audiobook through a local Chatterbox server, plus a voice lab.
 
-Only the OpenAI-compatible provider is exposed (pointed at Chatterbox via OPENAI_BASE_URL).
-Upstream's multi-provider UI stays in web_ui.py, whose process helpers are reused here.
+The OpenAI-compatible provider is exposed twice over: pointed at Chatterbox via OPENAI_BASE_URL
+(the default engine), or at Kokoro via KOKORO_BASE_URL (opt-in second engine). Upstream's
+multi-provider UI stays in web_ui.py, whose process helpers are reused here.
 
 Environment:
     OPENAI_BASE_URL      Chatterbox OpenAI endpoint, e.g. http://chatterbox:8004/v1
     CHATTERBOX_URL       Chatterbox root (default: OPENAI_BASE_URL without /v1)
     CHATTERBOX_CONFIG    Chatterbox config.yaml (read-only mount) for the saved delivery settings
-    TTS_VOICES_DIR       Chatterbox voices folder (writable mount, for adding voices)
+    TTS_VOICES_DIR       Chatterbox voices folder (writable mount, for adding/deleting voices)
     OPENAI_DEFAULT_VOICE Voice selected by default
     EBOOK_LIBRARY_DIR    Ebook library (read-only mount) for the searchable book picker
+    KOKORO_BASE_URL      Kokoro OpenAI endpoint, e.g. http://kokoro:8880/v1 (optional: leave unset
+                          to hide the Engine choice entirely and behave exactly as without Kokoro)
+    KOKORO_DEFAULT_VOICE Kokoro voice id selected by default (default: the server's own
+                          default_voice, else "af_heart")
 """
 import glob
 import json
@@ -22,7 +27,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import gradio as gr
 import yaml
@@ -79,6 +84,75 @@ def _http_error_detail(error: urllib.error.HTTPError) -> str:
         return json.loads(error.read()).get("detail", str(error))
     except Exception:
         return str(error)
+
+
+# ---- Kokoro (second engine) ----
+
+KOKORO_ENGLISH_PREFIXES = ("af_", "am_", "bf_", "bm_")  # American/British female/male
+KOKORO_TIMEOUT_SECONDS = 5
+_KOKORO_PREFIX_LABELS = {
+    "af": "American female", "am": "American male",
+    "bf": "British female", "bm": "British male",
+}
+_KOKORO_GRADE_LETTERS = "ABCDF"
+
+
+def kokoro_base_url() -> str:
+    """Kokoro's OpenAI-compatible endpoint, or "" when it isn't configured."""
+    return os.environ.get("KOKORO_BASE_URL", "").rstrip("/")
+
+
+def _kokoro_grade_sort_key(grade: Optional[str]) -> tuple:
+    """Sort key for a Kokoro voice grade: best (A+) first, ungraded last."""
+    if not grade:
+        return (len(_KOKORO_GRADE_LETTERS), 0)
+    letter, modifier = grade[0].upper(), grade[1:]
+    letter_rank = (_KOKORO_GRADE_LETTERS.index(letter) if letter in _KOKORO_GRADE_LETTERS
+                  else len(_KOKORO_GRADE_LETTERS))
+    modifier_rank = {"+": 0, "": 1, "-": 2}.get(modifier, 1)
+    return (letter_rank, modifier_rank)
+
+
+def _kokoro_voice_label(voice_id: str, grade: Optional[str]) -> str:
+    """Readable label for a Kokoro voice id, e.g. "af_heart" + grade "A" -> "Heart · American female · A"."""
+    prefix, _, rest = voice_id.partition("_")
+    name = rest.replace("_", " ").title() or voice_id
+    parts = [name, _KOKORO_PREFIX_LABELS.get(prefix, prefix)]
+    if grade:
+        parts.append(grade)
+    return " · ".join(parts)
+
+
+def kokoro_voices_and_default() -> Tuple[list, Optional[str]]:
+    """(label, id) choices for Kokoro's English voices (af_/am_/bf_/bm_ prefixes only; the
+    server's other prefixes are other languages), best grade first, plus the voice to preselect:
+    KOKORO_DEFAULT_VOICE when it's offered, else the server's own default_voice, else "af_heart".
+
+    One request to Kokoro. If it can't be reached, warns and falls back to offering just the
+    configured (or built-in) default, so the dropdown is never left empty.
+    """
+    configured_default = os.environ.get("KOKORO_DEFAULT_VOICE", "").strip()
+    fallback = configured_default or "af_heart"
+    try:
+        with urllib.request.urlopen(f"{kokoro_base_url()}/audio/voices", timeout=KOKORO_TIMEOUT_SECONDS) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        gr.Warning(f"Could not reach Kokoro for its voice list: {e}")
+        return [(fallback, fallback)], fallback
+    voices = data.get("voices", []) if isinstance(data, dict) else []
+    english = [v for v in voices if isinstance(v, dict) and isinstance(v.get("id"), str)
+              and v["id"].startswith(KOKORO_ENGLISH_PREFIXES)]
+    english.sort(key=lambda v: (_kokoro_grade_sort_key(v.get("overall_grade")), v["id"]))
+    choices = [(_kokoro_voice_label(v["id"], v.get("overall_grade")), v["id"]) for v in english]
+    values = [value for _, value in choices]
+    server_default = data.get("default_voice") if isinstance(data, dict) else None
+    if configured_default in values:
+        default = configured_default
+    elif server_default in values:
+        default = server_default
+    else:
+        default = values[0] if values else fallback
+    return choices, default
 
 
 # ---- Delivery settings (Chatterbox generation defaults) ----
@@ -200,6 +274,48 @@ def preview_voice(voice: str, phrase: str, exaggeration: float, cfg_weight: floa
     return path
 
 
+def _kokoro_sample(voice: str, speed: float) -> str:
+    """One-off Kokoro sample of PREVIEW_PHRASE; mirrors preview_voice's temp-file handling (F-30)."""
+    global _current_preview_path
+    base_url = kokoro_base_url()
+    if not base_url:
+        raise gr.Error("Kokoro is not configured (KOKORO_BASE_URL).")
+    payload = {"model": "kokoro", "voice": voice, "input": PREVIEW_PHRASE,
+              "response_format": "mp3", "speed": float(speed), "instructions": None}
+    request = urllib.request.Request(
+        f"{base_url}/audio/speech", data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=600) as response:
+            audio = response.read()
+    except urllib.error.HTTPError as e:
+        raise gr.Error(f"Kokoro could not make the sample: {_http_error_detail(e)}")
+    except Exception as e:
+        raise gr.Error(f"Could not reach Kokoro: {e}")
+    handle, path = tempfile.mkstemp(prefix="voice_preview_", suffix=".mp3")
+    with os.fdopen(handle, "wb") as f:
+        f.write(audio)
+    _delete_if_exists(_current_preview_path)
+    _current_preview_path = path
+    return path
+
+
+def sample_voice(engine: str, voice: str, speed: float) -> str:
+    """Speak PREVIEW_PHRASE with the Make tab's selected engine, voice and speed, so a voice can
+    be auditioned before queuing a book. Chatterbox goes through preview_voice with its saved
+    delivery settings (i.e. what a book will actually sound like); Kokoro has no delivery sliders
+    to save, so it is asked directly.
+    """
+    if not voice:
+        raise gr.Error("Pick a voice first.")
+    if engine == "kokoro":
+        return _kokoro_sample(voice, speed)
+    settings = read_saved_settings()
+    return preview_voice(voice, PREVIEW_PHRASE, settings["exaggeration"], settings["cfg_weight"],
+                         settings["temperature"], speed)
+
+
 # ---- Adding voices ----
 
 def _audio_seconds(path: str) -> float:
@@ -217,8 +333,15 @@ def voice_name_from_sample(sample: Optional[str]) -> str:
     return safe_folder_name(os.path.splitext(os.path.basename(sample))[0])
 
 
-def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bool) -> tuple:
-    """Save an uploaded sample into the Chatterbox voices folder as <name>.wav."""
+def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bool,
+             engine: str = "chatterbox") -> tuple:
+    """Save an uploaded sample into the Chatterbox voices folder as <name>.wav.
+
+    engine gates the Make-tab dropdown update only: adding a voice always affects the Chatterbox
+    voices folder and the Voice lab regardless of which engine the Make tab currently has
+    selected, but a Chatterbox file name must never land in the Make-tab dropdown while Kokoro is
+    selected there.
+    """
     voices_dir = os.environ.get("TTS_VOICES_DIR")
     if not voices_dir or not os.path.isdir(voices_dir):
         raise gr.Error("The Chatterbox voices folder is not mounted (TTS_VOICES_DIR).")
@@ -251,7 +374,89 @@ def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bo
     if seconds < SHORT_SAMPLE_SECONDS:
         message += " It's short: Chatterbox sounds steadier with 10-15 s of speech."
     choices = openai_voice_choices()
-    return message, gr.update(choices=choices, value=file_name), gr.update(choices=choices)
+    make_tab_update = gr.update(choices=choices, value=file_name) if engine == "chatterbox" else gr.update()
+    return (message, gr.update(choices=choices, value=file_name), make_tab_update,
+            gr.update(choices=own_voice_choices()))
+
+
+# ---- Deleting voices ----
+
+BUILT_IN_VOICES = frozenset({  # Chatterbox's 28 shipped voices (chatterbox/voices/); never deletable
+    "Abigail.wav", "Adrian.wav", "Alexander.wav", "Alice.wav", "Austin.wav", "Axel.wav",
+    "Connor.wav", "Cora.wav", "Elena.wav", "Eli.wav", "Emily.wav", "Everett.wav",
+    "Gabriel.wav", "Gianna.wav", "Henry.wav", "Ian.wav", "Jade.wav", "Jeremiah.wav",
+    "Jordan.wav", "Julian.wav", "Layla.wav", "Leonardo.wav", "Michael.wav", "Miles.wav",
+    "Olivia.wav", "Ryan.wav", "Taylor.wav", "Thomas.wav",
+})
+
+
+def own_voice_names() -> List[str]:
+    """Voice files sitting directly in TTS_VOICES_DIR that are not a Chatterbox built-in."""
+    voices_dir = os.environ.get("TTS_VOICES_DIR")
+    if not voices_dir or not os.path.isdir(voices_dir):
+        return []
+    return sorted(
+        (name for name in os.listdir(voices_dir)
+         if name.lower().endswith(web_ui.VOICE_FILE_EXTENSIONS) and name not in BUILT_IN_VOICES
+         and os.path.isfile(os.path.join(voices_dir, name))),
+        key=str.lower,
+    )
+
+
+def own_voice_choices() -> list:
+    """(label, file name) pairs for voices this app added -- excludes Chatterbox's built-ins."""
+    return [(os.path.splitext(name)[0], name) for name in own_voice_names()]
+
+
+def _is_safe_voice_filename(name: str) -> bool:
+    """True only for a plain file name: no path separators, no traversal."""
+    return (bool(name) and name not in (".", "..") and "/" not in name and "\\" not in name
+           and os.path.basename(name) == name)
+
+
+def _voice_in_use(name: str, jobs: List[dict]) -> Optional[str]:
+    """Title of the queued/running Chatterbox job still using this voice file, if any."""
+    for job in jobs:
+        if job.get("status") not in (QUEUED, RUNNING):
+            continue
+        settings = job.get("settings") or {}
+        if settings.get("engine", "chatterbox") == "chatterbox" and settings.get("voice") == name:
+            return job.get("title") or "a queued book"
+    return None
+
+
+def delete_own_voice(name: Optional[str], jobs: List[dict]) -> str:
+    """Delete one of the owner's own voice files from TTS_VOICES_DIR.
+
+    Refuses (gr.Error, file left untouched) a built-in voice, a name that isn't a plain existing
+    file directly inside TTS_VOICES_DIR, or a voice a queued/running Chatterbox job still uses.
+    """
+    voices_dir = os.environ.get("TTS_VOICES_DIR")
+    if not voices_dir or not os.path.isdir(voices_dir):
+        raise gr.Error("The Chatterbox voices folder is not mounted (TTS_VOICES_DIR).")
+    if not name:
+        raise gr.Error("Pick a voice to delete.")
+    if name in BUILT_IN_VOICES:
+        raise gr.Error(f"'{name}' is a built-in Chatterbox voice and can't be deleted.")
+    if not _is_safe_voice_filename(name):
+        raise gr.Error("That is not a valid voice file name.")
+    path = os.path.join(voices_dir, name)
+    if not _within_root(path, voices_dir) or not os.path.isfile(path):
+        raise gr.Error(f"'{name}' does not exist in the voices folder.")
+    book = _voice_in_use(name, jobs)
+    if book:
+        raise gr.Error(f"'{name}' is used by '{book}' in the queue. Remove or finish that book first.")
+    os.remove(path)
+    return f"Deleted **{os.path.splitext(name)[0]}**."
+
+
+def _voice_dropdown_after_delete(choices: list, current_value: Optional[str], deleted_name: str,
+                                 default_value: Optional[str]) -> dict:
+    """Refresh a voice dropdown's choices after a deletion; reselect the default only if the
+    deleted voice was the one showing, otherwise leave the caller's current selection alone."""
+    if current_value == deleted_name:
+        return gr.update(choices=choices, value=default_value)
+    return gr.update(choices=choices)
 
 
 # ---- Audiobook generation ----
@@ -260,10 +465,18 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
                  sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
                  output_text: bool, title_mode: str, newline_mode: str, remove_endnotes: bool,
                  remove_reference_numbers: bool, search_and_replace_file, log_level: str,
-                 paced_unit_mode: str = "sentence") -> GeneralConfig:
-    """GeneralConfig for the OpenAI provider pointed at Chatterbox (pauses in seconds).
+                 paced_unit_mode: str = "sentence", engine: str = "chatterbox") -> GeneralConfig:
+    """GeneralConfig for the OpenAI provider pointed at Chatterbox or Kokoro (pauses in seconds).
 
-    paced_unit_mode defaults to "sentence" so books queued before the option existed still build."""
+    paced_unit_mode and engine both default so books queued before either option existed still
+    build (as Chatterbox, sentence units). Kokoro always narrates in sentence units regardless of
+    paced_unit_mode: paragraph mode's gap detector was tuned on Chatterbox audio and saves nothing
+    on a server this fast (see the Narration units info text).
+
+    Raises ValueError if engine is "kokoro" but KOKORO_BASE_URL isn't configured; queue_settings
+    already refuses that earlier with a friendlier gr.Error at enqueue time, so this only guards a
+    job that was queued while Kokoro was configured and lost that configuration before its turn.
+    """
     config = GeneralConfig(None)
     config.input_file = input_file.name if hasattr(input_file, "name") else input_file
     config.output_folder = output_dir
@@ -271,7 +484,7 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     config.output_text = output_text
     config.skip_existing = skip_existing
     config.log = log_level
-    config.worker_count = 1  # Chatterbox handles one request at a time
+    config.worker_count = 1  # Chatterbox/Kokoro handle one request at a time from this app
     config.no_prompt = True
     config.title_mode = title_mode
     config.newline_mode = newline_mode
@@ -286,13 +499,24 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     config.language = "en"
     config.output_format = "mp3"
     config.voice_name = voice
-    config.model_name = "chatterbox"
     config.instructions = None
     config.speed = float(speed)
     config.sentence_pause_ms = int(round(float(sentence_pause) * 1000))
     config.paragraph_pause_ms = int(round(float(paragraph_pause) * 1000))
     config.output_m4b = bool(output_m4b)
-    config.paced_unit_mode = paced_unit_mode or "sentence"
+
+    engine = engine or "chatterbox"
+    if engine == "kokoro":
+        base_url = kokoro_base_url()
+        if not base_url:
+            raise ValueError("KOKORO_BASE_URL is not configured.")
+        config.model_name = "kokoro"
+        config.openai_base_url = base_url
+        config.paced_unit_mode = "sentence"
+    else:
+        config.model_name = "chatterbox"
+        config.openai_base_url = None
+        config.paced_unit_mode = paced_unit_mode or "sentence"
     return config
 
 
@@ -380,7 +604,8 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
                    sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
                    output_text: bool, title_mode: str, newline_mode: str, remove_endnotes: bool,
                    remove_reference_numbers: bool, search_and_replace_file, log_level: str,
-                   paced_unit_mode: str = "sentence", active_jobs: Optional[List[dict]] = None) -> dict:
+                   paced_unit_mode: str = "sentence", engine: str = "chatterbox",
+                   active_jobs: Optional[List[dict]] = None) -> dict:
     """Validate the form and turn it into build_config keyword arguments for a queued book."""
     if library_book:
         if not os.path.isfile(library_book):
@@ -395,6 +620,10 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         raise gr.Error("Tick at least one chapter.")
     if not voice:
         raise gr.Error("Pick a voice.")
+    engine = engine or "chatterbox"
+    if engine == "kokoro" and not kokoro_base_url():
+        raise gr.Error("Kokoro is not configured (set KOKORO_BASE_URL first), or switch the Engine "
+                       "back to Chatterbox.")
     output_dir = (output_dir or "").strip()
     if not output_dir:
         raise gr.Error("Set an output folder.")
@@ -422,14 +651,16 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         "remove_reference_numbers": bool(remove_reference_numbers),
         "search_and_replace_file": queued_replace_file,
         "log_level": log_level, "paced_unit_mode": paced_unit_mode or "sentence",
+        "engine": engine,
     }
 
 
-def generation_estimate(table, stats: list) -> float:
-    """Seconds Chatterbox needs for the ticked chapters."""
+def generation_estimate(table, stats: list, engine: str = "chatterbox") -> float:
+    """Seconds the engine needs for the ticked chapters."""
     stats = stats or []
     chosen = [stats[n - 1] for n in selected_chapter_numbers(table) if 0 < n <= len(stats)]
-    return sum(s[0] for s in chosen) / CHARS_PER_AUDIO_SECOND / GENERATION_SPEED * PACED_GENERATION_OVERHEAD
+    chars_per_second, generation_speed, paced_overhead = _engine_estimate_constants(engine)
+    return sum(s[0] for s in chosen) / chars_per_second / generation_speed * paced_overhead
 
 
 def _status_label(job: dict) -> str:
@@ -448,10 +679,18 @@ def _status_label(job: dict) -> str:
 QUEUE_COLUMNS = ["#", "Book", "Voice", "Chapters", "Status", "Generating time"]
 
 
+def _voice_column(job: dict) -> str:
+    """Voice column text: the bare (extension-stripped) file name for Chatterbox, prefixed with
+    the engine name for Kokoro (its ids carry no file extension to strip)."""
+    if job.get("settings", {}).get("engine", "chatterbox") == "kokoro":
+        return f"Kokoro · {job['voice']}"
+    return os.path.splitext(job["voice"])[0]
+
+
 def queue_view(queue: JobQueue) -> tuple:
     """(table rows, job ids in row order, one-line queue status)."""
     jobs = queue.jobs()
-    rows = [[n, job["title"], os.path.splitext(job["voice"])[0], job["chapters"], _status_label(job),
+    rows = [[n, job["title"], _voice_column(job), job["chapters"], _status_label(job),
              _duration(job["estimate_seconds"])] for n, job in enumerate(jobs, start=1)]
     ids = [job["id"] for job in jobs]
     left = 0.0
@@ -480,6 +719,19 @@ def queue_view(queue: JobQueue) -> tuple:
 CHARS_PER_AUDIO_SECOND = 20.2
 GENERATION_SPEED = 1.8
 PACED_GENERATION_OVERHEAD = 1.14
+
+# Measured live 2026-09-28 against Kokoro's af_heart voice through the real paced path
+# (paced_units + OpenAITTSProvider, sentence pause 0.35s / paragraph pause 0.9s, speed 1.0): two
+# invented paragraphs (6 sentences, 355 characters of speech) sent as 6 real paced requests took
+# 1.22s wall time for 20.95s of audio (ffprobe); the same text as one undivided request took
+# 0.41s for 21.72s of audio -- 52.9x real time, close to the ~0.09s-per-5s figure from the
+# earlier live check. 355 chars / 20.95s = 16.9 chars/s. The paced run took 3.07x the wall time
+# the bulk rate implies for that much audio: Kokoro generates so fast that many small
+# sentence-sized requests' fixed per-request overhead dominates far more than it does for
+# Chatterbox. Single small sample, one voice; not re-validated across books or voices.
+KOKORO_CHARS_PER_AUDIO_SECOND = 16.9
+KOKORO_GENERATION_SPEED = 52.9
+KOKORO_PACED_GENERATION_OVERHEAD = 3.07
 CHAPTER_COLUMNS = ["#", "Include", "Chapter", "Starts with", "Listening"]
 _SENTENCE_END = re.compile(r"[.!?\u2026]+[\"'\u201d\u2019)\]]*(?=\s|$)")
 
@@ -504,12 +756,20 @@ def chapter_stats(text: str) -> list:
     return [len(plain), max(1, len(_SENTENCE_END.findall(plain))), max(1, len(paragraphs))]
 
 
-def listening_seconds(stats: list, speed, sentence_pause, paragraph_pause) -> float:
+def _engine_estimate_constants(engine: str) -> Tuple[float, float, float]:
+    """(chars_per_audio_second, generation_speed, paced_overhead) for the given engine."""
+    if engine == "kokoro":
+        return KOKORO_CHARS_PER_AUDIO_SECOND, KOKORO_GENERATION_SPEED, KOKORO_PACED_GENERATION_OVERHEAD
+    return CHARS_PER_AUDIO_SECOND, GENERATION_SPEED, PACED_GENERATION_OVERHEAD
+
+
+def listening_seconds(stats: list, speed, sentence_pause, paragraph_pause, engine: str = "chatterbox") -> float:
     """Speech plus the inserted pauses (both shrink with speed)."""
     characters, sentences, paragraphs = stats
+    chars_per_second, _, _ = _engine_estimate_constants(engine)
     pauses = (max(0, sentences - paragraphs) * float(sentence_pause or 0)
               + max(0, paragraphs - 1) * float(paragraph_pause or 0))
-    return (characters / CHARS_PER_AUDIO_SECOND + pauses) / float(speed or 1.0)
+    return (characters / chars_per_second + pauses) / float(speed or 1.0)
 
 
 def book_chapters(book: str, title_mode: str, newline_mode: str, remove_endnotes: bool,
@@ -527,7 +787,8 @@ def book_chapters(book: str, title_mode: str, newline_mode: str, remove_endnotes
     return [(title, text) for title, text in chapters if text.strip()]  # same filter as the generator
 
 
-def chapter_summary(table, stats: list, speed, sentence_pause, paragraph_pause) -> str:
+def chapter_summary(table, stats: list, speed, sentence_pause, paragraph_pause,
+                    engine: str = "chatterbox") -> str:
     """One-line summary of the ticked chapters."""
     rows = _table_rows(table)
     if not rows:
@@ -537,17 +798,18 @@ def chapter_summary(table, stats: list, speed, sentence_pause, paragraph_pause) 
         return "⚠️ No chapters ticked."
     stats = stats or []
     chosen = [stats[n - 1] for n in picked if 0 < n <= len(stats)]
-    audio_seconds = sum(listening_seconds(s, speed, sentence_pause, paragraph_pause) for s in chosen)
-    speech_seconds = sum(s[0] for s in chosen) / CHARS_PER_AUDIO_SECOND
+    audio_seconds = sum(listening_seconds(s, speed, sentence_pause, paragraph_pause, engine) for s in chosen)
+    chars_per_second, generation_speed, paced_overhead = _engine_estimate_constants(engine)
+    speech_seconds = sum(s[0] for s in chosen) / chars_per_second
     skipped = len(rows) - len(picked)
     unticked = f" ({skipped} unticked)" if skipped else ""
     return (f"**{len(picked)} of {len(rows)} chapters** ticked{unticked} · "
             f"**{_about(audio_seconds)}** of audio at {float(speed or 1.0):g}× · "
-            f"{_about(speech_seconds / GENERATION_SPEED * PACED_GENERATION_OVERHEAD)} to generate. "
+            f"{_about(speech_seconds / generation_speed * paced_overhead)} to generate. "
             f"They'll be numbered 1–{len(picked)} in the finished book.")
 
 
-def chapter_overview(library_book, input_file, speed, sentence_pause, paragraph_pause, title_mode: str,
+def chapter_overview(library_book, input_file, speed, sentence_pause, paragraph_pause, engine, title_mode: str,
                      newline_mode: str, remove_endnotes: bool, remove_reference_numbers: bool,
                      search_and_replace_file) -> tuple:
     """Chapter table with story chapters pre-ticked and front/back matter unticked."""
@@ -572,20 +834,21 @@ def chapter_overview(library_book, input_file, speed, sentence_pause, paragraph_
     include = preselect_chapters(plain)
     stats = [chapter_stats(text) for _, text in chapters]
     rows = [[number, ticked, title.replace("_", " "), text[:70],
-             _duration(listening_seconds(stat, speed, sentence_pause, paragraph_pause))]
+             _duration(listening_seconds(stat, speed, sentence_pause, paragraph_pause, engine))]
             for number, ((title, text), ticked, stat) in enumerate(zip(plain, include, stats), start=1)]
     return (gr.update(value=rows, visible=True), stats,
-            chapter_summary(rows, stats, speed, sentence_pause, paragraph_pause))
+            chapter_summary(rows, stats, speed, sentence_pause, paragraph_pause, engine))
 
 
-def retime_chapters(table, stats: list, speed, sentence_pause, paragraph_pause) -> dict:
-    """Speed or pauses changed: update the Listening column, keeping the ticks."""
+def retime_chapters(table, stats: list, speed, sentence_pause, paragraph_pause,
+                    engine: str = "chatterbox") -> dict:
+    """Speed, pauses or engine changed: update the Listening column, keeping the ticks."""
     rows = _table_rows(table)
     stats = stats or []
     for row in rows:
         number = int(row[0])
         if 0 < number <= len(stats):
-            row[4] = _duration(listening_seconds(stats[number - 1], speed, sentence_pause, paragraph_pause))
+            row[4] = _duration(listening_seconds(stats[number - 1], speed, sentence_pause, paragraph_pause, engine))
     return gr.update(value=rows) if rows else gr.update()
 
 
@@ -616,9 +879,31 @@ def refresh_library() -> dict:
 
 
 def refresh_voices() -> tuple:
+    """Page-load handler: re-list Chatterbox voices for the Make tab, the Voice lab and the
+    delete dropdown so newly added or removed voice files appear without a restart. Chatterbox
+    is always the starting engine on a fresh page load, so this only needs its own voice list."""
     choices = openai_voice_choices()
-    return (gr.update(choices=choices, value=default_openai_voice(choices)),
-            gr.update(choices=choices, value=default_openai_voice(choices)))
+    default = default_openai_voice(choices)
+    return (gr.update(choices=choices, value=default), gr.update(choices=choices, value=default),
+            gr.update(choices=own_voice_choices()))
+
+
+def engine_changed(engine: str) -> dict:
+    """Switching the Make tab's engine swaps the Voice dropdown to that engine's own choices and
+    default (Chatterbox's file list, or Kokoro's English voices from its live API)."""
+    if engine == "kokoro":
+        choices, default = kokoro_voices_and_default()
+    else:
+        choices = openai_voice_choices()
+        default = default_openai_voice(choices)
+    return gr.update(choices=choices, value=default)
+
+
+def _sync_if_chatterbox(value: str, engine: str) -> dict:
+    """Pass a voice value through to the paired dropdown only while the Make tab's engine is
+    Chatterbox: a Kokoro id must never land in the (Chatterbox-only) Voice lab, and a Chatterbox
+    file name must never land in the Make-tab dropdown while Kokoro is selected there."""
+    return gr.update(value=value) if engine == "chatterbox" else gr.update()
 
 
 # ---- Layout ----
@@ -631,6 +916,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                          lambda: str(web_ui.webui_log_file.absolute()))
     choices = openai_voice_choices()
     default_voice = default_openai_voice(choices)
+    kokoro_configured = bool(kokoro_base_url())
 
     def refresh_queue() -> tuple:
         rows, ids, status = queue_view(queue)
@@ -640,10 +926,24 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         job_settings = queue_settings(library_book, input_file, chapter_table, *settings, active_jobs=queue.jobs())
         title = os.path.basename(job_settings["output_dir"].rstrip("/\\")) or "Book"
         position = queue.add(title, job_settings, len(job_settings["chapter_selection"]),
-                             generation_estimate(chapter_table, stats), job_settings["voice"])
+                             generation_estimate(chapter_table, stats, job_settings["engine"]),
+                             job_settings["voice"])
         queue.tick()
         gr.Info(f"Added '{title}' to the queue" + ("." if position <= 1 else f" (#{position} in line)."))
         return refresh_queue()
+
+    def delete_voice(name: Optional[str], current_lab_voice: str, current_voice: str, engine: str) -> tuple:
+        """Delete an own voice after the browser confirms (see the button's js=); None means the
+        owner cancelled the confirm, so nothing changes."""
+        if name is None:
+            return gr.update(), gr.update(), gr.update(), gr.update()
+        message = delete_own_voice(name, queue.jobs())
+        choices = openai_voice_choices()
+        default = default_openai_voice(choices)
+        lab_update = _voice_dropdown_after_delete(choices, current_lab_voice, name, default)
+        voice_update = (_voice_dropdown_after_delete(choices, current_voice, name, default)
+                        if engine == "chatterbox" else gr.update())
+        return message, lab_update, voice_update, gr.update(choices=own_voice_choices(), value=None)
 
     def select_job(ids: list, evt: gr.SelectData) -> tuple:
         row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
@@ -695,7 +995,16 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 with gr.Column():
                     output_dir = gr.Textbox(label="Output folder", value=timestamped_output_dir,
                                             info="Filled in from the book title; lands in the audiobook library.")
-                    voice = gr.Dropdown(choices, value=default_voice, label="Voice", allow_custom_value=True)
+                    with gr.Row(equal_height=True):
+                        engine = gr.Dropdown([("Chatterbox", "chatterbox"), ("Kokoro", "kokoro")],
+                                             value="chatterbox", label="Engine", visible=kokoro_configured,
+                                             scale=1)
+                        voice = gr.Dropdown(choices, value=default_voice, label="Voice",
+                                            allow_custom_value=True, scale=2)
+                        with gr.Column(scale=0, min_width=100):
+                            sample_button = gr.Button("▶ Sample", size="sm")
+                    sample_audio = gr.Audio(label="Sample", show_label=False, autoplay=True,
+                                            interactive=False)
                     speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed",
                                       info="1.0 recommended (other speeds are stretched after generation).")
             with gr.Row(equal_height=True):
@@ -729,7 +1038,9 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                      ("Whole paragraphs (about 8% faster, experimental)", "paragraph")],
                     value="sentence", label="Narration units",
                     info="Paragraphs send fewer, longer requests; the pauses inside a paragraph are placed "
-                         "at the gaps Chatterbox leaves between sentences.")
+                         "at the gaps Chatterbox leaves between sentences. Kokoro always narrates by "
+                         "sentence: its gap detector was tuned on Chatterbox audio, and it saves nothing "
+                         "on a server this fast.")
                 search_and_replace_file = gr.File(label="Search & replace file (optional, e.g. fix pronunciations)",
                                                   file_types=[".txt"], file_count="single")
             enqueue_button = gr.Button("➕ Add to queue", variant="primary")
@@ -785,12 +1096,19 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                     add_button = gr.Button("Add voice")
             add_status = gr.Markdown()
 
+            gr.Markdown("### Delete a voice")
+            with gr.Row(equal_height=True):
+                delete_voice_dropdown = gr.Dropdown(own_voice_choices(), value=None, label="Your voices",
+                                                    info="Chatterbox's built-in voices can't be deleted.")
+                delete_voice_button = gr.Button("Delete voice", variant="stop")
+            delete_voice_status = gr.Markdown()
+
         settings = [output_dir, voice, speed, sentence_pause, paragraph_pause, output_m4b, skip_existing,
                     output_text, title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
-                    search_and_replace_file, log_level, paced_unit_mode]
+                    search_and_replace_file, log_level, paced_unit_mode, engine]
         # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
-        # this re-runs the auto-selection. Ticks, speed, pauses and "Tick all" only touch the table.
-        timing = [speed, sentence_pause, paragraph_pause]
+        # this re-runs the auto-selection. Ticks, speed, pauses, engine and "Tick all" only touch the table.
+        timing = [speed, sentence_pause, paragraph_pause, engine]
         overview_inputs = [library_book, input_file, *timing, title_mode, newline_mode, remove_endnotes,
                            remove_reference_numbers, search_and_replace_file]
         overview_outputs = [chapter_table, chapter_stats_state, chapters_info]
@@ -826,17 +1144,26 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         chapter_table.change(chapter_summary, inputs=[chapter_table, chapter_stats_state, *timing],
                              outputs=chapters_info)
 
-        voice.input(lambda v: v, inputs=voice, outputs=lab_voice)
-        lab_voice.input(lambda v: v, inputs=lab_voice, outputs=voice)
+        engine.change(engine_changed, inputs=engine, outputs=voice)
+        voice.input(_sync_if_chatterbox, inputs=[voice, engine], outputs=lab_voice)
+        lab_voice.input(_sync_if_chatterbox, inputs=[lab_voice, engine], outputs=voice)
+        sample_button.click(sample_voice, inputs=[engine, voice, speed], outputs=sample_audio)
         play_button.click(preview_voice, inputs=[lab_voice, phrase, exaggeration, cfg_weight, temperature, speed],
                           outputs=preview_audio)
         save_button.click(save_settings, inputs=[exaggeration, cfg_weight, temperature], outputs=lab_status)
         reset_button.click(load_saved_settings, inputs=None, outputs=[exaggeration, cfg_weight, temperature])
         sample.change(voice_name_from_sample, inputs=sample, outputs=new_voice_name)
-        add_button.click(add_voice, inputs=[sample, new_voice_name, remove_pauses, replace],
-                         outputs=[add_status, lab_voice, voice])
+        add_button.click(add_voice, inputs=[sample, new_voice_name, remove_pauses, replace, engine],
+                         outputs=[add_status, lab_voice, voice, delete_voice_dropdown])
+        delete_voice_button.click(
+            delete_voice,
+            inputs=[delete_voice_dropdown, lab_voice, voice, engine],
+            outputs=[delete_voice_status, lab_voice, voice, delete_voice_dropdown],
+            js="(name, lab, mk, eng) => confirm(`Delete voice '${name}'? This can't be undone.`)"
+               " ? [name, lab, mk, eng] : [null, lab, mk, eng]",
+        )
 
-        ui.load(refresh_voices, inputs=None, outputs=[voice, lab_voice])
+        ui.load(refresh_voices, inputs=None, outputs=[voice, lab_voice, delete_voice_dropdown])
         ui.load(refresh_library, inputs=None, outputs=library_book)
         ui.load(load_saved_settings, inputs=None, outputs=[exaggeration, cfg_weight, temperature])
         ui.load(refresh_queue, inputs=None, outputs=queue_outputs)

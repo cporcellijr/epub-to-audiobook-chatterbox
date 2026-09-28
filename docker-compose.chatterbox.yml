@@ -76,6 +76,9 @@ services:
       - CHATTERBOX_CONFIG=/chatterbox/config.yaml
       # Searchable "Book" picker lists this library.
       - EBOOK_LIBRARY_DIR=/library
+      # Optional second engine. Leave unset (the default) to hide the Engine choice entirely.
+      - KOKORO_BASE_URL=${KOKORO_BASE_URL:-}
+      - KOKORO_DEFAULT_VOICE=${KOKORO_DEFAULT_VOICE:-}
     volumes:
       - ${APP_DATA:?set APP_DATA in .env}:/app                            # queue, library index, logs
       - ${AUDIOBOOK_LIBRARY:?set AUDIOBOOK_LIBRARY in .env}:/app/audiobook_output  # finished books

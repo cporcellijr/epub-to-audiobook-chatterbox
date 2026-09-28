@@ -23,10 +23,16 @@ The repo holds the whole stack:
 - **Chapter checkboxes** with automatic selection: story chapters are ticked; title pages, copyright,
   contents, dedications, acknowledgements, "about the author", newsletter pages and similar are unticked.
   Shows each chapter's opening words and estimated listening time. Ticked chapters are numbered 1…n.
-- **Voice dropdown** filled from Chatterbox's voices folder.
+- **Voice dropdown** filled from Chatterbox's voices folder. An optional **Engine** choice next to it
+  switches between Chatterbox and [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) (only
+  shown when `KOKORO_BASE_URL` is configured); the Voice dropdown swaps to Kokoro's English voices,
+  best-graded first. A **Sample** button next to the Voice dropdown speaks a short fixed phrase with
+  the selected engine, voice and speed so a voice can be auditioned before queuing a book.
 - **Voice lab**: play a phrase with any voice, tune Chatterbox's exaggeration / CFG weight / temperature
-  and save them as the settings books use, and add new voices (long pauses in the sample are removed,
-  because Chatterbox copies a reference clip's pauses).
+  and save them as the settings books use, add new voices (long pauses in the sample are removed,
+  because Chatterbox copies a reference clip's pauses), and delete a voice you added (Chatterbox's
+  built-in voices can't be deleted; a browser confirmation is required, and a voice a queued or
+  running book still uses is refused).
 - **Queue**: add books with their own voice, chapters and pauses; they run one at a time in order.
   Pause, resume, stop, remove, retry. The queue survives restarts and resumes an interrupted book.
 
@@ -89,6 +95,8 @@ Settings the app reads (the compose file sets them):
 | `CHATTERBOX_CONFIG` | Chatterbox's `config.yaml` (read-only), for the Voice lab sliders |
 | `CHATTERBOX_URL` | Chatterbox root URL, if it isn't `OPENAI_BASE_URL` minus `/v1` |
 | `EBOOK_LIBRARY_DIR` | Ebook library for the book picker |
+| `KOKORO_BASE_URL` | Optional second engine's OpenAI endpoint, e.g. `http://kokoro:8880/v1`. Leave unset to hide the Engine choice entirely |
+| `KOKORO_DEFAULT_VOICE` | Kokoro voice id selected by default (default: the server's own `default_voice`, else `af_heart`) |
 
 Books are written to `audiobook_output/<title>/` inside the container; mount your audiobook library there.
 

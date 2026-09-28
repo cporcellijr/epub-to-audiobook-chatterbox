@@ -14,7 +14,7 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | [Chatterbox-TTS-Server](https://github.com/devnen/Chatterbox-TTS-Server) (MIT), container `chatterbox`, port 8004 | Speech engine | "Original" English model, BF16, RTX 4070 (12 GB), ~4.4 GiB VRAM. Built from `chatterbox/`; local patches in section 2.3. |
 | This app, container `epub-to-audiobook`, port 7860 | EPUB → audiobook | Local build of this repo; talks to Chatterbox's OpenAI-compatible `/v1/audio/speech`. |
 | BookOrbit (self-hosted library and reader) | Plays the finished books; also has live read-aloud TTS | Separate project; see section 4. |
-| Kokoro-FastAPI, container `kokoro` (stopped) | Alternative engine | ~50× real time vs Chatterbox's ~1.8×, but no voice cloning and flatter delivery. Not wired into this app yet. |
+| Kokoro-FastAPI, container `kokoro`, port 8880 | Optional second engine | v0.9.0, OpenAI-compatible. Measured 52.9x real time vs Chatterbox's ~1.8-1.6x, but no voice cloning and flatter delivery. Wired into this app since 2026-09-28 (opt-in via `KOKORO_BASE_URL`; section 11). |
 
 How a book flows through this app:
 
@@ -142,7 +142,7 @@ non-story after one fix (a novel stored as a single section that begins with its
 | Same passage, A/B | Before: 83 s audio, 0 pauses ≥ 0.6 s. After: 98 s, 14 pauses ≥ 0.6 s |
 | Very short inputs ("Yes.", "Hmm?") | 0.36–1.32 s of audio; no runaway generations |
 | Library index | 1,517 EPUBs; first build ~13 s; refresh ~5 s; parsing one book 0.04–0.19 s |
-| Tests | 241 passing, plus 19 for `chatterbox/` (135 before the review fixes; upstream baseline: 28 tests, 2 erroring on a mock that closed stdout) |
+| Tests | 293 passing (241 before Kokoro + voice deletion, section 11), plus 19 for `chatterbox/` (135 before the review fixes; upstream baseline: 28 tests, 2 erroring on a mock that closed stdout) |
 
 ## 7. Known limitations and open questions
 
@@ -223,3 +223,63 @@ and it was off by up to 8% per chapter: chapter markers drifted, and ffmpeg squa
 audio packets to zero length. Chapter lengths are now summed from the packets and written into the
 concat list. The F-06 test used a pure tone, whose constant bitrate hides the problem; the new test
 uses a chapter that starts loud and ends quiet.
+
+## 11. Kokoro engine and voice deletion (2026-09-28)
+
+**Kokoro as a second engine.** Opt-in via `KOKORO_BASE_URL` (compose passes it through as
+`${KOKORO_BASE_URL:-}`); when unset the Make tab shows no Engine choice and everything behaves
+exactly as before. When set, an Engine dropdown next to Voice switches between Chatterbox and
+Kokoro; the Voice dropdown swaps to Kokoro's English voices (`af_`/`am_`/`bf_`/`bm_` prefixes;
+other prefixes are other languages and are excluded), labelled e.g. "Heart · American female · A",
+best grade first, from its live `/v1/audio/voices`, falling back to just the configured (or
+`af_heart`) default with a warning if Kokoro can't be reached. A **Sample** button next to Voice
+auditions the selected engine/voice/speed with a fixed phrase; for Chatterbox it goes through the
+same saved delivery settings a real book uses. Kokoro always narrates by sentence (never
+paragraph mode): its gap detector was tuned on Chatterbox audio and buys nothing on a server this
+fast (below). The chapter table, chapter summary and queue estimate all follow the selected
+engine. Queue jobs persist `"engine"`; a job queued before this change has no such key and builds
+as Chatterbox. `GeneralConfig` gained `openai_base_url` (`None` = today's `OPENAI_BASE_URL`
+behaviour); `OpenAITTSProvider` now passes it to the `OpenAI` client explicitly, since a container
+can have both `OPENAI_BASE_URL` (Chatterbox) and `KOKORO_BASE_URL` set at once and the ambient env
+var must not win for a Kokoro-selected book. Voice-lab/Make-tab syncing and `add_voice`'s
+Make-tab update are now engine-gated, so a Kokoro id can never land in the (Chatterbox-only)
+Voice lab and a Chatterbox file name can never land in the Make-tab dropdown while Kokoro is
+selected.
+
+**pydub vs. Kokoro's streaming WAV header (verified, no workaround needed).** Kokoro's
+`response_format: "wav"` sets the RIFF and data chunk sizes to the streaming placeholder
+0xFFFFFFFF; Python's stdlib `wave` module would misreport the length from that (it trusts the
+header literally). Checked with 6 real Kokoro WAV responses against `ffprobe` on the same bytes:
+`AudioSegment.from_file(io.BytesIO(content), format="wav")` (the exact call the paced path
+already uses) matched `ffprobe`'s duration to within 0.5 ms every time -- pydub does not take the
+naive stdlib-`wave` fast path here, so the existing decode line needed no change for Kokoro.
+
+**Kokoro estimate constants**, measured live 2026-09-28 against `af_heart` through the real paced
+path (`paced_units` + `OpenAITTSProvider`, sentence pause 0.35s / paragraph pause 0.9s, speed
+1.0), the same method as Chatterbox's own numbers: two invented paragraphs (6 sentences, 355
+characters of speech) sent as 6 real paced requests took 1.22s wall time for 20.95s of audio
+(`ffprobe`); the same text as one undivided request took 0.41s for 21.72s of audio -- 52.9x real
+time, close to the ~0.09s-per-5s figure from the earlier live check. 355 / 20.95 = 16.9
+characters/s (Chatterbox: 20.2). The paced run took 3.07x the wall time the bulk rate implies for
+that much audio: Kokoro generates so fast that the fixed per-request overhead of many small
+sentence requests dominates far more than it does for Chatterbox (14%), which is exactly why it
+always narrates by sentence rather than adding paragraph mode's complexity for a saving that
+would be swamped by that overhead anyway. Single small sample, one voice; not re-validated across
+books or voices. `KOKORO_CHARS_PER_AUDIO_SECOND = 16.9`, `KOKORO_GENERATION_SPEED = 52.9`,
+`KOKORO_PACED_GENERATION_OVERHEAD = 3.07` (`ui/chatterbox_ui.py`).
+
+**Voice deletion (Voice lab).** A new "Delete a voice" section: a dropdown of the owner's own
+voices (`.wav`/`.mp3` files directly in `TTS_VOICES_DIR` that aren't one of Chatterbox's 28
+built-in voices -- `BUILT_IN_VOICES`, checked by a test against `chatterbox/voices/`), a "Delete
+voice" button and a status line. The button's `js=` runs a browser `confirm()` first; cancelling
+returns `null`, which the Python handler treats as a no-op. Refused (file untouched): a built-in
+voice, a name that isn't a plain existing file directly inside `TTS_VOICES_DIR` (no path
+separators or traversal), or a voice a queued/running Chatterbox job still uses (names the book).
+After a successful delete, the Voice lab dropdown, the delete dropdown and the Make-tab dropdown
+(only while Chatterbox is selected there) are refreshed, reselecting the default only if the
+deleted voice was the one showing. Adding a voice also refreshes the delete dropdown now, and so
+does page load.
+
+Live-verified against the real `kokoro` container over `blackcat-net` (measurement + one smoke
+run through the production `build_config` -> `get_tts_provider` -> `text_to_speech` path): 775
+characters sent in total. Tests: 293 passing (was 241; +52), plus 19 for `chatterbox/` (unchanged).

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import gradio as gr
 
 from audiobook_generator.ui import chatterbox_ui, web_ui
-from audiobook_generator.ui.job_queue import QUEUED
+from audiobook_generator.ui.job_queue import DONE, QUEUED, RUNNING
 
 
 def _fake_response(body: bytes = b"") -> MagicMock:
@@ -196,7 +196,7 @@ class TestAddVoice(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_adds_wav_with_pauses_removed(self):
-        message, lab_update, _ = chatterbox_ui.add_voice(self.sample, "Narrator: One", True, False)
+        message, lab_update, _, _ = chatterbox_ui.add_voice(self.sample, "Narrator: One", True, False)
         saved = os.path.join(self.voices, "Narrator One.wav")
         self.assertTrue(os.path.isfile(saved))
         self.assertLess(chatterbox_ui._audio_seconds(saved), 3.0)
@@ -219,7 +219,7 @@ class TestAddVoice(unittest.TestCase):
         chatterbox_ui.add_voice(self.sample, "Dup", True, True)
 
     def test_short_sample_warns(self):
-        message, _, _ = chatterbox_ui.add_voice(self.sample, "Short", True, False)
+        message, _, _, _ = chatterbox_ui.add_voice(self.sample, "Short", True, False)
         self.assertIn("short", message)
 
 
@@ -477,7 +477,7 @@ class TestChapterList(unittest.TestCase):
 
     def test_front_matter_is_unticked_and_story_ticked(self):
         table, stats, summary = chatterbox_ui.chapter_overview(
-            self.book, None, 1.0, 0.35, 0.9, "auto", "double", False, False, None)
+            self.book, None, 1.0, 0.35, 0.9, "chatterbox", "auto", "double", False, False, None)
         rows = table["value"]
         self.assertEqual([row[1] for row in rows], [False, False, True, True])
         self.assertEqual(len(stats), 4)
@@ -486,14 +486,14 @@ class TestChapterList(unittest.TestCase):
 
     def test_no_book_hides_the_table(self):
         table, stats, summary = chatterbox_ui.chapter_overview(
-            None, None, 1.0, 0.35, 0.9, "auto", "double", False, False, None)
+            None, None, 1.0, 0.35, 0.9, "chatterbox", "auto", "double", False, False, None)
         self.assertFalse(table["visible"])
         self.assertEqual((stats, summary), ([], ""))
 
     def test_typed_text_that_is_not_a_book_explains_itself(self):
         # F-42c: typed text with no upload used to hide the table with an empty message.
         table, stats, summary = chatterbox_ui.chapter_overview(
-            "detour", None, 1.0, 0.35, 0.9, "auto", "double", False, False, None)
+            "detour", None, 1.0, 0.35, 0.9, "chatterbox", "auto", "double", False, False, None)
         self.assertFalse(table["visible"])
         self.assertEqual(stats, [])
         self.assertNotEqual(summary, "")
@@ -616,6 +616,444 @@ class TestUploadTableSequencing(unittest.TestCase):
         ui = chatterbox_ui.build_ui()
         names = {getattr(fn.fn, "__name__", None) for fn in ui.fns.values()}
         self.assertIn("chapter_overview", names)
+
+
+class TestKokoroVoiceChoices(unittest.TestCase):
+
+    VOICES_PAYLOAD = {
+        "default_voice": "af_heart",
+        "voices": [
+            {"id": "af_heart", "name": "af_heart", "overall_grade": "A"},
+            {"id": "af_v0bella", "name": "af_v0bella"},
+            {"id": "bm_george", "name": "bm_george", "overall_grade": "C+"},
+            {"id": "am_liam", "name": "am_liam", "overall_grade": "B-"},
+            {"id": "jf_alpha", "name": "jf_alpha", "overall_grade": "A"},  # Japanese: excluded
+        ],
+    }
+
+    def _choices(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": "http://kokoro:8880/v1"}), \
+                patch("urllib.request.urlopen",
+                     return_value=_fake_response(json.dumps(self.VOICES_PAYLOAD).encode())):
+            return chatterbox_ui.kokoro_voices_and_default()
+
+    def test_only_english_prefixes_are_offered(self):
+        choices, default = self._choices()
+        values = [v for _, v in choices]
+        self.assertNotIn("jf_alpha", values)
+        self.assertEqual(set(values), {"af_heart", "af_v0bella", "bm_george", "am_liam"})
+        self.assertEqual(default, "af_heart")
+
+    def test_best_grade_first_ungraded_last(self):
+        choices, _ = self._choices()
+        values = [v for _, v in choices]
+        self.assertEqual(values, ["af_heart", "am_liam", "bm_george", "af_v0bella"])
+
+    def test_label_format_matches_id_plus_grade(self):
+        choices, _ = self._choices()
+        labels = {value: label for label, value in choices}
+        self.assertEqual(labels["af_heart"], "Heart · American female · A")
+
+    def test_configured_default_wins_when_offered(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": "http://kokoro:8880/v1", "KOKORO_DEFAULT_VOICE": "bm_george"}), \
+                patch("urllib.request.urlopen",
+                     return_value=_fake_response(json.dumps(self.VOICES_PAYLOAD).encode())):
+            _, default = chatterbox_ui.kokoro_voices_and_default()
+        self.assertEqual(default, "bm_george")
+
+    def test_configured_default_not_offered_falls_back_to_server_default(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": "http://kokoro:8880/v1", "KOKORO_DEFAULT_VOICE": "zz_missing"}), \
+                patch("urllib.request.urlopen",
+                     return_value=_fake_response(json.dumps(self.VOICES_PAYLOAD).encode())):
+            _, default = chatterbox_ui.kokoro_voices_and_default()
+        self.assertEqual(default, "af_heart")
+
+    def test_unreachable_server_warns_and_falls_back_to_built_in_default(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": "http://kokoro:8880/v1", "KOKORO_DEFAULT_VOICE": ""}), \
+                patch("urllib.request.urlopen", side_effect=OSError("no route to host")), \
+                patch("gradio.Warning") as warning:
+            choices, default = chatterbox_ui.kokoro_voices_and_default()
+        warning.assert_called_once()
+        self.assertEqual(choices, [("af_heart", "af_heart")])
+        self.assertEqual(default, "af_heart")
+
+    def test_unreachable_server_falls_back_to_configured_default(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": "http://kokoro:8880/v1", "KOKORO_DEFAULT_VOICE": "am_liam"}), \
+                patch("urllib.request.urlopen", side_effect=OSError("no route to host")), \
+                patch("gradio.Warning"):
+            choices, default = chatterbox_ui.kokoro_voices_and_default()
+        self.assertEqual(choices, [("am_liam", "am_liam")])
+        self.assertEqual(default, "am_liam")
+
+
+class TestBuildConfigEngine(unittest.TestCase):
+
+    def test_kokoro_engine_sets_model_and_base_url(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": "http://kokoro:8880/v1"}):
+            config = chatterbox_ui.build_config(
+                "/tmp/book.epub", "audiobook_output/Book", "af_heart", 1.0, [1], 0.35, 0.9, True, True, False,
+                "auto", "double", False, False, None, "INFO", "paragraph", "kokoro")
+        self.assertEqual(config.model_name, "kokoro")
+        self.assertEqual(config.openai_base_url, "http://kokoro:8880/v1")
+        self.assertEqual(config.voice_name, "af_heart")
+        # Kokoro always narrates by sentence, even though "paragraph" was requested.
+        self.assertEqual(config.paced_unit_mode, "sentence")
+
+    def test_chatterbox_is_the_default_engine(self):
+        config = chatterbox_ui.build_config(
+            "/tmp/book.epub", "audiobook_output/Book", "Elena.wav", 1.0, [1], 0.35, 0.9, True, True, False,
+            "auto", "double", False, False, None, "INFO")
+        self.assertEqual((config.model_name, config.openai_base_url), ("chatterbox", None))
+        self.assertEqual(config.paced_unit_mode, "sentence")
+
+    def test_chatterbox_engine_keeps_requested_paced_unit_mode(self):
+        config = chatterbox_ui.build_config(
+            "/tmp/book.epub", "audiobook_output/Book", "Elena.wav", 1.0, [1], 0.35, 0.9, True, True, False,
+            "auto", "double", False, False, None, "INFO", "paragraph", "chatterbox")
+        self.assertEqual(config.paced_unit_mode, "paragraph")
+
+    def test_kokoro_without_base_url_raises_value_error(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": ""}):
+            with self.assertRaises(ValueError):
+                chatterbox_ui.build_config(
+                    "/tmp/book.epub", "audiobook_output/Book", "af_heart", 1.0, [1], 0.35, 0.9, True, True, False,
+                    "auto", "double", False, False, None, "INFO", "sentence", "kokoro")
+
+
+class TestQueueSettingsEngine(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.uploads = patch.object(chatterbox_ui, "QUEUE_UPLOADS", os.path.join(self.tmp.name, "uploads"))
+        self.uploads.start()
+        self.env = patch.dict(os.environ, {"EBOOK_LIBRARY_DIR": "/library",
+                                           "KOKORO_BASE_URL": "http://kokoro:8880/v1"})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.uploads.stop()
+        self.tmp.cleanup()
+
+    def test_engine_is_persisted_and_flows_into_build_config(self):
+        with patch("os.path.isfile", side_effect=lambda p: p == "/library/book.epub"):
+            settings = chatterbox_ui.queue_settings("/library/book.epub", None, TABLE, *SETTINGS,
+                                                    "sentence", "kokoro")
+        self.assertEqual(settings["engine"], "kokoro")
+        config = chatterbox_ui.build_config(**settings)
+        self.assertEqual((config.model_name, config.openai_base_url), ("kokoro", "http://kokoro:8880/v1"))
+
+    def test_missing_engine_key_builds_as_chatterbox(self):
+        # A job queued before Kokoro existed has no "engine" key at all.
+        with patch("os.path.isfile", side_effect=lambda p: p == "/library/book.epub"):
+            settings = chatterbox_ui.queue_settings("/library/book.epub", None, TABLE, *SETTINGS)
+        self.assertEqual(settings["engine"], "chatterbox")
+        del settings["engine"]
+        config = chatterbox_ui.build_config(**settings)
+        self.assertEqual(config.model_name, "chatterbox")
+
+    def test_kokoro_without_base_url_is_refused_at_enqueue_time(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": ""}), \
+                patch("os.path.isfile", side_effect=lambda p: p == "/library/book.epub"):
+            with self.assertRaises(gr.Error):
+                chatterbox_ui.queue_settings("/library/book.epub", None, TABLE, *SETTINGS, "sentence", "kokoro")
+
+
+class TestEngineAwareEstimates(unittest.TestCase):
+
+    def test_generation_estimate_uses_kokoro_constants(self):
+        stats = [[1690, 1, 1]]
+        table = [[1, True, "A", "", ""]]
+        expected = (1690 / chatterbox_ui.KOKORO_CHARS_PER_AUDIO_SECOND / chatterbox_ui.KOKORO_GENERATION_SPEED
+                   * chatterbox_ui.KOKORO_PACED_GENERATION_OVERHEAD)
+        self.assertAlmostEqual(chatterbox_ui.generation_estimate(table, stats, "kokoro"), expected, delta=0.01)
+
+    def test_generation_estimate_defaults_to_chatterbox(self):
+        stats, table = [[1000, 1, 1]], [[1, True, "A", "", ""]]
+        self.assertEqual(chatterbox_ui.generation_estimate(table, stats),
+                         chatterbox_ui.generation_estimate(table, stats, "chatterbox"))
+        self.assertNotAlmostEqual(chatterbox_ui.generation_estimate(table, stats, "chatterbox"),
+                                  chatterbox_ui.generation_estimate(table, stats, "kokoro"), delta=0.001)
+
+    def test_listening_seconds_uses_kokoro_chars_per_second(self):
+        self.assertAlmostEqual(chatterbox_ui.listening_seconds([1000, 1, 1], 1.0, 0, 0, "chatterbox"),
+                               1000 / chatterbox_ui.CHARS_PER_AUDIO_SECOND, places=3)
+        self.assertAlmostEqual(chatterbox_ui.listening_seconds([1000, 1, 1], 1.0, 0, 0, "kokoro"),
+                               1000 / chatterbox_ui.KOKORO_CHARS_PER_AUDIO_SECOND, places=3)
+
+    def test_chapter_summary_differs_by_engine(self):
+        stats, rows = [[1690, 1, 1]], [[1, True, "A", "", ""]]
+        chatterbox_summary = chatterbox_ui.chapter_summary(rows, stats, 1.0, 0, 0, "chatterbox")
+        kokoro_summary = chatterbox_ui.chapter_summary(rows, stats, 1.0, 0, 0, "kokoro")
+        self.assertNotEqual(chatterbox_summary, kokoro_summary)
+
+    def test_retime_chapters_differs_by_engine(self):
+        rows, stats = [[1, True, "A", "", "x"]], [[169000, 1, 1]]
+        chatterbox_row = chatterbox_ui.retime_chapters(rows, stats, 1.0, 0, 0, "chatterbox")["value"][0][4]
+        kokoro_row = chatterbox_ui.retime_chapters([[1, True, "A", "", "x"]], stats, 1.0, 0, 0, "kokoro")["value"][0][4]
+        self.assertNotEqual(chatterbox_row, kokoro_row)
+
+
+class TestQueueViewEngine(unittest.TestCase):
+
+    def test_kokoro_voice_shown_with_engine_prefix(self):
+        queue = MagicMock()
+        queue.paused = False
+        queue.jobs.return_value = [
+            {"id": "a", "title": "Book A", "voice": "af_heart", "chapters": 4, "estimate_seconds": 60,
+             "status": "queued", "note": "", "settings": {"engine": "kokoro"}},
+        ]
+        rows, _, _ = chatterbox_ui.queue_view(queue)
+        self.assertEqual(rows[0][2], "Kokoro · af_heart")
+
+    def test_chatterbox_voice_still_strips_the_extension(self):
+        queue = MagicMock()
+        queue.paused = False
+        queue.jobs.return_value = [
+            {"id": "a", "title": "Book A", "voice": "Elena.wav", "chapters": 4, "estimate_seconds": 60,
+             "status": "queued", "note": "", "settings": {"engine": "chatterbox"}},
+        ]
+        rows, _, _ = chatterbox_ui.queue_view(queue)
+        self.assertEqual(rows[0][2], "Elena")
+
+
+class TestEngineGatedVoiceSync(unittest.TestCase):
+
+    def test_sync_passes_through_while_chatterbox(self):
+        update = chatterbox_ui._sync_if_chatterbox("Elena.wav", "chatterbox")
+        self.assertEqual(update["value"], "Elena.wav")
+
+    def test_sync_is_a_no_op_while_kokoro(self):
+        update = chatterbox_ui._sync_if_chatterbox("af_heart", "kokoro")
+        self.assertNotIn("value", update)
+
+
+class TestAddVoiceEngineGating(unittest.TestCase):
+    """A Chatterbox file name must never land in the Make-tab dropdown while Kokoro is selected
+    there; the Voice lab (always Chatterbox) is updated regardless."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.voices = os.path.join(self.tmp.name, "voices")
+        os.mkdir(self.voices)
+        self.sample = os.path.join(self.tmp.name, "sample.wav")
+        _sample_with_pauses(self.sample)
+        self.env = patch.dict(os.environ, {"TTS_VOICES_DIR": self.voices})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_chatterbox_engine_updates_make_tab_dropdown(self):
+        _, _, make_tab_update, _ = chatterbox_ui.add_voice(self.sample, "One", True, False, "chatterbox")
+        self.assertEqual(make_tab_update["value"], "One.wav")
+
+    def test_kokoro_engine_leaves_make_tab_dropdown_untouched(self):
+        _, lab_update, make_tab_update, delete_update = chatterbox_ui.add_voice(
+            self.sample, "Two", True, False, "kokoro")
+        self.assertEqual(lab_update["value"], "Two.wav")
+        self.assertNotIn("value", make_tab_update)
+        self.assertNotIn("choices", make_tab_update)
+        self.assertIn(("Two", "Two.wav"), delete_update["choices"])
+
+    def test_default_engine_argument_is_chatterbox(self):
+        # Existing callers that predate the engine parameter must keep updating the Make tab.
+        _, _, make_tab_update, _ = chatterbox_ui.add_voice(self.sample, "Three", True, False)
+        self.assertEqual(make_tab_update["value"], "Three.wav")
+
+
+class TestSampleVoice(unittest.TestCase):
+
+    def tearDown(self):
+        chatterbox_ui._delete_if_exists(chatterbox_ui._current_preview_path)
+        chatterbox_ui._current_preview_path = None
+
+    def test_no_voice_is_an_error(self):
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.sample_voice("chatterbox", "", 1.0)
+
+    def test_chatterbox_uses_saved_settings_through_preview_voice(self):
+        saved = {"exaggeration": 0.61, "cfg_weight": 0.4, "temperature": 0.9}
+        with patch.object(chatterbox_ui, "read_saved_settings", return_value=saved), \
+                patch.object(chatterbox_ui, "preview_voice", return_value="/tmp/x.mp3") as preview:
+            path = chatterbox_ui.sample_voice("chatterbox", "Elena.wav", 1.25)
+        self.assertEqual(path, "/tmp/x.mp3")
+        preview.assert_called_once_with("Elena.wav", chatterbox_ui.PREVIEW_PHRASE, 0.61, 0.4, 0.9, 1.25)
+
+    def test_kokoro_posts_to_its_own_speech_endpoint(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": "http://kokoro:8880/v1"}), \
+                patch("urllib.request.urlopen", return_value=_fake_response(b"mp3-bytes")) as urlopen:
+            path = chatterbox_ui.sample_voice("kokoro", "af_heart", 1.0)
+        request = urlopen.call_args[0][0]
+        payload = json.loads(request.data)
+        self.assertEqual(request.full_url, "http://kokoro:8880/v1/audio/speech")
+        self.assertEqual(payload["model"], "kokoro")
+        self.assertEqual(payload["voice"], "af_heart")
+        self.assertEqual(payload["input"], chatterbox_ui.PREVIEW_PHRASE)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"mp3-bytes")
+
+    def test_kokoro_not_configured_is_an_error(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": ""}):
+            with self.assertRaises(gr.Error):
+                chatterbox_ui.sample_voice("kokoro", "af_heart", 1.0)
+
+
+class TestBuiltInVoicesMatchChatterboxFolder(unittest.TestCase):
+    """BUILT_IN_VOICES must list exactly what's shipped in chatterbox/voices/, so a real
+    built-in voice can never be mistakenly offered for deletion (or a custom one wrongly
+    protected)."""
+
+    def test_constant_matches_the_voices_folder(self):
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        voices_dir = os.path.join(repo_root, "chatterbox", "voices")
+        if not os.path.isdir(voices_dir):
+            self.skipTest("chatterbox/voices/ is not present in this checkout")
+        on_disk = {name for name in os.listdir(voices_dir) if name.lower().endswith(".wav")}
+        self.assertEqual(chatterbox_ui.BUILT_IN_VOICES, on_disk)
+
+
+class TestOwnVoiceChoices(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.voices = os.path.join(self.tmp.name, "voices")
+        os.mkdir(self.voices)
+        for name in ("MyVoice.wav", "Elena.wav", "notes.txt"):
+            open(os.path.join(self.voices, name), "wb").close()
+        self.env = patch.dict(os.environ, {"TTS_VOICES_DIR": self.voices})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_excludes_built_ins_and_non_voice_files(self):
+        self.assertEqual(chatterbox_ui.own_voice_names(), ["MyVoice.wav"])
+
+    def test_choices_are_label_value_pairs(self):
+        self.assertEqual(chatterbox_ui.own_voice_choices(), [("MyVoice", "MyVoice.wav")])
+
+    def test_empty_when_folder_not_mounted(self):
+        with patch.dict(os.environ, {"TTS_VOICES_DIR": ""}):
+            self.assertEqual(chatterbox_ui.own_voice_names(), [])
+
+
+class TestVoiceDropdownAfterDelete(unittest.TestCase):
+
+    def test_reselects_default_when_the_deleted_voice_was_selected(self):
+        update = chatterbox_ui._voice_dropdown_after_delete(["a", "b"], "MyVoice.wav", "MyVoice.wav", "Elena.wav")
+        self.assertEqual(update["value"], "Elena.wav")
+
+    def test_keeps_current_selection_when_a_different_voice_was_deleted(self):
+        update = chatterbox_ui._voice_dropdown_after_delete(["a", "b"], "Elena.wav", "MyVoice.wav", "Elena.wav")
+        self.assertNotIn("value", update)
+
+
+class TestDeleteOwnVoice(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.voices = os.path.join(self.tmp.name, "voices")
+        os.mkdir(self.voices)
+        open(os.path.join(self.voices, "MyVoice.wav"), "wb").close()
+        open(os.path.join(self.voices, "Elena.wav"), "wb").close()  # a built-in name, present on disk
+        self.env = patch.dict(os.environ, {"TTS_VOICES_DIR": self.voices})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_deletes_an_own_voice(self):
+        message = chatterbox_ui.delete_own_voice("MyVoice.wav", [])
+        self.assertIn("Deleted", message)
+        self.assertFalse(os.path.isfile(os.path.join(self.voices, "MyVoice.wav")))
+
+    def test_refuses_a_built_in_voice_even_if_present_on_disk(self):
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.delete_own_voice("Elena.wav", [])
+        self.assertTrue(os.path.isfile(os.path.join(self.voices, "Elena.wav")))
+
+    def test_refuses_path_traversal(self):
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.delete_own_voice("../MyVoice.wav", [])
+        self.assertTrue(os.path.isfile(os.path.join(self.voices, "MyVoice.wav")))
+
+    def test_refuses_a_name_with_a_forward_slash(self):
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.delete_own_voice("sub/MyVoice.wav", [])
+
+    def test_refuses_a_name_with_a_backslash(self):
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.delete_own_voice("sub\\MyVoice.wav", [])
+
+    def test_refuses_a_missing_file(self):
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.delete_own_voice("NoSuchVoice.wav", [])
+
+    def test_refuses_none(self):
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.delete_own_voice(None, [])
+
+    def test_refuses_a_voice_used_by_a_queued_chatterbox_job_and_names_the_book(self):
+        jobs = [{"status": QUEUED, "title": "Invented Story",
+                "settings": {"engine": "chatterbox", "voice": "MyVoice.wav"}}]
+        with self.assertRaises(gr.Error) as ctx:
+            chatterbox_ui.delete_own_voice("MyVoice.wav", jobs)
+        self.assertIn("Invented Story", str(ctx.exception))
+        self.assertTrue(os.path.isfile(os.path.join(self.voices, "MyVoice.wav")))
+
+    def test_refuses_a_voice_used_by_a_running_chatterbox_job(self):
+        jobs = [{"status": RUNNING, "title": "Invented Story",
+                "settings": {"engine": "chatterbox", "voice": "MyVoice.wav"}}]
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.delete_own_voice("MyVoice.wav", jobs)
+
+    def test_a_finished_job_does_not_block_deletion(self):
+        jobs = [{"status": DONE, "title": "Invented Story",
+                "settings": {"engine": "chatterbox", "voice": "MyVoice.wav"}}]
+        chatterbox_ui.delete_own_voice("MyVoice.wav", jobs)  # must not raise
+
+    def test_a_kokoro_job_with_the_same_looking_voice_name_does_not_block_deletion(self):
+        jobs = [{"status": QUEUED, "title": "Invented Story",
+                "settings": {"engine": "kokoro", "voice": "MyVoice.wav"}}]
+        chatterbox_ui.delete_own_voice("MyVoice.wav", jobs)  # must not raise
+
+    def test_voices_dir_not_mounted_is_an_error(self):
+        with patch.dict(os.environ, {"TTS_VOICES_DIR": ""}):
+            with self.assertRaises(gr.Error):
+                chatterbox_ui.delete_own_voice("MyVoice.wav", [])
+
+
+class TestDeleteVoiceWiring(unittest.TestCase):
+    """The delete button must ask for browser confirmation before any server call, and treat a
+    cancelled confirm (the js= returning null) as a complete no-op."""
+
+    def test_delete_button_click_confirms_in_the_browser_first(self):
+        ui = chatterbox_ui.build_ui()
+        delete_button_id = next(block._id for block in ui.blocks.values()
+                                if getattr(block, "value", None) == "Delete voice")
+        triggers = [fn for fn in ui.fns.values()
+                   for target_id, event in getattr(fn, "targets", [])
+                   if target_id == delete_button_id and event == "click"]
+        self.assertEqual(len(triggers), 1)
+        self.assertIn("confirm(", triggers[0].js)
+        self.assertEqual(getattr(triggers[0].fn, "__name__", None), "delete_voice")
+
+    def test_cancelled_confirm_changes_nothing(self):
+        ui = chatterbox_ui.build_ui()
+        delete_button_id = next(block._id for block in ui.blocks.values()
+                                if getattr(block, "value", None) == "Delete voice")
+        handler = next(fn.fn for fn in ui.fns.values()
+                      for target_id, event in getattr(fn, "targets", [])
+                      if target_id == delete_button_id and event == "click")
+        result = handler(None, "Elena.wav", "Elena.wav", "chatterbox")
+        self.assertEqual(len(result), 4)
+        for update in result:
+            self.assertNotIn("value", update)
+            self.assertNotIn("choices", update)
 
 
 class TestHostUiProcessFactory(unittest.TestCase):
