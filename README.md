@@ -57,13 +57,18 @@ The repo holds the whole stack:
   needed. *Cast* asks a local LLM (any OpenAI-compatible chat endpoint: Ollama, llama.cpp, LM Studio;
   book text never leaves the machine) who speaks each line: **Analyse selected chapters** queues the pass as a job
   of its own, Chatterbox's model is unloaded from the GPU while it runs and reloaded after, and the
-  result is an editable cast table (character, lines, gender, voice, sample button). Voices are
-  suggested by gender (Kokoro ids carry it; Chatterbox voices get theirs from a **Voice gender**
-  setting in the Voice lab) with the main characters kept distinct from each other and the narrator;
-  lines whose speaker the LLM couldn't tell get the dialogue voice. To help pick voices, the same
-  analysis writes a short profile of each of the most-spoken characters from the book's own
-  passages (role, who they are, relationships, and a "sounds like" casting note), shown in the table
-  and under it when you click a character, with the first line they speak. The cast is saved per book under
+  result is an editable cast table (character, lines, gender, voice, sample button). To help pick
+  voices, the same analysis writes a short profile of each of the most-spoken characters from the
+  book's own passages (role, who they are, relationships, a "sounds like" casting note, and the kind
+  of voice that fits: pitch, huskiness, liveliness), shown in the table and under it when you click a
+  character, with the first line they speak. Voices are suggested by gender (Kokoro ids carry it;
+  Chatterbox voices get theirs from a **Voice gender** setting in the Voice lab) and, for Chatterbox,
+  by how each voice measures against the profile: **Measure voices** in the Voice lab has each voice
+  speak one sentence and measures its pitch, huskiness and liveliness (a voice you add is measured
+  straight away). The main characters stay distinct from each other and the narrator; lines whose
+  speaker the LLM couldn't tell get the dialogue voice. **Auto-pick suggested voices** (next to
+  Analyse) makes a re-analysis keep only the voices you saved yourself; **Suggest voices again**
+  re-matches an existing cast. The cast is saved per book under
   `casts/` in the app data folder, and **Add to queue** carries a snapshot of it with the job. Units
   never span a change of voice; the pause between narration and a quote is the sentence pause.
   Validation on a real LLM: `docs/chatterbox-edition/experiments/multivoice/`.

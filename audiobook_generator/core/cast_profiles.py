@@ -5,8 +5,9 @@ After the attribution pass (core.cast_llm) every dialogue line has a speaker, so
 passages can be found without guessing: paragraphs where they speak (shown to the model as
 [Name] "...", as in the attribution windows) and paragraphs whose narration names them. Up to
 PROFILE_MAX_CHARS of those, the first few plus an even spread over the rest, go to the model in one
-request per character; it answers with a role, a short description, relationships and a casting
-note for the voice. The first line each character speaks is quoted by code, never by the model.
+request per character; it answers with a role, a short description, relationships, a casting
+note for the voice and voice targets (pitch, huskiness, liveliness) that voice suggestions match
+against measured voices. The first line each character speaks is quoted by code, never by the model.
 
 KOReader's X-Ray plugins send only the title and author and rely on a large cloud model having read
 the book. Nothing here depends on the model knowing the book: a local 14B model mostly doesn't, and
@@ -34,6 +35,14 @@ FIELD_MAX_CHARS = {"description": 400, "relationships": 300, "voice": 160}
 MINOR_SHARE_OF_TOP = 0.1      # fewer lines than this share of the most-spoken character's: a minor part
 
 ROLES = ("protagonist", "antagonist", "supporting", "minor", "unknown")
+# Words a model uses for each voice target, checked in this order ("medium-high" is medium).
+_TARGET_WORDS = {
+    "pitch": (("low", "low"), ("deep", "low"), ("medium", "medium"), ("mid", "medium"), ("high", "high")),
+    "quality": (("husky", "husky"), ("breathy", "husky"), ("rough", "husky"), ("raspy", "husky"),
+                ("gravel", "husky"), ("smoky", "husky"), ("clear", "clear"), ("crisp", "clear")),
+    "delivery": (("expressive", "expressive"), ("lively", "expressive"), ("animated", "expressive"),
+                 ("even", "even"), ("flat", "even"), ("calm", "even"), ("monoton", "even")),
+}
 # Accent and origin words a voice note may only use when the excerpts do (measured 2026-09-28: the
 # model gave a character "a slight southern drawl" that appears nowhere in the book).
 ACCENT_WORDS = (
@@ -61,7 +70,8 @@ PROMPTS = {
         "Reply with exactly this shape:\n"
         "{{\"role\": \"protagonist|antagonist|supporting|minor\", \"gender\": \"female|male|unknown\", "
         "\"age\": \"child|adult|elderly|unknown\", \"description\": \"...\", \"relationships\": \"...\", "
-        "\"voice\": \"...\"}}\n"
+        "\"voice\": \"...\", \"pitch\": \"low|medium|high\", \"quality\": \"husky|clear|either\", "
+        "\"delivery\": \"expressive|even|either\"}}\n"
         "Rules:\n"
         "- use only what the excerpts show; if you recognise the book, add nothing from elsewhere;\n"
         "- description: one or two sentences on who {name} is and their lasting personality traits, not a "
@@ -70,6 +80,10 @@ PROMPTS = {
         "with; leave out everyone else, and write \"\" if there is no one;\n"
         "- voice: 4 to 12 words on how {name} should sound, from their apparent age, manner and energy in "
         "these excerpts; never an accent, dialect or place of origin unless the excerpts state it;\n"
+        "- pitch, quality and delivery: the kind of voice that fits {name}, pitch relative to other voices of "
+        "the same gender: low for older, commanding, stern or gruff characters, high for young, light or "
+        "playful ones; husky for rough, sultry or tired characters, clear for crisp, gentle or precise ones; "
+        "expressive for lively or emotional characters, even for calm or dry ones;\n"
         "- write \"unknown\" or \"\" rather than guess."
     ),
     "aka": " (also called {aliases})",
@@ -232,6 +246,13 @@ def _role(value) -> str:
     return next((role for word, role in _ROLE_WORDS if word in text), "unknown")
 
 
+def _target(value, kind: str) -> Optional[str]:
+    """One voice target from the reply (pitch, quality or delivery), or None for "either",
+    "unknown" or anything unrecognised."""
+    text = str(value or "").lower()
+    return next((target for word, target in _TARGET_WORDS[kind] if word in text), None)
+
+
 def _field(data: dict, name: str) -> str:
     value = data.get(name)
     if not isinstance(value, str) or value.strip().lower().strip(".") in ("", "unknown", "none", "n/a"):
@@ -240,10 +261,13 @@ def _field(data: dict, name: str) -> str:
 
 
 def parse_profile(reply: str) -> dict:
-    """Validate one profile reply: {role, gender, age, description, relationships, voice}.
+    """Validate one profile reply: {role, gender, age, description, relationships, voice,
+    voice_targets: {pitch, quality, delivery}} (the targets core.cast.suggest_voices matches
+    measured voices against).
 
     Raises ProfileError unless it is a JSON object with a usable description. A bad role, gender or
-    age becomes "unknown"; a missing relationships or voice note becomes ""."""
+    age becomes "unknown"; a missing relationships or voice note becomes ""; a target that is
+    missing, "either" or unrecognised becomes None."""
     try:
         data = _extract_json(reply)
     except AttributionError as e:
@@ -255,6 +279,7 @@ def parse_profile(reply: str) -> dict:
         "description": _field(data, "description"),
         "relationships": _field(data, "relationships"),
         "voice": _field(data, "voice"),
+        "voice_targets": {kind: _target(data.get(kind), kind) for kind in ("pitch", "quality", "delivery")},
     }
     if not profile["description"]:
         raise ProfileError("no description in the reply")

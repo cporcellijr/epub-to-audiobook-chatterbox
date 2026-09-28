@@ -112,6 +112,17 @@ class TestAnalyseBook(unittest.TestCase):
         self.assertEqual(redone["characters"]["ada marsh"]["voice"], "Picked.wav")
         self.assertIsNone(redone["characters"]["tom"].get("voice"))
 
+    def test_auto_pick_keeps_only_the_voices_the_owner_saved(self):
+        replies = ({"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}}, {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}})
+        analyse_book(self.settings, chat=ScriptedChat(*replies))
+        cast = cast_store.load_cast(self.settings["cast_file"])
+        cast["characters"]["ada marsh"].update(voice="Picked.wav", voice_picked=True)
+        cast["characters"]["tom"]["voice"] = "Suggested.wav"
+        cast_store.save_cast(self.settings["cast_file"], cast)
+        redone = analyse_book(dict(self.settings, auto_pick_voices=True), chat=ScriptedChat(*replies))
+        self.assertEqual(redone["characters"]["ada marsh"]["voice"], "Picked.wav")
+        self.assertIsNone(redone["characters"]["tom"].get("voice"))  # left for a fresh suggestion
+
     def test_only_selected_chapters_are_analysed(self):
         self.settings["chapter_selection"] = [2]
         cast = analyse_book(self.settings, chat=ScriptedChat({"speakers": {"1": "Mother", "2": "Tom"}}))

@@ -165,6 +165,92 @@ class TestSuggestions(unittest.TestCase):
         self.assertEqual(cast_store.suggest_voices(_cast({"a": (1, "male", None)}), [("N.wav", "male")], "N.wav"), {})
 
 
+def _wants(cast, key, pitch=None, quality=None, delivery=None):
+    cast["characters"][key]["profile"] = {"voice_targets": {"pitch": pitch, "quality": quality, "delivery": delivery}}
+
+
+# Five female voices from deep to light; Husky.wav is the one husky voice, Lively.wav the lively one.
+FEMALE = [("Deep.wav", "female"), ("Husky.wav", "female"), ("Mid.wav", "female"), ("Lively.wav", "female"),
+          ("Light.wav", "female")]
+TRAITS = {
+    "Deep.wav": {"pitch": 0.0, "husky": 0.2, "expressive": 0.5},
+    "Husky.wav": {"pitch": 0.25, "husky": 1.0, "expressive": 0.3},
+    "Mid.wav": {"pitch": 0.5, "husky": 0.5, "expressive": 0.4},
+    "Lively.wav": {"pitch": 0.75, "husky": 0.3, "expressive": 1.0},
+    "Light.wav": {"pitch": 1.0, "husky": 0.0, "expressive": 0.0},
+}
+
+
+class TestMatching(unittest.TestCase):
+
+    def test_each_character_gets_the_voice_that_fits_its_profile(self):
+        cast = _cast({"boss": (50, "female", None), "kid": (40, "female", None), "vamp": (30, "female", None)})
+        _wants(cast, "boss", pitch="low", quality="clear")
+        _wants(cast, "kid", pitch="high", delivery="expressive")
+        _wants(cast, "vamp", pitch="low", quality="husky")
+        suggestions = cast_store.suggest_voices(cast, FEMALE, "Narrator.wav", TRAITS)
+        self.assertEqual(suggestions, {"boss": "Deep.wav", "kid": "Lively.wav", "vamp": "Husky.wav"})
+
+    def test_the_wanted_pitch_band_comes_before_huskiness_and_liveliness(self):
+        # Measured live: "medium, clear, even" got a high voice that was clear and even.
+        cast = _cast({"a": (5, "female", None)})
+        _wants(cast, "a", pitch="medium", quality="clear", delivery="even")
+        traits = {"Mid.wav": {"pitch": 0.5, "husky": 1.0, "expressive": 1.0},
+                  "Light.wav": {"pitch": 0.75, "husky": 0.0, "expressive": 0.0}}
+        suggestions = cast_store.suggest_voices(cast, [("Light.wav", "female"), ("Mid.wav", "female")], "N.wav", traits)
+        self.assertEqual(suggestions, {"a": "Mid.wav"})
+
+    def test_the_most_spoken_character_chooses_first_and_voices_stay_distinct(self):
+        cast = _cast({"lead": (50, "female", None), "second": (10, "female", None)})
+        _wants(cast, "lead", pitch="low")
+        _wants(cast, "second", pitch="low")
+        suggestions = cast_store.suggest_voices(cast, FEMALE, "Narrator.wav", TRAITS)
+        # A band's middle fits best, so the extreme voice isn't everyone's first choice.
+        self.assertEqual(suggestions["lead"], "Husky.wav")
+        self.assertEqual(suggestions["second"], "Deep.wav")  # the other low voice, not a shared one
+
+    def test_without_targets_or_measurements_the_list_order_decides_as_before(self):
+        cast = _cast({"a": (5, "female", None)})
+        self.assertEqual(cast_store.suggest_voices(cast, FEMALE, "Narrator.wav", TRAITS), {"a": "Deep.wav"})
+        _wants(cast, "a", pitch="high")
+        self.assertEqual(cast_store.suggest_voices(cast, FEMALE, "Narrator.wav"), {"a": "Deep.wav"})
+
+    def test_a_measured_fit_beats_an_unmeasured_voice(self):
+        cast = _cast({"a": (5, "female", None)})
+        _wants(cast, "a", pitch="high")
+        voices = [("Unmeasured.wav", "female"), *FEMALE]
+        self.assertEqual(cast_store.suggest_voices(cast, voices, "Narrator.wav", TRAITS), {"a": "Lively.wav"})
+
+    def test_age_stands_in_for_a_missing_pitch_target(self):
+        cast = _cast({"kid": (5, "female", None), "gran": (4, "female", None)})
+        cast["characters"]["kid"]["age"], cast["characters"]["gran"]["age"] = "child", "elderly"
+        self.assertEqual(cast_store.voice_targets(cast["characters"]["kid"])["pitch"], "high")
+        suggestions = cast_store.suggest_voices(cast, FEMALE, "Narrator.wav", TRAITS)
+        self.assertEqual((suggestions["kid"], suggestions["gran"]), ("Lively.wav", "Husky.wav"))
+
+    def test_match_cost_is_zero_inside_the_wanted_band_centre(self):
+        character = {"profile": {"voice_targets": {"pitch": "medium"}}}
+        self.assertLess(cast_store.match_cost(character, {"pitch": 0.5, "husky": 0.5, "expressive": 0.5}), 0.01)
+        self.assertGreater(cast_store.match_cost(character, {"pitch": 1.0, "husky": 0.5, "expressive": 0.5}), 0.6)
+        self.assertEqual(cast_store.match_cost(character, None), cast_store.UNMEASURED_COST)
+        self.assertEqual(cast_store.match_cost({}, None), 0.0)
+
+    def test_suggest_again_clears_only_the_voices_the_owner_did_not_pick(self):
+        cast = _cast({"a": (5, "female", "Deep.wav"), "b": (4, "female", "Mid.wav"), "c": (3, "female", None)})
+        cast["characters"]["a"]["voice_picked"] = True
+        self.assertEqual(cast_store.clear_suggested_voices(cast), 1)
+        self.assertEqual([cast["characters"][k]["voice"] for k in "abc"], ["Deep.wav", None, None])
+
+    def test_reanalysis_can_carry_only_the_voices_the_owner_picked(self):
+        previous = _cast({"ann": (5, "female", "Deep.wav"), "bea": (4, "female", "Mid.wav")})
+        previous["characters"]["ann"]["voice_picked"] = True
+        fresh = _cast({"ann": (5, "female", None), "bea": (4, "female", None)})
+        self.assertEqual(cast_store.carry_voice_choices(previous, fresh["characters"], picked_only=True), 1)
+        self.assertEqual((fresh["characters"]["ann"]["voice"], fresh["characters"]["ann"]["voice_picked"]),
+                         ("Deep.wav", True))
+        self.assertIsNone(fresh["characters"]["bea"].get("voice"))
+
+
 class TestEngineCheck(unittest.TestCase):
 
     def test_voices_must_look_like_the_engines(self):

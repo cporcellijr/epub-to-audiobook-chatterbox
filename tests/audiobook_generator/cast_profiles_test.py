@@ -111,7 +111,17 @@ class TestParseProfile(unittest.TestCase):
     def test_a_good_reply(self):
         profile = parse_profile(_profile(role="Main character", gender="female", age="child"))
         self.assertEqual(profile, {"role": "protagonist", "gender": "female", "age": "child",
-                                   "description": "A farm girl.", "relationships": "", "voice": "bright young woman"})
+                                   "description": "A farm girl.", "relationships": "", "voice": "bright young woman",
+                                   "voice_targets": {"pitch": None, "quality": None, "delivery": None}})
+
+    def test_voice_targets_accept_the_words_a_model_uses(self):
+        cases = [({"pitch": "high", "quality": "husky", "delivery": "expressive"}, ("high", "husky", "expressive")),
+                 ({"pitch": "Deep", "quality": "breathy", "delivery": "calm"}, ("low", "husky", "even")),
+                 ({"pitch": "medium-high", "quality": "either", "delivery": "unknown"}, ("medium", None, None)),
+                 ({"pitch": 3, "quality": "crisp"}, (None, "clear", None))]
+        for reply, expected in cases:
+            targets = parse_profile(_profile(**reply))["voice_targets"]
+            self.assertEqual((targets["pitch"], targets["quality"], targets["delivery"]), expected, reply)
 
     def test_fences_and_odd_values_are_tolerated(self):
         reply = "```json\n" + _profile(role="the villain", gender="woman", age="old", relationships="unknown") + "\n```"

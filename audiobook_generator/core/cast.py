@@ -11,7 +11,8 @@ them.
 
 Voice gender metadata: Kokoro ids carry it in their prefix; Chatterbox voice files don't, so the
 owner records it in VOICE_GENDERS_FILE from the Voice lab. Nothing here guesses a gender from a
-voice's name.
+voice's name. How a voice sounds (pitch, huskiness, liveliness) is measured by core.voice_measure;
+suggest_voices matches that against each character's profile.
 """
 import hashlib
 import json
@@ -217,16 +218,68 @@ def ranked_characters(cast: dict) -> List[Tuple[str, dict]]:
                   key=lambda item: (-int(item[1].get("lines", 0)), item[1].get("name", item[0])))
 
 
-def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Optional[str]) -> Dict[str, str]:
+# What a profile's voice targets mean against a voice's traits (core.voice_measure.voice_traits,
+# each 0..1 among voices of the same gender).
+PITCH_BANDS = {"low": (0.0, 1 / 3), "medium": (1 / 3, 2 / 3), "high": (2 / 3, 1.0)}
+OUT_OF_BAND_COST = 2.0  # more than huskiness, liveliness and centring can add (1.1 at most)
+# A voice nobody measured, for a character who wants something: any measured voice in the wanted
+# pitch band beats it, and it ties with a measured voice just outside the band.
+UNMEASURED_COST = OUT_OF_BAND_COST
+
+
+def voice_targets(character: dict) -> Dict[str, Optional[str]]:
+    """The kind of voice a character's profile asks for: {"pitch": low|medium|high,
+    "quality": husky|clear, "delivery": expressive|even}, each None when it doesn't matter. Without
+    a pitch target, a child wants a high voice and an elderly character a low one."""
+    targets = dict((character.get("profile") or {}).get("voice_targets") or {})
+    if not targets.get("pitch"):
+        targets["pitch"] = {"child": "high", "elderly": "low"}.get(character.get("age", ""))
+    return {key: targets.get(key) for key in ("pitch", "quality", "delivery")}
+
+
+def match_cost(character: dict, traits: Optional[dict]) -> float:
+    """How far a voice is from what the character wants (0 fits perfectly; 0 for every voice when
+    the character wants nothing in particular). Pitch comes first: any voice in the wanted third of
+    its gender's range beats any voice outside it (OUT_OF_BAND_COST is more than everything else can
+    add up to), and outside it the nearest wins. Within the band, huskiness and liveliness decide,
+    then closeness to the band's middle, so the most extreme voice isn't everyone's first choice.
+
+    Measured 2026-09-28: with pitch merely weighted twice as heavily, a character asking for a
+    medium, clear, even voice got a high one that was clear and even."""
+    targets = voice_targets(character)
+    if not any(targets.values()):
+        return 0.0
+    if not traits:
+        return UNMEASURED_COST
+    cost = 0.0
+    band = PITCH_BANDS.get(targets["pitch"] or "")
+    if band:
+        low, high = band
+        outside = max(0.0, low - traits["pitch"], traits["pitch"] - high)
+        if outside > 0:
+            cost += OUT_OF_BAND_COST + 2 * outside
+        cost += 0.2 * abs(traits["pitch"] - (low + high) / 2)
+    if targets["quality"] in ("husky", "clear"):
+        cost += 0.5 * (1 - traits["husky"] if targets["quality"] == "husky" else traits["husky"])
+    if targets["delivery"] in ("expressive", "even"):
+        cost += 0.5 * (1 - traits["expressive"] if targets["delivery"] == "expressive" else traits["expressive"])
+    return cost
+
+
+def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Optional[str],
+                   traits: Optional[Dict[str, dict]] = None) -> Dict[str, str]:
     """Pick a voice for every character that has none yet: {character key: voice}.
 
     voices are (voice, gender) pairs for the job's engine. Characters with the most lines are
     served first and get a voice nobody else has, matching their gender (a neutral voice fits
-    anyone; an unknown gender takes any voice). The narrator's voice is never suggested. Only
-    when every suitable voice is taken does a character share one, with the least-used voice
-    first, so the main characters always sound distinct. Voices already chosen by the owner are
-    kept and count as taken.
+    anyone; an unknown gender takes any voice). Among those, the voice whose measured traits
+    best fit the character's profile (match_cost) wins; with no traits or no profile targets,
+    the first in the list does. The narrator's voice is never suggested. Only when every
+    suitable voice is taken does a character share one, with the least-used voice first, so the
+    main characters always sound distinct. Voices already chosen by the owner are kept and count
+    as taken.
     """
+    traits = traits or {}
     candidates = [(voice, gender) for voice, gender in voices if voice and voice != narrator_voice]
     if not candidates:
         return {}
@@ -252,22 +305,40 @@ def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Op
         # Prefer an exact gender match over a neutral voice among the unused ones.
         exact = [voice for voice in pool if dict(candidates)[voice] == wanted and use_count[voice] == 0]
         unused = exact or [voice for voice in pool if use_count[voice] == 0]
-        chosen = unused[0] if unused else min(pool, key=lambda voice: (use_count[voice], pool.index(voice)))
+
+        def cost(voice: str) -> tuple:
+            return match_cost(character, traits.get(voice)), pool.index(voice)
+        chosen = (min(unused, key=cost) if unused
+                  else min(pool, key=lambda voice: (use_count[voice], *cost(voice))))
         use_count[chosen] += 1
         suggestions[key] = chosen
     return suggestions
 
 
-def carry_voice_choices(previous: Optional[dict], characters: Dict[str, dict]) -> int:
+def clear_suggested_voices(cast: dict) -> int:
+    """Take away every voice the owner didn't pick (character["voice_picked"], set when a voice is
+    saved in the cast editor), so suggest_voices can choose them again; returns how many."""
+    cleared = 0
+    for character in cast.get("characters", {}).values():
+        if character.get("voice") and not character.get("voice_picked"):
+            character["voice"] = None
+            cleared += 1
+    return cleared
+
+
+def carry_voice_choices(previous: Optional[dict], characters: Dict[str, dict], picked_only: bool = False) -> int:
     """Give characters of a fresh analysis the voice (and a known gender) an earlier analysis of the
     same book had for the same person, so re-analysing never throws away the owner's picks.
 
     A character matches by key, else by exactly one earlier character sharing a name or alias with
     it; an ambiguous match is left for the owner to review. Characters that already have a voice are
-    left alone. Returns how many characters got a carried voice."""
+    left alone. picked_only carries only the voices the owner saved in the cast editor
+    ("voice_picked"), leaving the rest to fresh suggestions. Returns how many characters got a
+    carried voice."""
     if not previous:
         return 0
-    old = {key: c for key, c in previous.get("characters", {}).items() if c.get("voice")}
+    old = {key: c for key, c in previous.get("characters", {}).items()
+           if c.get("voice") and (c.get("voice_picked") or not picked_only)}
 
     def forms(key: str, character: dict) -> set:
         names = [character.get("name", ""), *character.get("aliases", [])]
@@ -287,6 +358,8 @@ def carry_voice_choices(previous: Optional[dict], characters: Dict[str, dict]) -
         if match is None:
             continue
         character["voice"] = old[match]["voice"]
+        if old[match].get("voice_picked"):
+            character["voice_picked"] = True
         if old[match].get("gender") in GENDERS and old[match]["gender"] != "unknown":
             character["gender"] = old[match]["gender"]
         carried += 1

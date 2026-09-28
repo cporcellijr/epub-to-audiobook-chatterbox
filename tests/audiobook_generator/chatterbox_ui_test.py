@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from unittest.mock import MagicMock, patch
 
@@ -243,10 +244,24 @@ class TestAddVoice(unittest.TestCase):
         _sample_with_pauses(self.sample)
         self.env = patch.dict(os.environ, {"TTS_VOICES_DIR": self.voices})
         self.env.start()
+        # No Chatterbox in tests: measuring the new voice fails, which must never fail the add.
+        self.measure = patch.object(chatterbox_ui, "measure_voice", side_effect=OSError("no Chatterbox here"))
+        self.measure.start()
 
     def tearDown(self):
+        self.measure.stop()
         self.env.stop()
         self.tmp.cleanup()
+
+    def test_a_new_voice_is_measured_and_a_failure_only_defers_it(self):
+        message, _, _, _ = chatterbox_ui.add_voice(self.sample, "Unmeasured", True, False)
+        self.assertTrue(os.path.isfile(os.path.join(self.voices, "Unmeasured.wav")))
+        self.assertIn("Not measured yet", message)
+        with patch.object(chatterbox_ui, "measure_voice", return_value={}) as measure, \
+                patch.object(chatterbox_ui, "voice_sound_words", return_value="low for a woman, husky"):
+            message, _, _, _ = chatterbox_ui.add_voice(self.sample, "Measured", True, False)
+        measure.assert_called_once_with("Measured.wav")
+        self.assertIn("Measured: sounds low for a woman, husky.", message)
 
     def test_adds_wav_with_pauses_removed(self):
         message, lab_update, _, _ = chatterbox_ui.add_voice(self.sample, "Narrator: One", True, False)
@@ -274,6 +289,72 @@ class TestAddVoice(unittest.TestCase):
     def test_short_sample_warns(self):
         message, _, _, _ = chatterbox_ui.add_voice(self.sample, "Short", True, False)
         self.assertIn("short", message)
+
+
+class TestVoiceMeasuring(unittest.TestCase):
+    """Measure voices (Voice lab): Chatterbox speaks a fixed sentence per voice; Praat is replaced by
+    a stand-in so each voice gets a known pitch."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.voices = os.path.join(self.tmp.name, "voices")
+        os.mkdir(self.voices)
+        for name in ("Ada.wav", "Bea.wav", "Cal.wav"):
+            with open(os.path.join(self.voices, name), "wb") as f:
+                f.write(name.encode())
+        self.patches = [
+            patch.dict(os.environ, {"TTS_VOICES_DIR": self.voices}),
+            patch.object(chatterbox_ui.voice_measure, "VOICE_FEATURES_FILE", os.path.join(self.tmp.name, "features.json")),
+            patch("audiobook_generator.core.cast.VOICE_GENDERS_FILE", os.path.join(self.tmp.name, "genders.json")),
+        ]
+        for p in self.patches:
+            p.start()
+        self.pitches = iter([150.0, 250.0, 120.0])
+        self.fake_praat = patch.object(chatterbox_ui.voice_measure, "measure_audio",
+                                       side_effect=lambda audio: {"f0_median": next(self.pitches), "f0_range": 8.0,
+                                                                  "hnr": 11.0})
+        self.fake_praat.start()
+
+    def tearDown(self):
+        self.fake_praat.stop()
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def test_every_unmeasured_voice_is_measured_once(self):
+        with patch.object(chatterbox_ui, "_post_json", return_value=b"wav") as post:
+            self.assertEqual(chatterbox_ui.measure_voices(), "Measured 3 voices.")
+            self.assertEqual(chatterbox_ui.measure_voices(), "All 3 voices are measured.")
+        self.assertEqual(post.call_count, 3)
+        path, payload = post.call_args_list[0].args
+        self.assertEqual((path, payload["predefined_voice_id"], payload["text"]),
+                         ("/tts", "Ada.wav", chatterbox_ui.voice_measure.MEASURE_TEXT))
+        saved = chatterbox_ui.voice_measure.load_features()
+        self.assertEqual({v: m["f0_median"] for v, m in saved.items()}, {"Ada.wav": 150.0, "Bea.wav": 250.0, "Cal.wav": 120.0})
+
+    def test_an_unreachable_chatterbox_stops_the_run_and_a_bad_voice_is_skipped(self):
+        with patch.object(chatterbox_ui, "_post_json", side_effect=urllib.error.URLError("refused")) as post:
+            self.assertIn("Measured 0 of 3, then Chatterbox couldn't be reached", chatterbox_ui.measure_voices())
+        self.assertEqual(post.call_count, 1)
+        bad = urllib.error.HTTPError("http://cb/tts", 500, "boom", {}, io.BytesIO(b'{"detail": "voice broken"}'))
+        with patch.object(chatterbox_ui, "_post_json", side_effect=[bad, b"wav", b"wav"]):
+            self.assertEqual(chatterbox_ui.measure_voices(), "Measured 2 voices. Couldn't measure Ada (voice broken).")
+
+    def test_the_voice_lab_describes_a_measured_voice_within_its_gender(self):
+        self.assertIn("Not measured yet", chatterbox_ui.voice_sound_text("Ada.wav"))
+        from audiobook_generator.core import cast as cast_store
+        for voice in ("Ada.wav", "Bea.wav"):
+            cast_store.save_voice_gender(voice, "female")
+        with patch.object(chatterbox_ui, "_post_json", return_value=b"wav"):
+            chatterbox_ui.measure_voices()
+        self.assertIn("Sounds **low for a woman** (150 Hz)", chatterbox_ui.voice_sound_text("Ada.wav"))
+        self.assertIn("high for a woman", chatterbox_ui.voice_sound_text("Bea.wav"))
+
+    def test_deleting_a_voice_forgets_its_measurement(self):
+        with patch.object(chatterbox_ui, "_post_json", return_value=b"wav"):
+            chatterbox_ui.measure_voices()
+        chatterbox_ui.delete_own_voice("Ada.wav", [])
+        self.assertNotIn("Ada.wav", chatterbox_ui.voice_measure.load_features())
 
 
 class TestBuildConfig(unittest.TestCase):
@@ -1311,7 +1392,9 @@ class TestCastPanel(unittest.TestCase):
                         patch.dict(os.environ, {"TTS_VOICES_DIR": self.voices, "EBOOK_LIBRARY_DIR": "/library",
                                                 "LLM_BASE_URL": "http://llm:11434/v1", "LLM_MODEL": "m"}),
                         patch("audiobook_generator.core.cast.VOICE_GENDERS_FILE",
-                              os.path.join(self.tmp.name, "voice_genders.json"))]
+                              os.path.join(self.tmp.name, "voice_genders.json")),
+                        patch.object(chatterbox_ui.voice_measure, "VOICE_FEATURES_FILE",
+                                     os.path.join(self.tmp.name, "voice_features.json"))]
         for p in self.patches:
             p.start()
         from audiobook_generator.core import cast as cast_store
@@ -1433,6 +1516,55 @@ class TestCastPanel(unittest.TestCase):
         self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
         _, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
         self.assertIn("Writing character profiles**: 3 of 4", status)
+
+    def _measure(self, pitches):
+        for voice, f0 in pitches.items():
+            chatterbox_ui.voice_measure.save_features(voice, {"f0_median": f0, "f0_range": 8.0, "hnr": 11.0})
+
+    def test_suggestions_match_measured_voices_to_the_profile(self):
+        self._measure({"Ada.wav": 160.0, "Bea.wav": 240.0})
+        self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": None,
+                     "profile": {"voice_targets": {"pitch": "high"}}},
+        })
+        table, _, _, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertEqual(table["value"][0][5], "Bea")  # without a profile it would be Ada, the first in the list
+
+    def test_suggest_again_rematches_all_but_the_voices_the_owner_saved(self):
+        self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav",
+                     "profile": {"voice_targets": {"pitch": "high"}}},
+            "bob": {"name": "Bob", "aliases": [], "gender": "male", "age": "adult", "lines": 3, "voice": "Ada.wav"},
+        })
+        chatterbox_ui.apply_cast_edit("k", "bob", "male", "Cal.wav", "chatterbox")  # the owner's own pick
+        self.assertEqual(chatterbox_ui.resuggest_cast_voices("k", "chatterbox", "Elena.wav", False),
+                         (gr.update(), gr.update(), gr.update()))  # cancelled in the browser
+        _, _, message = chatterbox_ui.resuggest_cast_voices("k", "chatterbox", "Elena.wav")
+        self.assertIn("No voices are measured yet", message)
+        self._measure({"Ada.wav": 160.0, "Bea.wav": 240.0})
+        table, keys, message = chatterbox_ui.resuggest_cast_voices("k", "chatterbox", "Elena.wav", True)
+        self.assertEqual(message, "Suggested voices again for 1 character; kept the 1 you picked.")
+        saved = self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))["characters"]
+        self.assertEqual((saved["anne"]["voice"], saved["bob"]["voice"], saved["bob"]["voice_picked"]),
+                         ("Bea.wav", "Cal.wav", True))
+
+    def test_the_profile_shows_what_the_character_wants_and_how_its_voice_measures(self):
+        self.cast_store.save_voice_gender("Elena.wav", "female")
+        self._measure({"Ada.wav": 160.0, "Bea.wav": 240.0, "Elena.wav": 200.0})
+        self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Bea.wav",
+                     "profile": {"description": "A lark.", "voice_targets": {"pitch": "high", "delivery": "expressive"}}},
+        })
+        profile = chatterbox_ui.select_cast_row("k", ["anne"], "chatterbox", MagicMock(index=[0, 0]))[4]
+        self.assertIn("**Voice match:** wants high pitch, expressive · Bea is high for a woman", profile)
+
+    def test_analysis_can_keep_every_earlier_voice_or_only_the_owners_picks(self):
+        book = os.path.join(self.tmp.name, "mine.epub")
+        with open(book, "wb") as f:
+            f.write(b"epub bytes")
+        args = (None, book, TABLE, "chatterbox", "Elena.wav", "auto", "double", False, False, None)
+        self.assertTrue(chatterbox_ui.analysis_settings(*args)["auto_pick_voices"])
+        self.assertFalse(chatterbox_ui.analysis_settings(*args, "INFO", False)["auto_pick_voices"])
 
     def test_editing_a_character_saves_and_refreshes(self):
         self._save("k", self.cast_store.STATUS_DONE, {

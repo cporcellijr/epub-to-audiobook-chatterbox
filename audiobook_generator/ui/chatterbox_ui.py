@@ -24,6 +24,7 @@ Environment:
 import glob
 import io
 import json
+import logging
 import multiprocessing
 import os
 import re
@@ -33,7 +34,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import gradio as gr
 import yaml
@@ -43,7 +44,7 @@ from pydub import AudioSegment
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import delivery
+from audiobook_generator.core import delivery, voice_measure
 from audiobook_generator.core.cast_llm import llm_configured
 from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.core.chatterbox_control import chatterbox_url
@@ -62,6 +63,8 @@ from audiobook_generator.ui.web_ui import (
     timestamped_output_dir,
 )
 from audiobook_generator.utils.log_handler import generate_unique_log_path
+
+logger = logging.getLogger(__name__)
 
 PREVIEW_PHRASE = (
     "The rain had stopped by the time they reached the old bridge. "
@@ -426,6 +429,7 @@ def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bo
     message = f"Added **{base}** ({seconds:.1f} s of speech{', pauses removed' if remove_pauses else ''})."
     if seconds < SHORT_SAMPLE_SECONDS:
         message += " It's short: Chatterbox sounds steadier with 10-15 s of speech."
+    message += " " + _measure_after_add(file_name)
     choices = openai_voice_choices()
     make_tab_update = gr.update(choices=choices, value=file_name) if engine == "chatterbox" else gr.update()
     return (message, gr.update(choices=choices, value=file_name), make_tab_update,
@@ -500,6 +504,7 @@ def delete_own_voice(name: Optional[str], jobs: List[dict]) -> str:
     if book:
         raise gr.Error(f"'{name}' is used by '{book}' in the queue. Remove or finish that book first.")
     os.remove(path)
+    voice_measure.forget_features(name)
     return f"Deleted **{os.path.splitext(name)[0]}**."
 
 
@@ -510,6 +515,95 @@ def _voice_dropdown_after_delete(choices: list, current_value: Optional[str], de
     if current_value == deleted_name:
         return gr.update(choices=choices, value=default_value)
     return gr.update(choices=choices)
+
+
+# ---- Measuring voices (for cast suggestions) ----
+
+MEASURE_TIMEOUT_SECONDS = 180  # a request waits behind the chunk of a book being generated
+
+
+def _chatterbox_voice_files() -> Dict[str, str]:
+    """{voice file name: path} for every voice in the Chatterbox voices folder."""
+    voices_dir = os.environ.get("TTS_VOICES_DIR")
+    if not voices_dir or not os.path.isdir(voices_dir):
+        return {}
+    return {name: os.path.join(voices_dir, name) for name in os.listdir(voices_dir)
+            if name.lower().endswith(web_ui.VOICE_FILE_EXTENSIONS) and os.path.isfile(os.path.join(voices_dir, name))}
+
+
+def measure_voice(voice: str) -> dict:
+    """Have Chatterbox speak voice_measure.MEASURE_TEXT with this voice (the saved delivery
+    settings, as a book would), measure the speech and save it; returns the measurement."""
+    path = _chatterbox_voice_files().get(voice)
+    if not path:
+        raise ValueError(f"'{voice}' is not in the voices folder")
+    settings = read_saved_settings()
+    payload = {"text": voice_measure.MEASURE_TEXT, "voice_mode": "predefined", "predefined_voice_id": voice,
+               "output_format": "wav", "split_text": True, "chunk_size": 500, "speed_factor": 1.0,
+               "exaggeration": settings["exaggeration"], "cfg_weight": settings["cfg_weight"],
+               "temperature": settings["temperature"]}
+    measurement = voice_measure.measure_audio(_post_json("/tts", payload, timeout=MEASURE_TIMEOUT_SECONDS))
+    voice_measure.save_features(voice, measurement, voice_measure.file_signature(path))
+    logger.info(f"Voice measured: {voice} {measurement}")
+    return measurement
+
+
+def voice_sound_words(voice: Optional[str]) -> str:
+    """How a Chatterbox voice sounds, from its measurement ("low for a woman, husky"), ranked
+    among the measured voices of its recorded gender."""
+    voices = engine_voices_with_gender("chatterbox")
+    traits = voice_measure.voice_traits(voices, voice_measure.load_features())
+    return voice_measure.describe(traits.get(voice or ""), dict(voices).get(voice or "", "neutral"))
+
+
+def _measure_after_add(voice: str) -> str:
+    """Measure a voice just added; a failure (Chatterbox busy, unloaded or unreachable) never
+    fails the add, it only leaves the voice for Measure voices."""
+    try:
+        measure_voice(voice)
+    except Exception as e:
+        logger.warning(f"Voice {voice} not measured after adding it: {e}")
+        return "Not measured yet (Chatterbox couldn't be asked just now): press **Measure voices** later."
+    return f"Measured: sounds {voice_sound_words(voice)}."
+
+
+def voice_sound_text(voice: Optional[str]) -> str:
+    """Voice lab: the selected voice's measurement, or how to get one."""
+    if not voice:
+        return ""
+    measurement = voice_measure.load_features().get(voice)
+    if not measurement:
+        return "Not measured yet: press **Measure voices**."
+    return (f"Sounds **{voice_sound_words(voice)}** ({measurement['f0_median']:.0f} Hz), "
+            f"measured {measurement.get('measured', '')}.")
+
+
+def measure_voices() -> str:
+    """Voice lab: measure every Chatterbox voice not measured yet, or changed since (about 3 s
+    each). Stops at the first sign that Chatterbox can't be reached rather than timing out on
+    every voice."""
+    files = _chatterbox_voice_files()
+    if not files:
+        raise gr.Error("The Chatterbox voices folder is not mounted (TTS_VOICES_DIR).")
+    todo = voice_measure.voices_to_measure(files, voice_measure.load_features())
+    if not todo:
+        return f"All {len(files)} voices are measured."
+    done, failed = 0, []
+    for voice in todo:
+        try:
+            measure_voice(voice)
+            done += 1
+        except urllib.error.HTTPError as e:
+            failed.append(f"{os.path.splitext(voice)[0]} ({_http_error_detail(e)})")
+        except (urllib.error.URLError, OSError) as e:
+            return (f"Measured {done} of {len(todo)}, then Chatterbox couldn't be reached ({e}). "
+                    "Press **Measure voices** again when it's running.")
+        except Exception as e:  # this voice's audio couldn't be measured; the others still can
+            failed.append(f"{os.path.splitext(voice)[0]} ({e})")
+    message = f"Measured {done} voice{'' if done == 1 else 's'}."
+    if failed:
+        message += f" Couldn't measure {', '.join(failed)}."
+    return message
 
 
 # ---- Audiobook generation ----
@@ -881,9 +975,23 @@ def cast_rows(cast: dict, engine: str) -> Tuple[list, list]:
     return rows, keys
 
 
-def character_profile_text(character: dict) -> str:
-    """The clicked character's profile as Markdown: who they are, how they might sound, and the
-    first line they speak."""
+def voice_match_text(character: dict, voice_label: str = "", voice_words: str = "") -> str:
+    """What kind of voice the character's profile asks for, next to how their voice measures:
+    "wants low pitch, clear · Olivia is low for a woman, clear, even"."""
+    targets = cast_store.voice_targets(character)
+    wants = ", ".join(w for w in (f"{targets['pitch']} pitch" if targets["pitch"] else "",
+                                  targets["quality"] or "", targets["delivery"] or "") if w)
+    if not wants and voice_words in ("", "not measured"):
+        return ""
+    parts = [f"wants {wants}" if wants else "no particular voice asked for"]
+    if voice_label and voice_words:
+        parts.append(f"{voice_label} is {voice_words}")
+    return "**Voice match:** " + " · ".join(parts)
+
+
+def character_profile_text(character: dict, voice_match: str = "") -> str:
+    """The clicked character's profile as Markdown: who they are, how they might sound, how their
+    voice matches, and the first line they speak."""
     profile = character.get("profile") or {}
     facts = [f"**{character.get('name', '')}**"]
     if profile.get("role") and profile["role"] != "unknown":
@@ -899,6 +1007,8 @@ def character_profile_text(character: dict) -> str:
                      "analysed (a cast analysed before profiles existed has none until it is analysed again).*")
     if profile.get("voice"):
         parts.append(f"**Sounds like:** {profile['voice']}")
+    if voice_match:
+        parts.append(voice_match)
     if profile.get("relationships"):
         parts.append(f"**Relationships:** {profile['relationships']}")
     first = profile.get("first_line")
@@ -907,16 +1017,47 @@ def character_profile_text(character: dict) -> str:
     return "\n\n".join(parts)
 
 
+def engine_voice_traits(engine: str, voices: Optional[List[Tuple[str, str]]] = None) -> Dict[str, dict]:
+    """Measured traits of the engine's voices (core.voice_measure), for matching; Kokoro voices
+    aren't measured, so they match by gender only."""
+    if engine == "kokoro":
+        return {}
+    return voice_measure.voice_traits(voices if voices is not None else engine_voices_with_gender(engine),
+                                      voice_measure.load_features())
+
+
 def _fill_missing_voices(cast: dict, path: str, engine: str, narrator_voice: Optional[str]) -> dict:
     """Give every character without a voice the automatic suggestion and save, so what the table
     shows is exactly what a queued book would use."""
     if any(not c.get("voice") for c in cast["characters"].values()):
-        suggestions = cast_store.suggest_voices(cast, engine_voices_with_gender(engine), narrator_voice)
+        voices = engine_voices_with_gender(engine)
+        suggestions = cast_store.suggest_voices(cast, voices, narrator_voice, engine_voice_traits(engine, voices))
         for key, voice in suggestions.items():
             cast["characters"][key]["voice"] = voice
         if suggestions:
             cast_store.save_cast(path, cast)
     return cast
+
+
+def resuggest_cast_voices(cast_key: Optional[str], engine: str, narrator_voice: Optional[str],
+                          confirmed: Optional[bool] = True) -> tuple:
+    """Suggest again every voice the owner didn't pick with Save voice (the browser confirms
+    first; a falsy `confirmed` means cancelled). Returns the refreshed table, keys and a status
+    line."""
+    if not confirmed:
+        return gr.update(), gr.update(), gr.update()
+    path, cast = _finished_cast(cast_key)
+    cleared = cast_store.clear_suggested_voices(cast)
+    cast = _fill_missing_voices(cast, path, engine, narrator_voice)
+    cast_store.save_cast(path, cast)
+    kept = sum(1 for c in cast["characters"].values() if c.get("voice_picked"))
+    rows, keys = cast_rows(cast, engine)
+    message = f"Suggested voices again for {cleared} character{'' if cleared == 1 else 's'}"
+    message += f"; kept the {kept} you picked." if kept else "."
+    if not engine_voice_traits(engine):
+        message += (" No voices are measured yet, so this matched by gender only: press **Measure voices** "
+                    "in the Voice lab to match by sound.")
+    return gr.update(value=rows, visible=True), keys, message
 
 
 def _cast_summary(cast: dict) -> str:
@@ -987,10 +1128,16 @@ def select_cast_row(cast_key: Optional[str], keys: list, engine: str, evt: gr.Se
     character = cast["characters"].get(keys[row])
     if not character:
         return None, "", gr.update(), gr.update(), ""
+    choices = engine_voice_choices(engine)
+    voice = character.get("voice") or ""
+    voices = engine_voices_with_gender(engine)
+    words = (voice_measure.describe(engine_voice_traits(engine, voices).get(voice), dict(voices).get(voice, "neutral"))
+             if voice else "")
+    label = dict((value, label) for label, value in choices).get(voice, voice)
     return (keys[row], f"Editing **{character.get('name', keys[row])}**",
             gr.update(value=character.get("gender", "unknown")),
-            gr.update(choices=engine_voice_choices(engine), value=character.get("voice") or None),
-            character_profile_text(character))
+            gr.update(choices=choices, value=voice or None),
+            character_profile_text(character, voice_match_text(character, label, words)))
 
 
 def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gender: str, voice: Optional[str],
@@ -1011,6 +1158,7 @@ def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gende
     character = cast["characters"][character_key]
     character["gender"] = gender if gender in cast_store.GENDERS else "unknown"
     character["voice"] = voice
+    character["voice_picked"] = True  # Suggest voices again keeps it
     cast_store.save_cast(path, cast)
     rows, keys = cast_rows(cast, engine)
     return gr.update(value=rows, visible=True), keys, f"Saved **{character.get('name', character_key)}**: {gender}, {voice}."
@@ -1018,8 +1166,12 @@ def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gende
 
 def analysis_settings(library_book, input_file, chapter_table, engine: str, voice: str, title_mode: str,
                       newline_mode: str, remove_endnotes: bool, remove_reference_numbers: bool,
-                      search_and_replace_file, log_level: str = "INFO") -> dict:
-    """Validate the form for a cast analysis and return the analysis job's settings."""
+                      search_and_replace_file, log_level: str = "INFO", auto_pick_voices: bool = True) -> dict:
+    """Validate the form for a cast analysis and return the analysis job's settings.
+
+    auto_pick_voices: a re-analysis keeps only the voices the owner saved in the cast editor, so
+    every other character gets a fresh suggestion matched to its new profile; off, it keeps every
+    voice the earlier analysis had."""
     if not llm_configured():
         raise gr.Error("No LLM is configured (set LLM_BASE_URL and LLM_MODEL first).")
     if library_book:
@@ -1047,7 +1199,7 @@ def analysis_settings(library_book, input_file, chapter_table, engine: str, voic
         "remove_endnotes": bool(remove_endnotes), "remove_reference_numbers": bool(remove_reference_numbers),
         "search_and_replace_file": _copy_for_queue(replace_file, ".txt") if replace_file else None,
         "engine": engine or "chatterbox", "voice": voice, "log_level": log_level,
-        "cast_key": key, "cast_file": cast_file_for(key),
+        "cast_key": key, "cast_file": cast_file_for(key), "auto_pick_voices": bool(auto_pick_voices),
     }
 
 
@@ -1386,11 +1538,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         return refresh_queue()
 
     def queue_analysis(library_book, input_file, chapter_table, stats, engine, voice, title_mode, newline_mode,
-                       remove_endnotes, remove_reference_numbers, search_and_replace_file, log_level) -> tuple:
+                       remove_endnotes, remove_reference_numbers, search_and_replace_file, log_level,
+                       auto_pick_voices) -> tuple:
         """Analyse this cast before generating queued books; a running book finishes first."""
         job_settings = analysis_settings(library_book, input_file, chapter_table, engine, voice, title_mode,
                                          newline_mode, remove_endnotes, remove_reference_numbers,
-                                         search_and_replace_file, log_level)
+                                         search_and_replace_file, log_level, auto_pick_voices)
         for job in queue.jobs():
             if (job_kind(job) == CAST and job["status"] in (QUEUED, RUNNING)
                     and job["settings"].get("cast_key") == job_settings["cast_key"]):
@@ -1547,7 +1700,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                             "add this book to queue. Repeat for another book, then start the queued books.")
                 with gr.Row(equal_height=True):
                     analyse_button = gr.Button("🎭 Analyse selected chapters", scale=0, min_width=210)
+                    auto_pick_voices = gr.Checkbox(True, label="Auto-pick suggested voices", scale=0, min_width=210,
+                                                   info="Re-analysing keeps only voices you saved; the rest "
+                                                        "are matched to the new profiles.")
+                    resuggest_button = gr.Button("🎯 Suggest voices again", scale=0, min_width=190)
                     cast_status = gr.Markdown("Choose chapters above, then press **Analyse selected chapters**.")
+                resuggest_confirmed = gr.Checkbox(False, visible=False)
                 cast_table = gr.Dataframe(headers=CAST_COLUMNS,
                                           datatype=["str", "str", "number", "str", "str", "str", "str", "str"],
                                           interactive=False, wrap=True, visible=False,
@@ -1623,13 +1781,20 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                     add_button = gr.Button("Add voice")
             add_status = gr.Markdown()
 
-            gr.Markdown("### Voice gender (for cast suggestions)")
+            gr.Markdown("### Voice gender and sound (for cast suggestions)")
             with gr.Row(equal_height=True):
                 lab_gender = gr.Dropdown(VOICE_GENDER_CHOICES, value="", label="Gender of the voice selected above",
                                          info="Multi-voice books suggest voices for characters by gender. "
                                               "Chatterbox voice files carry no gender, so set it here.")
                 save_gender_button = gr.Button("Save gender")
             gender_status = gr.Markdown()
+            lab_sound = gr.Markdown()
+            with gr.Row(equal_height=True):
+                measure_button = gr.Button("Measure voices", scale=0, min_width=160)
+                measure_status = gr.Markdown(
+                    "Cast suggestions match each character's profile to how voices sound: pitch, huskiness and "
+                    "liveliness. **Measure voices** speaks one sentence with every voice not measured yet (about "
+                    "3 s each); a voice you add is measured straight away.")
 
             gr.Markdown("### Delete a voice")
             with gr.Row(equal_height=True):
@@ -1672,8 +1837,16 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         analyse_button.click(queue_analysis,
                              inputs=[library_book, input_file, chapter_table, chapter_stats_state, engine, voice,
                                      title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
-                                     search_and_replace_file, log_level],
+                                     search_and_replace_file, log_level, auto_pick_voices],
                              outputs=[*queue_outputs, cast_key_state, cast_status])
+        # A browser-only confirm sets the hidden checkbox, then the handler reads it: state values
+        # don't pass through a js step reliably, and a cancel must change nothing.
+        resuggest_button.click(
+            None, inputs=None, outputs=resuggest_confirmed,
+            js="() => confirm('Suggest voices again? Voices you saved with Save voice are kept; every other "
+               "character gets a fresh suggestion.')",
+        ).then(resuggest_cast_voices, inputs=[cast_key_state, engine, voice, resuggest_confirmed],
+               outputs=[cast_table, cast_keys_state, cast_status])
         cast_table.select(select_cast_row, inputs=[cast_key_state, cast_keys_state, engine],
                           outputs=[cast_selected, cast_editing, cast_gender, cast_voice, cast_profile])
         cast_apply_button.click(apply_cast_edit, inputs=[cast_key_state, cast_selected, cast_gender, cast_voice, engine],
@@ -1709,7 +1882,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         voice.input(_sync_if_chatterbox, inputs=[voice, engine], outputs=lab_voice)
         lab_voice.input(_sync_if_chatterbox, inputs=[lab_voice, engine], outputs=voice)
         lab_voice.change(voice_gender_of, inputs=lab_voice, outputs=lab_gender)
-        save_gender_button.click(save_voice_gender, inputs=[lab_voice, lab_gender], outputs=gender_status)
+        lab_voice.change(voice_sound_text, inputs=lab_voice, outputs=lab_sound)
+        # A voice's words are relative to its gender, so they change with it.
+        save_gender_button.click(save_voice_gender, inputs=[lab_voice, lab_gender], outputs=gender_status) \
+            .then(voice_sound_text, inputs=lab_voice, outputs=lab_sound)
+        measure_button.click(measure_voices, inputs=None, outputs=measure_status) \
+            .then(voice_sound_text, inputs=lab_voice, outputs=lab_sound)
         # The player stays hidden until the first sample, then shows before the audio arrives.
         sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
             .then(sample_voice, inputs=[engine, voice, speed], outputs=sample_audio)
@@ -1739,6 +1917,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
 
         ui.load(refresh_voices, inputs=None, outputs=[voice, lab_voice, delete_voice_dropdown, dialogue_voice])
         ui.load(voice_gender_of, inputs=lab_voice, outputs=lab_gender)
+        ui.load(voice_sound_text, inputs=lab_voice, outputs=lab_sound)
         ui.load(refresh_library, inputs=None, outputs=library_book)
         ui.load(load_saved_settings, inputs=None, outputs=[exaggeration, cfg_weight, temperature])
         ui.load(delivery_baseline_text, inputs=[exaggeration, cfg_weight, temperature], outputs=delivery_baseline_info)

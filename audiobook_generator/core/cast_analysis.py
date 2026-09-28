@@ -73,7 +73,8 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
                 "unknown": sum(1 for speaker in lines.values() if speaker is None),
             }
             cast["characters"] = dict(roster.characters)
-            cast_store.carry_voice_choices(previous, cast["characters"])
+            cast_store.carry_voice_choices(previous, cast["characters"],
+                                           picked_only=bool(settings.get("auto_pick_voices")))
             cast["chapters_done"] = done
             cast_store.save_cast(path, cast)
             log.info(f"Cast: {done}/{len(selection)} chapters analysed, {len(roster.characters)} characters, "
