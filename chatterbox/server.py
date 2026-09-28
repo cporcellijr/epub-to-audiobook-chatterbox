@@ -710,6 +710,7 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
         safe_filename = utils.sanitize_filename(file.filename)
         destination_path = ref_path / safe_filename
 
+        written = False
         try:
             if not (
                 safe_filename.lower().endswith(".wav")
@@ -725,6 +726,7 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
                     uploaded_filenames_successfully.append(safe_filename)
                 continue
 
+            written = True  # from here on, destination_path is this request's own file
             with open(destination_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             logger.info(
@@ -753,7 +755,9 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
             logger.error(error_msg, exc_info=True)
             upload_errors.append({"filename": file.filename, "error": str(e_upload)})
             # Don't leave a partial/broken file behind for the voice picker to list (F-61).
-            if destination_path.exists():
+            # Only a file this request wrote: an upload rejected before writing (wrong type)
+            # must not delete an existing file that happens to share its name.
+            if written and destination_path.exists():
                 try:
                     destination_path.unlink()
                     logger.info(f"Removed partially written upload: {destination_path}")
@@ -803,6 +807,7 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
         safe_filename = utils.sanitize_filename(file.filename)
         destination_path = predefined_voices_path / safe_filename
 
+        written = False
         try:
             if not (
                 safe_filename.lower().endswith(".wav")
@@ -820,6 +825,7 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
                     uploaded_filenames_successfully.append(safe_filename)
                 continue
 
+            written = True  # from here on, destination_path is this request's own file
             with open(destination_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             logger.info(
@@ -845,7 +851,9 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
             logger.error(error_msg, exc_info=True)
             upload_errors.append({"filename": file.filename, "error": str(e_upload)})
             # Don't leave a partial/broken file behind for the voice picker to list (F-61).
-            if destination_path.exists():
+            # Only a file this request wrote: an upload rejected before writing (wrong type)
+            # must not delete an existing file that happens to share its name.
+            if written and destination_path.exists():
                 try:
                     destination_path.unlink()
                     logger.info(f"Removed partially written upload: {destination_path}")
