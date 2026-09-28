@@ -1,5 +1,8 @@
 # Addendum: the rest of `chatterbox/` and the model package
 
+**Note, 2026-09-28:** F-49, F-50, F-51 and F-58 do not apply to the model package the image installs;
+see the status note at the top of `REVIEW_FINDINGS.md`.
+
 Continues the numbering of `REVIEW_FINDINGS.md` (F-49 onward) so it can be merged
 into that file. Same method: four junior packages (WP8 server endpoints, WP9 config/utilities/launchers/
 docs, WP10 browser UI, WP11 model package), every finding re-checked by the PM against the code and

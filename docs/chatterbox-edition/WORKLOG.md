@@ -1,6 +1,6 @@
 # Chatterbox edition: work log and findings
 
-Covers 2026-09-25 to 2026-09-27. Written for the owner and for any agent reviewing or continuing
+Covers 2026-09-25 to 2026-09-28. Written for the owner and for any agent reviewing or continuing
 this project. Personal library details (book titles, authors) are deliberately left out.
 
 Since 2026-09-27 this repo holds the whole stack: the audiobook app at the root and the Chatterbox
@@ -23,9 +23,11 @@ EPUB (library mount or upload)
  → EpubBookParser: spine order, paragraphs from HTML blocks
  → chapter_selection: pre-tick story, untick front/back matter (user can override)
  → JobQueue: one book at a time
- → OpenAITTSProvider paced mode: sentence-sized units → Chatterbox /v1/audio/speech (WAV)
-     → join PCM with sentence/paragraph silences → chapter MP3 in <book>/.chapters/
- → m4b.build_m4b: concat → AAC, chapter markers, cover, tags → <book>/<Title>.m4b
+ → OpenAITTSProvider paced mode: sentence-sized units (or whole paragraphs, opt-in)
+     → Chatterbox /v1/audio/speech (WAV) → join PCM with sentence/paragraph silences, one speed
+       change per chapter → chapter AAC in <book>/.chapters/ (MP3 when not making an M4B)
+ → m4b.build_m4b: concat by stream copy (no re-encode), chapter markers, cover, tags
+     → <book>/<Title>.m4b
  → audiobook library → BookOrbit
 ```
 
@@ -33,10 +35,11 @@ EPUB (library mount or upload)
 
 ### 2.1 Behaviour this app depends on (verified)
 
-- **Strictly serial.** Synthesis is a blocking call inside an async endpoint, so the server handles
-  one request at a time, and even `GET /v1/audio/voices` waits behind a running synthesis (it
-  timed out at 5 s in testing). This is why the app uses one worker and reads the voice list
-  from the mounted voices folder instead of asking the server.
+- **One generation at a time.** Until 2026-09-28 synthesis blocked the server's event loop, so even
+  `GET /v1/audio/voices` waited behind a running synthesis (it timed out at 5 s in testing). Now
+  synthesis runs in a worker thread and one engine lock keeps generation serial, so other endpoints
+  answer while a book is generating (F-10, F-54). The app still uses one worker and reads the voice
+  list from the mounted voices folder.
 - **`/v1/audio/speech` chunking.** Input is split at sentence boundaries into chunks of up to 500
   characters (Original; 400 for other models). Each chunk is generated independently and they are
   stitched with a 200 ms crossfaded pause (`SENTENCE_PAUSE_MS`).
@@ -75,7 +78,8 @@ EPUB (library mount or upload)
 
 Until 2026-09-27 these patches existed only as uncommitted edits in a local clone, deployed through
 a thin image (`FROM` the full build, `COPY server.py`). They are now committed here and the image is
-built from `chatterbox/`.
+built from `chatterbox/`. The review fixes of 2026-09-28 added more local changes (section 10);
+`git log -- chatterbox` lists them all.
 
 ## 3. Voice reference clips (findings)
 
@@ -116,8 +120,8 @@ built from `chatterbox/`.
 | 8 | Searchable library picker, "Title — Author" from each EPUB's metadata, cached in `library_index.json` | Typing a title beats uploading files; 1,517 books: first build ~13 s, refresh ~5 s | `ui/library_index.py` |
 | 9 | Preview writes nothing | #186 dropped `cover.jpg` into the output folder even when previewing, leaving cover-only "books" in the library | `core/audiobook_generator.py` |
 | 10 | Chapter checkboxes with automatic selection; ticked chapters renumbered 1…n | Front/back matter (title pages, copyright, contents, acknowledgements, "also by", newsletter pages) was being narrated | `core/chapter_selection.py`, UI |
-| 11 | Paced narration: paragraphs from HTML block elements; one request per sentence-sized unit (sentences under 40 characters join the next); inserted pauses, 0.35 s after sentences and 0.9 s between paragraphs by default, scaled by speed | Upstream collapsed paragraph breaks (the OpenAI provider's break marker was whitespace), and long requests left only ~0.2 s between sentences | `tts_providers/openai_tts_provider.py`, parser |
-| 12 | Single M4B per book: chapters in a hidden `.chapters` folder, merged only when all succeed; AAC, chapter markers, cover, tags | BookOrbit mishandles multi-file books; the library never sees a half-made book; failed books can be resumed | `core/m4b.py`, generator |
+| 11 | Paced narration: paragraphs from HTML block elements; one request per sentence-sized unit (sentences under 40 characters join the next); inserted pauses, 0.35 s after sentences and 0.9 s between paragraphs by default; at speeds other than 1.0 the finished chapter is stretched once, pauses included | Upstream collapsed paragraph breaks (the OpenAI provider's break marker was whitespace), and long requests left only ~0.2 s between sentences | `tts_providers/openai_tts_provider.py`, parser |
+| 12 | Single M4B per book: chapters in a hidden `.chapters` folder, merged only when all succeed; AAC chapters joined by stream copy, chapter markers, cover, tags | BookOrbit mishandles multi-file books; the library never sees a half-made book; failed books can be resumed | `core/m4b.py`, generator |
 | 13 | Book queue: persisted, runs one book at a time, pause/resume/stop, remove, retry; a book interrupted by a restart resumes first | Queue several books | `ui/job_queue.py`, UI |
 
 Chapter auto-selection is adapted from abogen's scoring (MIT; see `THIRD_PARTY_NOTICES.md`) with four
@@ -138,29 +142,29 @@ non-story after one fix (a novel stored as a single section that begins with its
 | Same passage, A/B | Before: 83 s audio, 0 pauses ≥ 0.6 s. After: 98 s, 14 pauses ≥ 0.6 s |
 | Very short inputs ("Yes.", "Hmm?") | 0.36–1.32 s of audio; no runaway generations |
 | Library index | 1,517 EPUBs; first build ~13 s; refresh ~5 s; parsing one book 0.04–0.19 s |
-| Tests | 135 passing (upstream baseline: 28 tests, 2 erroring on a mock that closed stdout) |
+| Tests | 241 passing, plus 19 for `chatterbox/` (135 before the review fixes; upstream baseline: 28 tests, 2 erroring on a mock that closed stdout) |
 
 ## 7. Known limitations and open questions
 
 | ID | Item |
 |---|---|
-| K1 | Double lossy encoding: chapters are MP3 64 kbps, then the M4B re-encodes to AAC 64 kbps. Lossless intermediates would avoid it. |
+| K1 | Resolved 2026-09-28 (F-06): for an M4B the chapters are AAC and are stream-copied into it, so there is one lossy encode. Was: MP3 chapters re-encoded to AAC. |
 | K2 | Time estimates are calibrated on one voice; other voices speak at different rates. |
 | K3 | A very short, untitled opening section (under ~1,000 characters) is unticked; real openings titled "Chapter…" or "Prologue" are always kept. |
 | K4 | Some collections repeat a title/author/copyright header inside every story; it is narrated. Search & replace can remove it; nothing automatic yet. |
 | K5 | The non-paced path (CLI default) still sends 1,800-character requests, so the 1000-token cap can cut words. |
-| K6 | One failed request (after the OpenAI SDK's retries) fails the whole chapter; the chapter's finished units are discarded. |
-| K7 | Per-request overhead: a 30-minute chapter is several hundred requests, each paying the server's fixed cost. |
-| K8 | Queue: all books log to one shared file; progress counts finished chapter files only; the worker thread forks processes from a multithreaded server. |
+| K6 | One failed request fails the whole chapter; the chapter's finished units are discarded. Partly resolved (F-02): connection errors and 502/503/504 are retried for up to 10 minutes, so a Chatterbox restart is waited out. |
+| K7 | Per-request overhead: a 30-minute chapter is several hundred requests, each paying the server's fixed cost. Partly resolved (F-05): Advanced → Narration units → Whole paragraphs sends about a quarter as many requests; experimental until checked on real chapters. |
+| K8 | Queue: all books log to one shared file; progress counts finished chapter files only. Resolved (F-19, F-29): job processes are spawned, not forked, and stale chapter files from an earlier run are not counted. |
 | K9 | The library index walks the whole library on every page load (~5 s over a Windows bind mount). |
 | K10 | Pauses, M4B output and chapter selection are UI-only; the CLI has no flags for them. |
 | K11 | `requirements.txt` pins every dependency; the local image's Gradio 5.50 vs. upstream's image 5.33 is a deliberate pin, not drift. |
-| K12 | Security: the UI has no login and is reachable on the LAN; the Book box accepts any existing path; the Voice lab writes into the voices folder and changes Chatterbox's global settings. |
+| K12 | Security: the UI has no login and is reachable on the LAN (the owner's choice); the Voice lab writes into the voices folder and changes Chatterbox's global settings. Since 2026-09-28 the book and the output folder must be inside the library and output folders (F-21), and Chatterbox refuses cross-origin browser calls (F-55). |
 | K13 | Upstream's `web_ui.py` stays in place to keep upstream merges easy; `main_ui.py` uses `chatterbox_ui.py`, which reuses helpers from it. |
-| K14 | Upstream's `.gitattributes` (`* text=auto`) gives Windows checkouts a CRLF `entrypoint.sh`, and the container then fails to start. Worked around locally with `core.eol lf`; `*.sh text eol=lf` would fix it for everyone. |
+| K14 | Resolved (F-35): `.gitattributes` now forces LF for `*.sh`. Was: upstream's `* text=auto` gave Windows checkouts a CRLF `entrypoint.sh`, and the container failed to start. |
 | K15 | The OpenAI provider logs "Unsupported model name … unable to retrieve the price" for every chapter; the cost estimate is meaningless for a local server. |
 | K16 | Voice lab "Save for books" changes Chatterbox's global settings at once, including for a book in progress and for BookOrbit. |
-| K17 | At speeds other than 1.0, Chatterbox stretches each unit separately; the inserted pauses are scaled on the client. |
+| K17 | Resolved (F-27): units are generated at 1.0 and the finished chapter is stretched once, pauses included. Was: Chatterbox stretched each unit separately. |
 
 ## 8. Run, test, deploy
 
@@ -172,7 +176,11 @@ non-story after one fix (a novel stored as a single section that begins with its
   `compose.yaml` that includes the repo's file with its own `.env`. Rebuilding the app is quick;
   rebuilding Chatterbox only redoes changed layers unless its requirements change. Restarting the app
   while a book is generating stops it, and the queue resumes it on the next start; restarting
-  Chatterbox fails the chapter in progress (K6).
+  Chatterbox pauses the book, since the app waits up to 10 minutes for it (F-02). Compose starts the
+  app only once Chatterbox's healthcheck reports its model loaded.
+- Chatterbox's settings: on a first run, copy `chatterbox/config.audiobook.yaml` (this deployment's
+  tuned values) into `CHATTERBOX_DATA` as `config.yaml`; `chatterbox/config.yaml` is upstream's
+  template. The whole `CHATTERBOX_DATA` folder is mounted so settings saves are atomic (F-52).
 - Chatterbox upstream updates: `git subtree pull --prefix=chatterbox
   https://github.com/devnen/Chatterbox-TTS-Server.git main --squash`, then re-check the patches.
 - Upstream updates: `git fetch upstream && git merge upstream/main`, then run the tests and rebuild.
@@ -187,3 +195,31 @@ non-story after one fix (a novel stored as a single section that begins with its
   chapters, throughput from the server's token logs. Two early theories ("chunk crossfades cause the
   tin-can sound", "buffering causes the mid-sentence pauses") were wrong.
 - Keep real library titles out of test fixtures and docs.
+- A stream copy keeps whatever timestamps it is handed. Test audio joins with realistic,
+  variable-bitrate audio: a constant tone hid the AAC chapter-join bug in section 10.
+
+## 10. Review fixes (2026-09-28)
+
+The cloud review (`REVIEW_FINDINGS.md`, `REVIEW_FINDINGS_CHATTERBOX.md`) was carried out in five
+packages (text, generator and M4B, narration, queue and UI, Chatterbox and deployment), each built
+by a junior agent in its own worktree and reviewed and merged by the PM. The status of every finding
+is at the top of `REVIEW_FINDINGS.md`. What changes in use:
+
+- M4B books: chapters are generated as AAC and stream-copied into the book.
+- Speed: units are generated at 1.0 and each finished chapter is stretched once.
+- Units over 450 characters are split at punctuation (or a space), so none reach the token cap
+  (F-07); symbol-only units such as scene breaks are dropped (F-18).
+- The app waits out a Chatterbox restart (F-02).
+- Chatterbox: generation runs in a worker thread under one lock, so health checks, the voice list
+  and settings saves answer during a book; model reload and unload wait for that lock; settings saves
+  are atomic; cross-origin browser calls are refused; a warning is logged when a chunk hits the
+  1000-token cap (F-56). The model package is pinned to `chatterbox-v2@cc03573`; bump it
+  deliberately.
+- New option: Advanced → Narration units → Whole paragraphs (experimental, about 8% faster).
+
+Caught while integrating: F-06's stream copy placed each AAC chapter join where ffprobe *estimated*
+the previous chapter ended. ADTS AAC has no duration header, so the estimate comes from the bitrate,
+and it was off by up to 8% per chapter: chapter markers drifted, and ffmpeg squashed the overlapping
+audio packets to zero length. Chapter lengths are now summed from the packets and written into the
+concat list. The F-06 test used a pure tone, whose constant bitrate hides the problem; the new test
+uses a chapter that starts loud and ends quiet.
