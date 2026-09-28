@@ -320,7 +320,7 @@ def preview_delivery_range(voice: str, phrase: str, exaggeration: float, cfg_wei
             raise gr.Error(f"Chatterbox could not make the {mood} sample: {_http_error_detail(e)}")
         except Exception as e:
             raise gr.Error(f"Could not reach Chatterbox: {e}")
-        clip = delivery.peak_guard(AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3").apply_gain(gain_db))
+        clip = delivery.guarded_gain(AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3"), gain_db)
         combined = clip if combined is None else combined + AudioSegment.silent(duration=1000) + clip
     handle, path = tempfile.mkstemp(prefix="voice_preview_", suffix=".mp3")
     with os.fdopen(handle, "wb") as f:

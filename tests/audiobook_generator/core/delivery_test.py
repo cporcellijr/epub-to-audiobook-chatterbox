@@ -65,6 +65,33 @@ class TestPeakGuard(unittest.TestCase):
         self.assertIs(peak_guard(silence), silence)
 
 
+def _sine(peak_dbfs: float, frame_rate: int = 24000, duration_ms: int = 300) -> AudioSegment:
+    """A 220 Hz sine peaking at peak_dbfs: unlike a square wave, clipping visibly changes its shape."""
+    import math
+    amplitude = 32767 * 10 ** (peak_dbfs / 20)
+    count = int(frame_rate * duration_ms / 1000)
+    samples = [int(round(amplitude * math.sin(2 * math.pi * 220 * i / frame_rate))) for i in range(count)]
+    return AudioSegment(data=struct.pack("<%dh" % count, *samples), sample_width=2, frame_rate=frame_rate, channels=1)
+
+
+class TestGuardedGain(unittest.TestCase):
+
+    def test_an_excited_gain_on_a_near_full_scale_clip_never_clips(self):
+        # Chatterbox's clips peak near -0.4 dBFS: +1.5 dB first and the guard after flattened the peaks.
+        clip = _sine(-0.4)
+        out = delivery.guarded_gain(clip, 1.5)
+        self.assertAlmostEqual(out.max_dBFS, delivery.PEAK_GUARD_DBFS, delta=0.1)
+        before, after = clip.get_array_of_samples(), out.get_array_of_samples()
+        factor = max(map(abs, after)) / max(map(abs, before))
+        self.assertLessEqual(max(abs(b * factor - a) for a, b in zip(after, before)), 2)  # just scaled, same shape
+
+    def test_the_full_gain_applies_when_there_is_headroom_and_silence_is_left_alone(self):
+        self.assertAlmostEqual(delivery.guarded_gain(_sine(-10.0), 1.5).max_dBFS, -8.5, delta=0.1)
+        self.assertAlmostEqual(delivery.guarded_gain(_sine(-3.0), -6.0).max_dBFS, -9.0, delta=0.1)
+        silence = AudioSegment.silent(duration=200)
+        self.assertIs(delivery.guarded_gain(silence, 1.5), silence)
+
+
 class TestMoodOf(unittest.TestCase):
 
     def test_no_cues_is_normal(self):

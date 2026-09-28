@@ -784,8 +784,7 @@ class OpenAITTSProvider(BaseTTSProvider):
             if sentence_count > 1 and sentence_gap_ms > 0:
                 audio = _stretch_sentence_gaps(audio, sentence_count - 1, sentence_gap_ms)
             if adaptive:
-                gain_db = delivery.preset(mood, baseline)[3]
-                audio = delivery.peak_guard(audio.apply_gain(gain_db))
+                audio = delivery.guarded_gain(audio, delivery.preset(mood, baseline)[3])
             if audio_format is None:
                 audio_format = (audio.frame_rate, audio.channels, audio.sample_width)
             else:

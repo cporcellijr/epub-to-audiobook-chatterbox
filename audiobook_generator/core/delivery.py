@@ -54,6 +54,21 @@ def preset(mood: str, baseline: Baseline) -> Tuple[float, float, float, float]:
     return (round(b_exag, 2), round(b_cfg, 2), round(b_temp, 2), 0.0)
 
 
+def guarded_gain(audio: AudioSegment, gain_db: float) -> AudioSegment:
+    """A mood's gain, but never more than takes the clip's peak to PEAK_GUARD_DBFS (a louder clip is
+    turned down to it, as peak_guard does).
+
+    Gain and guard must be one step. Measured 2026-09-28: Chatterbox returns clips already peaking
+    near -0.4 dBFS, so the excited +1.5 dB applied first pushed peaks past full scale, where pydub's
+    apply_gain clips the waveform flat, and turning the clip down afterwards can't undo that. A
+    single shouted word, loud from end to end, came out audibly distorted (8 of 18 excited test clips
+    had 20-85 samples flattened at the top; normal clips had none)."""
+    peak = audio.max_dBFS
+    if peak == float("-inf"):
+        return audio
+    return audio.apply_gain(min(gain_db, PEAK_GUARD_DBFS - peak))
+
+
 def peak_guard(audio: AudioSegment) -> AudioSegment:
     """Turn a clip down to exactly PEAK_GUARD_DBFS if its peak is louder than that; silence (whose
     peak is -inf) and anything already at or under the guard are returned unchanged."""
