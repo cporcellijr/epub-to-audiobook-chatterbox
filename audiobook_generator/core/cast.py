@@ -233,7 +233,12 @@ def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Op
         if character.get("voice") in use_count:
             use_count[character["voice"]] += 1
     suggestions: Dict[str, str] = {}
-    for key, character in ranked_characters(cast):
+    # Characters with a known gender choose first, so a prominent character of unknown gender (who
+    # can take any voice) never takes the only fitting voice from one who can't.
+    ranked = ranked_characters(cast)
+    ordered = ([item for item in ranked if item[1].get("gender", "unknown") != "unknown"]
+               + [item for item in ranked if item[1].get("gender", "unknown") == "unknown"])
+    for key, character in ordered:
         if character.get("voice"):
             continue
         wanted = character.get("gender", "unknown")
@@ -249,6 +254,41 @@ def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Op
         use_count[chosen] += 1
         suggestions[key] = chosen
     return suggestions
+
+
+def carry_voice_choices(previous: Optional[dict], characters: Dict[str, dict]) -> int:
+    """Give characters of a fresh analysis the voice (and a known gender) an earlier analysis of the
+    same book had for the same person, so re-analysing never throws away the owner's picks.
+
+    A character matches by key, else by exactly one earlier character sharing a name or alias with
+    it; an ambiguous match is left for the owner to review. Characters that already have a voice are
+    left alone. Returns how many characters got a carried voice."""
+    if not previous:
+        return 0
+    old = {key: c for key, c in previous.get("characters", {}).items() if c.get("voice")}
+
+    def forms(key: str, character: dict) -> set:
+        names = [character.get("name", ""), *character.get("aliases", [])]
+        return ({key} | {normalize_name(n) for n in names}) - {""}
+
+    old_forms = {key: forms(key, c) for key, c in old.items()}
+    carried = 0
+    for key, character in characters.items():
+        if character.get("voice"):
+            continue
+        if key in old:
+            match = key
+        else:
+            mine = forms(key, character)
+            hits = [old_key for old_key, names in old_forms.items() if names & mine]
+            match = hits[0] if len(hits) == 1 else None
+        if match is None:
+            continue
+        character["voice"] = old[match]["voice"]
+        if old[match].get("gender") in GENDERS and old[match]["gender"] != "unknown":
+            character["gender"] = old[match]["gender"]
+        carried += 1
+    return carried
 
 
 def voices_belong_to_engine(cast: dict, engine: str, known_voices: Optional[List[str]] = None) -> List[str]:

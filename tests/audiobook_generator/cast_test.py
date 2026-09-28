@@ -123,6 +123,14 @@ class TestSuggestions(unittest.TestCase):
         third = cast_store.suggest_voices(third_female, VOICES, "Narrator.wav")
         self.assertEqual(third["c"], "Eve.wav")  # both female voices taken: the neutral one, not a male one
 
+    def test_a_known_gender_is_served_before_an_unknown_one_that_could_take_anything(self):
+        # One female and one male voice. The unknown-gender character has more lines, but must not
+        # take the only female voice from the female character (who would then have to share it
+        # while the male voice sits unused).
+        cast = _cast({"x": (10, "unknown", None), "ada": (5, "female", None)})
+        suggestions = cast_store.suggest_voices(cast, [("F.wav", "female"), ("M.wav", "male")], "Narrator.wav")
+        self.assertEqual(suggestions, {"ada": "F.wav", "x": "M.wav"})
+
     def test_voices_are_shared_only_when_none_are_left_and_the_least_used_first(self):
         cast = _cast({f"c{n}": (20 - n, "female", None) for n in range(5)})
         suggestions = cast_store.suggest_voices(cast, [("Ada.wav", "female"), ("Bea.wav", "female")], "Narrator.wav")
@@ -132,6 +140,25 @@ class TestSuggestions(unittest.TestCase):
         cast = _cast({"anne": (50, "female", "Bea.wav"), "cara": (30, "female", None)})
         suggestions = cast_store.suggest_voices(cast, VOICES, "Narrator.wav")
         self.assertEqual(suggestions, {"cara": "Ada.wav"})
+
+    def test_reanalysis_keeps_earlier_voice_picks_by_key_or_unambiguous_name(self):
+        previous = _cast({"ada marsh": (5, "female", "Bea.wav"), "tom": (4, "male", "Cal.wav")})
+        previous["characters"]["tom"]["aliases"] = ["Thomas"]
+        fresh = _cast({"ada marsh": (6, "unknown", None), "thomas": (4, "male", None), "new": (2, "female", None)})
+        carried = cast_store.carry_voice_choices(previous, fresh["characters"])
+        self.assertEqual(carried, 2)
+        self.assertEqual((fresh["characters"]["ada marsh"]["voice"], fresh["characters"]["ada marsh"]["gender"]),
+                         ("Bea.wav", "female"))
+        self.assertEqual(fresh["characters"]["thomas"]["voice"], "Cal.wav")
+        self.assertIsNone(fresh["characters"]["new"].get("voice"))
+
+    def test_an_ambiguous_name_match_is_left_for_review(self):
+        previous = _cast({"ann": (5, "female", "Ada.wav"), "anne": (4, "female", "Bea.wav")})
+        previous["characters"]["ann"]["aliases"] = ["Miss Gray"]
+        previous["characters"]["anne"]["aliases"] = ["Miss Gray"]
+        fresh = _cast({"miss gray": (3, "female", None)})
+        self.assertEqual(cast_store.carry_voice_choices(previous, fresh["characters"]), 0)
+        self.assertIsNone(fresh["characters"]["miss gray"].get("voice"))
 
     def test_no_voices_means_no_suggestions(self):
         self.assertEqual(cast_store.suggest_voices(_cast({"a": (1, "male", None)}), [], None), {})

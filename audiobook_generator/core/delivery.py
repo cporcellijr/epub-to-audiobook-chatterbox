@@ -129,11 +129,14 @@ def segment_moods(paragraphs: List[List[Segment]]) -> Dict[int, str]:
         for i, piece in enumerate(segments):
             if piece.kind != DIALOGUE:
                 continue
-            if piece.continues:
-                moods[piece.line_id] = moods.get(piece.line_id - 1, MOOD_NORMAL)
-                continue
             before = segments[i - 1].text if i > 0 and segments[i - 1].kind == NARRATION else ""
             after = segments[i + 1].text if i + 1 < len(segments) and segments[i + 1].kind == NARRATION else ""
+            if piece.continues:
+                # A speech continued over paragraphs keeps its mood, unless this paragraph gives a
+                # clear new cue of its own ("... and run!" he shouted).
+                own = mood_of(before, piece.text, after)
+                moods[piece.line_id] = own if own != MOOD_NORMAL else moods.get(piece.line_id - 1, MOOD_NORMAL)
+                continue
             moods[piece.line_id] = mood_of(before, piece.text, after)
             cue = _cue_mood(before, after)
             if cue:

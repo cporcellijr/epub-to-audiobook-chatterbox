@@ -45,6 +45,9 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
     selection = [n for n in settings.get("chapter_selection") or range(1, len(chapters) + 1) if 0 < n <= len(chapters)]
     key = settings.get("cast_key") or cast_store.cast_key(settings["input_file"])
     path = settings["cast_file"]
+    previous = cast_store.load_cast(path)  # an earlier analysis of this book: its voice picks carry over
+    if previous and previous.get("engine") != settings.get("engine", "chatterbox"):
+        previous = None  # another engine's voices can't be used
     cast = cast_store.new_cast(key, settings["input_file"], parser.get_book_title(), parser.get_book_author(),
                                settings.get("engine", "chatterbox"), settings.get("voice"), selection)
     cast_store.save_cast(path, cast)
@@ -65,6 +68,7 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
                 "unknown": sum(1 for speaker in lines.values() if speaker is None),
             }
             cast["characters"] = dict(roster.characters)
+            cast_store.carry_voice_choices(previous, cast["characters"])
             cast["chapters_done"] = done
             cast_store.save_cast(path, cast)
             log.info(f"Cast: {done}/{len(selection)} chapters analysed, {len(roster.characters)} characters, "

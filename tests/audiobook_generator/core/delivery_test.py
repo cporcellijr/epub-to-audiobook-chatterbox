@@ -131,13 +131,13 @@ class TestSegmentMoods(unittest.TestCase):
         moods = segment_moods(chapter_segments(f"Nothing happens here.{M}Nor here."))
         self.assertEqual(moods, {})
 
-    def test_a_continued_line_inherits_the_previous_lines_final_mood_ignoring_its_own_cues(self):
-        # Paragraph 1's own lead-in ("whispered,") makes line 1 soft; paragraph 2's own narration
-        # ("he shouted") would make line 2 excited on its own, but it continues line 1's quotation
-        # and must inherit "soft" instead.
+    def test_a_continued_line_inherits_the_speechs_mood(self):
+        text = f'She whispered, "First part.{M}"Second part," she said.'
+        self.assertEqual(segment_moods(chapter_segments(text)), {1: MOOD_SOFT, 2: MOOD_SOFT})
+
+    def test_a_clear_new_cue_in_a_continued_paragraph_overrides_the_inherited_mood(self):
         text = f'She whispered, "First part.{M}"Second part," he shouted.'
-        moods = segment_moods(chapter_segments(text))
-        self.assertEqual(moods, {1: MOOD_SOFT, 2: MOOD_SOFT})
+        self.assertEqual(segment_moods(chapter_segments(text)), {1: MOOD_SOFT, 2: MOOD_EXCITED})
 
 
 class TestParagraphMood(unittest.TestCase):

@@ -97,6 +97,21 @@ class TestAnalyseBook(unittest.TestCase):
         saved = cast_store.load_cast(self.settings["cast_file"])
         self.assertEqual((saved["status"], saved["error"], saved["chapters_done"]), ("failed", "LLM down", 0))
 
+    def test_re_analysing_keeps_the_voices_already_picked(self):
+        first = ScriptedChat(
+            {"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"},
+             "characters": [{"name": "Ada Marsh", "gender": "female", "age": "adult"}]},
+            {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}})
+        analyse_book(self.settings, chat=first)
+        cast = cast_store.load_cast(self.settings["cast_file"])
+        cast["characters"]["ada marsh"]["voice"] = "Picked.wav"
+        cast_store.save_cast(self.settings["cast_file"], cast)
+        again = ScriptedChat({"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}},
+                             {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}})
+        redone = analyse_book(self.settings, chat=again)
+        self.assertEqual(redone["characters"]["ada marsh"]["voice"], "Picked.wav")
+        self.assertIsNone(redone["characters"]["tom"].get("voice"))
+
     def test_only_selected_chapters_are_analysed(self):
         self.settings["chapter_selection"] = [2]
         cast = analyse_book(self.settings, chat=ScriptedChat({"speakers": {"1": "Mother", "2": "Tom"}}))
