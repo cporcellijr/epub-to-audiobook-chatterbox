@@ -495,8 +495,9 @@ class OpenAITTSProvider(BaseTTSProvider):
     def _voice_of(self, text: str) -> VoiceOf:
         """The per-segment voice rule for one chapter: narration is the narrator's voice; a
         quoted line is its attributed character's voice when the cast knows the speaker and has
-        given them a voice, else the dialogue voice (else the narrator's, so a mode without a
-        dialogue voice degrades to single voice rather than failing)."""
+        given them a voice (the narrator's own for a first-person book's narrating character),
+        else the dialogue voice (else the narrator's, so a mode without a dialogue voice degrades
+        to single voice rather than failing)."""
         narrator = self.config.voice_name
         dialogue_voice = self.config.dialogue_voice or narrator
         if self.cast is None:
@@ -509,10 +510,17 @@ class OpenAITTSProvider(BaseTTSProvider):
                            "every quoted line gets the dialogue voice")
             lines = {}
 
+        # In a first-person book the "I" character's own lines are the narrator's too, as one
+        # performer would read them (unless the owner gave that character a voice of their own).
+        narrating = cast_store.narrating_character(self.cast)
+
         def voice_of(piece: Segment) -> str:
             if piece.kind != DIALOGUE:
                 return narrator
-            return cast_store.character_voice(self.cast, lines.get(piece.line_id)) or dialogue_voice
+            speaker = lines.get(piece.line_id)
+            if speaker and speaker == narrating:
+                return narrator
+            return cast_store.character_voice(self.cast, speaker) or dialogue_voice
         return voice_of
 
     def _mood_of(self, text: str) -> MoodOf:

@@ -302,12 +302,14 @@ def exaggeration_offsets(cast: dict) -> Dict[str, float]:
     cast's line-weighted average and capped at the step: measured 2026-09-28, the model called 5 of
     6 characters of a dramatic book "expressive", and uncentred that made nearly all its dialogue
     louder instead of making characters differ. The book's tone sets the level (the narrator's
-    sliders); characters differ around it. A character with no delivery at all (no profile) stays
-    as the book and doesn't count in the average."""
+    sliders); characters differ around it. A character with no delivery at all (no profile), and a
+    first-person book's narrating character, stay as the book and don't count in the average."""
     characters = cast.get("characters", {})
-    owner_set = {key for key, c in characters.items() if (c.get("delivery") or "auto") != "auto"}
+    narrating = narrating_character(cast)  # reads in the narrator's voice and delivery: no offset, not averaged
+    owner_set = {key for key, c in characters.items() if (c.get("delivery") or "auto") != "auto" and key != narrating}
     scores = {key: exaggeration_offset(c) / CHARACTER_EXAGGERATION_STEP for key, c in characters.items()}
-    centred = [key for key in characters if key not in owner_set and character_delivery(characters[key])]
+    centred = [key for key in characters
+               if key not in owner_set and key != narrating and character_delivery(characters[key])]
     weights = {key: max(1, int(characters[key].get("lines", 0))) for key in centred}
     total = sum(weights.values())
     mean = sum(scores[k] * weights[k] for k in centred) / total if total else 0.0
@@ -353,20 +355,50 @@ def narrator_delivery(book_tone: Optional[dict], base: Tuple[float, float, float
             round(temperature, 2))
 
 
+def pov_character(cast: dict) -> Optional[str]:
+    """The key of the character who says "I" in a first-person book (matched by
+    cast_profiles.describe_book), or None."""
+    tone = cast.get("book_tone") or {}
+    key = tone.get("pov_key")
+    return key if tone.get("point_of_view") == "first" and key in cast.get("characters", {}) else None
+
+
+def narrating_character(cast: dict) -> Optional[str]:
+    """The first-person narrator whose dialogue is read in the narrator's voice, as one performer
+    would read the book: pov_character, unless the owner gave that character a voice of their own in
+    the cast editor (voice_picked)."""
+    key = pov_character(cast)
+    return None if key is None or cast["characters"][key].get("voice_picked") else key
+
+
+def release_narrating_voice(cast: dict) -> bool:
+    """Free a voice the narrating character still holds from an earlier suggestion (their lines use
+    the narrator's voice), so another character can have it; True when one was freed."""
+    key = narrating_character(cast)
+    if key and cast["characters"][key].get("voice"):
+        cast["characters"][key]["voice"] = None
+        return True
+    return False
+
+
 def suggest_narrator(cast: dict, voices: List[Tuple[str, str]], traits: Dict[str, dict],
                      exclude: Tuple[str, ...] = ()) -> Optional[str]:
     """The measured voice that best fits the narrator the book's tone asks for (cast["book_tone"]),
     or None when there is no tone, nothing measured, or nothing asked for (the owner's voice then
-    stays). A first-person book's narrator takes the viewpoint character's known gender."""
+    stays). A first-person book's narrator is its viewpoint character: their known gender, and their
+    profile's voice targets where they have one, come before the tone's."""
     tone = cast.get("book_tone") or {}
     wants = tone.get("narrator") or {}
     targets = {key: wants.get(key) for key in ("pitch", "quality", "delivery")}
+    gender = wants.get("gender")
+    pov = cast.get("characters", {}).get(pov_character(cast) or "")
+    if pov:
+        own = (pov.get("profile") or {}).get("voice_targets") or {}
+        targets.update({key: own[key] for key in targets if own.get(key)})
+        if pov.get("gender") in ("female", "male"):
+            gender = pov["gender"]
     if not traits or not any(targets.values()):
         return None
-    gender = wants.get("gender")
-    pov = cast.get("characters", {}).get(tone.get("pov_key") or "")
-    if pov and pov.get("gender") in ("female", "male"):
-        gender = pov["gender"]
     candidates = [voice for voice, voice_gender in voices if voice not in exclude and voice in traits
                   and (gender not in ("female", "male") or voice_gender in (gender, "neutral"))]
     if not candidates:
@@ -386,7 +418,8 @@ def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Op
     the first in the list does. The narrator's voice is never suggested. Only when every
     suitable voice is taken does a character share one, with the least-used voice first, so the
     main characters always sound distinct. Voices already chosen by the owner are kept and count
-    as taken.
+    as taken. A first-person book's narrating character (narrating_character) gets none: their
+    lines are read in the narrator's voice.
     """
     traits = traits or {}
     candidates = [(voice, gender) for voice, gender in voices if voice and voice != narrator_voice]
@@ -402,8 +435,9 @@ def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Op
     ranked = ranked_characters(cast)
     ordered = ([item for item in ranked if item[1].get("gender", "unknown") != "unknown"]
                + [item for item in ranked if item[1].get("gender", "unknown") == "unknown"])
+    narrating = narrating_character(cast)
     for key, character in ordered:
-        if character.get("voice"):
+        if character.get("voice") or key == narrating:  # a first-person narrator speaks in the narrator's voice
             continue
         wanted = character.get("gender", "unknown")
 

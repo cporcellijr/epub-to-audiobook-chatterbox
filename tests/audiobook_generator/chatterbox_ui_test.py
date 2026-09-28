@@ -1600,6 +1600,35 @@ class TestCastPanel(unittest.TestCase):
         self.assertIn("a little more even than the book (exaggeration -0.12) (your setting)",
                       chatterbox_ui.character_profile_text(saved))
 
+    def test_a_first_person_narrator_shares_the_narrators_voice_unless_given_their_own(self):
+        cast = self._save("k", self.cast_store.STATUS_DONE, {
+            "me": {"name": "Me", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav",
+                   "profile": {"description": "Tells the story.", "first_line": {"chapter": 1, "text": '"Hi."'}}},
+            "bob": {"name": "Bob", "aliases": [], "gender": "male", "age": "adult", "lines": 3, "voice": None},
+        })
+        cast["book_tone"] = {"point_of_view": "first", "pov_character": "Me", "pov_key": "me", "tone": "wry"}
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        table, keys, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertEqual(table["value"][keys.index("me")][5], "(narrator's voice)")
+        self.assertIsNone(self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))["characters"]["me"]["voice"])
+        self.assertIn("Me tells the story, so their lines are read in the narrator's voice.", status)
+        _, _, _, voice, profile, _ = chatterbox_ui.select_cast_row("k", keys, "chatterbox", MagicMock(index=[0, 0]))
+        self.assertEqual(voice["value"], chatterbox_ui.NARRATOR_VOICE)
+        self.assertEqual(voice["choices"][0], chatterbox_ui.NARRATOR_VOICE_CHOICE)
+        self.assertIn("**Voice:** the narrator's", profile)
+        with patch.object(chatterbox_ui, "preview_voice", return_value="/tmp/x.mp3") as preview:
+            chatterbox_ui.sample_character("k", "me", "chatterbox", chatterbox_ui.NARRATOR_VOICE, "auto", 1.0,
+                                           0.73, 0.5, 0.61, "Elena.wav")
+        self.assertEqual(preview.call_args.args[:3], ("Elena.wav", '"Hi."', 0.73))
+        # Advanced: a voice of her own, then back to the narrator's.
+        table, _, _ = chatterbox_ui.apply_cast_edit("k", "me", "female", "Bea.wav", "chatterbox")
+        self.assertEqual(table["value"][keys.index("me")][5], "Bea")
+        table, _, message = chatterbox_ui.apply_cast_edit("k", "me", "female", chatterbox_ui.NARRATOR_VOICE, "chatterbox")
+        self.assertEqual(table["value"][keys.index("me")][5], "(narrator's voice)")
+        self.assertIn("narrator's voice", message)
+        with self.assertRaises(gr.Error):  # only the narrating character can follow the narrator
+            chatterbox_ui.apply_cast_edit("k", "bob", "male", chatterbox_ui.NARRATOR_VOICE, "chatterbox")
+
     def test_analysis_can_keep_every_earlier_voice_or_only_the_owners_picks(self):
         book = os.path.join(self.tmp.name, "mine.epub")
         with open(book, "wb") as f:

@@ -875,6 +875,10 @@ ANALYSIS_SECONDS_PER_LINE = 0.5
 _GENDER_CHOICES = [("female", "female"), ("male", "male"), ("unknown", "unknown")]
 DELIVERY_CHOICES = [("from the profile", "auto"), ("a little more even", "even"), ("as the book", "book"),
                     ("a little more expressive", "expressive")]
+# The cast editor's voice choice for a first-person book's narrator: their lines follow whatever
+# narrator voice the book is queued with. Never stored as a voice; saving it clears the character's own.
+NARRATOR_VOICE = "__narrator__"
+NARRATOR_VOICE_CHOICE = ("(the narrator's voice)", NARRATOR_VOICE)
 VOICE_GENDER_CHOICES = [("not set", ""), ("female", "female"), ("male", "male"), ("neutral (fits anyone)", "neutral")]
 
 
@@ -965,14 +969,16 @@ def cast_rows(cast: dict, engine: str) -> Tuple[list, list]:
     from the character's profile and are blank for characters without one."""
     rows, keys = [], []
     labels = dict((value, label) for label, value in engine_voice_choices(engine))
+    narrating = cast_store.narrating_character(cast)
     for key, character in cast_store.ranked_characters(cast):
         voice = character.get("voice") or ""
         profile = character.get("profile") or {}
         role = profile.get("role", "")
+        shown = ("(narrator's voice)" if key == narrating
+                 else labels.get(voice, voice) if voice else "(dialogue voice)")
         rows.append([character.get("name", key), "" if role == "unknown" else role, int(character.get("lines", 0)),
-                     character.get("gender", "unknown"), character.get("age", "unknown"),
-                     labels.get(voice, voice) if voice else "(dialogue voice)", profile.get("voice", ""),
-                     ", ".join(character.get("aliases", []))])
+                     character.get("gender", "unknown"), character.get("age", "unknown"), shown,
+                     profile.get("voice", ""), ", ".join(character.get("aliases", []))])
         keys.append(key)
     return rows, keys
 
@@ -1044,8 +1050,12 @@ def engine_voice_traits(engine: str, voices: Optional[List[Tuple[str, str]]] = N
 
 def _fill_missing_voices(cast: dict, path: str, engine: str, narrator_voice: Optional[str]) -> dict:
     """Give every character without a voice the automatic suggestion and save, so what the table
-    shows is exactly what a queued book would use."""
-    if any(not c.get("voice") for c in cast["characters"].values()):
+    shows is exactly what a queued book would use. A first-person book's narrating character gives
+    up any suggested voice first: their lines are the narrator's."""
+    if cast_store.release_narrating_voice(cast):
+        cast_store.save_cast(path, cast)
+    narrating = cast_store.narrating_character(cast)
+    if any(not c.get("voice") for key, c in cast["characters"].items() if key != narrating):
         voices = engine_voices_with_gender(engine)
         suggestions = cast_store.suggest_voices(cast, voices, narrator_voice, engine_voice_traits(engine, voices))
         for key, voice in suggestions.items():
@@ -1144,6 +1154,10 @@ def book_tone_text(cast: dict) -> str:
         text += (f"  \n**Narrator:** {os.path.splitext(suggestion['voice'])[0]}, exaggeration "
                  f"{suggestion['exaggeration']:.2f} · CFG {suggestion['cfg_weight']:.2f} · temperature "
                  f"{suggestion['temperature']:.2f}, picked from the book's tone")
+    narrating = cast_store.narrating_character(cast)
+    if narrating:
+        text += (f"  \n{cast['characters'][narrating].get('name', narrating)} tells the story, so their lines "
+                 "are read in the narrator's voice.")
     return text
 
 
@@ -1218,20 +1232,29 @@ def select_cast_row(cast_key: Optional[str], keys: list, engine: str, evt: gr.Se
     words = (voice_measure.describe(engine_voice_traits(engine, voices).get(voice), dict(voices).get(voice, "neutral"))
              if voice else "")
     label = dict((value, label) for label, value in choices).get(voice, voice)
+    match = voice_match_text(character, label, words)
+    offset = cast_store.exaggeration_offsets(cast).get(keys[row])
+    if keys[row] == cast_store.pov_character(cast):  # a first-person narrator can follow the narrator's voice
+        choices = [NARRATOR_VOICE_CHOICE, *choices]
+        if keys[row] == cast_store.narrating_character(cast):
+            voice, offset = NARRATOR_VOICE, 0.0
+            match = "**Voice:** the narrator's: they tell the story, so one performer reads their lines too"
     return (keys[row], f"Editing **{character.get('name', keys[row])}**",
             gr.update(value=character.get("gender", "unknown")),
             gr.update(choices=choices, value=voice or None),
-            character_profile_text(character, voice_match_text(character, label, words),
-                                   cast_store.exaggeration_offsets(cast).get(keys[row])),
+            character_profile_text(character, match, offset),
             gr.update(value=character.get("delivery") or "auto"))
 
 
 def sample_character(cast_key: Optional[str], character_key: Optional[str], engine: str, voice: Optional[str],
                      delivery_choice: str, speed: float, exaggeration: float, cfg_weight: float,
-                     temperature: float) -> str:
+                     temperature: float, narrator_voice: Optional[str] = None) -> str:
     """Cast editor: the selected character's first line in the editor's voice, with the editor's
     delivery around the book's current sliders (as a book would read it); any other text when the
-    character has no first line. Kokoro plays its usual sample."""
+    character has no first line. "(the narrator's voice)" samples the Make tab's narrator, which
+    reads such lines with the book's own delivery. Kokoro plays its usual sample."""
+    follows_narrator = voice == NARRATOR_VOICE
+    voice = narrator_voice if follows_narrator else voice
     if not voice:
         raise gr.Error("Pick a voice first.")
     if engine == "kokoro":
@@ -1241,7 +1264,9 @@ def sample_character(cast_key: Optional[str], character_key: Optional[str], engi
     character["delivery"] = delivery_choice or "auto"
     first = (character.get("profile") or {}).get("first_line") or {}
     text = first.get("text") or PREVIEW_PHRASE
-    if character_key in cast["characters"]:  # the editor's delivery, within this cast
+    if follows_narrator:
+        offset = 0.0
+    elif character_key in cast["characters"]:  # the editor's delivery, within this cast
         cast["characters"][character_key] = character
         offset = cast_store.exaggeration_offsets(cast)[character_key]
     else:
@@ -1260,6 +1285,17 @@ def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gende
     cast = cast_store.load_cast(path)
     if cast is None or character_key not in cast["characters"]:
         raise gr.Error("That character is no longer in the cast (was it re-analysed?).")
+    if voice == NARRATOR_VOICE:
+        if character_key != cast_store.pov_character(cast):
+            raise gr.Error("Only the character who narrates a first-person book can share the narrator's voice.")
+        character = cast["characters"][character_key]
+        character["gender"] = gender if gender in cast_store.GENDERS else "unknown"
+        character["voice"], character["voice_picked"] = None, False  # follows the narrator again
+        character["delivery"] = delivery_choice if delivery_choice in cast_store.DELIVERIES else "auto"
+        cast_store.save_cast(path, cast)
+        rows, keys = cast_rows(cast, engine)
+        return (gr.update(value=rows, visible=True), keys,
+                f"Saved **{character.get('name', character_key)}**: their lines use the narrator's voice.")
     if not voice:
         raise gr.Error("Pick a voice for the character.")
     if cast_store.voices_belong_to_engine({"characters": {"x": {"voice": voice}}}, engine):
@@ -1973,7 +2009,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                 outputs=[cast_table, cast_keys_state, cast_status])
         cast_sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
             .then(sample_character, inputs=[cast_key_state, cast_selected, engine, cast_voice, cast_delivery, speed,
-                                            exaggeration, cfg_weight, temperature], outputs=sample_audio)
+                                            exaggeration, cfg_weight, temperature, voice], outputs=sample_audio)
         selection_outputs = [*queue_outputs, selected_job, selected_info]
         enqueue_button.click(enqueue, inputs=[library_book, input_file, chapter_table, chapter_stats_state, *settings],
                              outputs=queue_outputs)

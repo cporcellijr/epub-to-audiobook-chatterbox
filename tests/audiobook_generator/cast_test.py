@@ -310,6 +310,46 @@ class TestDelivery(unittest.TestCase):
         self.assertIsNone(cast_store.suggest_narrator(cast, voices, traits))  # nothing asked for
 
 
+class TestFirstPerson(unittest.TestCase):
+    """A first-person book: the "I" character's lines are read in the narrator's voice."""
+
+    def _cast(self):
+        cast = _cast({"me": (50, "female", None), "friend": (30, "female", None)})
+        cast["book_tone"] = {"point_of_view": "first", "pov_key": "me",
+                             "narrator": {"gender": "either", "pitch": "high", "quality": None, "delivery": None}}
+        return cast
+
+    def test_the_narrating_character_is_the_pov_unless_the_owner_gave_them_a_voice(self):
+        cast = self._cast()
+        self.assertEqual((cast_store.pov_character(cast), cast_store.narrating_character(cast)), ("me", "me"))
+        cast["characters"]["me"].update(voice="Deep.wav", voice_picked=True)
+        self.assertEqual((cast_store.pov_character(cast), cast_store.narrating_character(cast)), ("me", None))
+        cast["book_tone"]["point_of_view"] = "third"
+        self.assertIsNone(cast_store.pov_character(cast))
+
+    def test_the_narrator_gets_no_suggested_voice_and_gives_one_back(self):
+        cast = self._cast()
+        self.assertEqual(cast_store.suggest_voices(cast, FEMALE, "Narrator.wav"), {"friend": "Deep.wav"})
+        cast["characters"]["me"]["voice"] = "Mid.wav"  # suggested before the book was known to be first person
+        self.assertTrue(cast_store.release_narrating_voice(cast))
+        self.assertIsNone(cast["characters"]["me"]["voice"])
+        self.assertFalse(cast_store.release_narrating_voice(cast))
+
+    def test_the_narrator_voice_follows_the_narrating_characters_own_profile(self):
+        cast = self._cast()
+        _wants(cast, "me", pitch="low", quality="husky")  # the tone asked for a high voice
+        self.assertEqual(cast_store.suggest_narrator(cast, FEMALE, TRAITS), "Husky.wav")
+
+    def test_the_narrating_character_has_no_delivery_offset_and_isnt_averaged(self):
+        cast = self._cast()
+        _wants(cast, "me", delivery="expressive")
+        _wants(cast, "friend", delivery="even")
+        cast["characters"]["third"] = {"name": "Third", "aliases": [], "gender": "male", "age": "adult", "lines": 30,
+                                       "profile": {"voice_targets": {"delivery": "expressive"}}}
+        offsets = cast_store.exaggeration_offsets(cast)
+        self.assertEqual((offsets["me"], offsets["friend"], offsets["third"]), (0.0, -0.12, 0.12))
+
+
 class TestEngineCheck(unittest.TestCase):
 
     def test_voices_must_look_like_the_engines(self):
