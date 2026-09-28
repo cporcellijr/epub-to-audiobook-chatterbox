@@ -18,10 +18,15 @@ logger = logging.getLogger(__name__)
 
 QUEUED, RUNNING, DONE, FAILED, STOPPED = "queued", "running", "done", "failed", "stopped"
 FINISHED = (DONE, FAILED, STOPPED)
+# Job kinds: a book to narrate (the default, and what every job queued before kinds existed is),
+# or a cast analysis (the LLM pass over a book's dialogue, which must never overlap a book).
+BOOK, CAST = "book", "cast"
 
 # Chapter audio files are named "<number>_<title>.<ext>"; a chapter work folder in M4B mode.
 _CHAPTER_EXTENSIONS = (".mp3", ".aac")
 _CHAPTER_WORK_FOLDER = ".chapters"
+# Settings keys that may point at a private copy in the uploads folder, deleted with the job.
+UPLOAD_KEYS = ("input_file", "search_and_replace_file", "cast_file")
 
 
 def run_job(config, log_file: str) -> None:
@@ -30,18 +35,42 @@ def run_job(config, log_file: str) -> None:
     sys.exit(0 if main(config, log_file) else 1)
 
 
+def run_cast_job(settings: dict, log_file: str) -> None:
+    """Process target: analyse one book's cast (unloading and reloading Chatterbox around the LLM
+    pass); exit code 0 = the cast was written."""
+    from audiobook_generator.core.cast_analysis import run_cast_analysis
+    run_cast_analysis(settings, log_file)
+
+
+def job_kind(job: dict) -> str:
+    return job.get("kind") or BOOK
+
+
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def _chatterbox_ready(settings: dict) -> bool:
+    """Default engine_ready: a Chatterbox book waits while the model is unloaded; Kokoro has no
+    unload and never waits."""
+    if settings.get("engine", "chatterbox") == "kokoro":
+        return True
+    from audiobook_generator.core.chatterbox_control import ready_for_book
+    return ready_for_book()
+
+
 class JobQueue:
     def __init__(self, path: str, build_config: Callable[..., object], log_file: Callable[[], str],
-                 process_factory: Callable[..., object] = multiprocessing.Process, uploads_dir: str = ""):
+                 process_factory: Callable[..., object] = multiprocessing.Process, uploads_dir: str = "",
+                 engine_ready: Callable[[dict], bool] = None):
+        """engine_ready(settings) says whether a book may start now (default: not while Chatterbox
+        reports its model unloaded after a cast analysis; see core.chatterbox_control)."""
         self.path = path
         self.uploads_dir = os.path.abspath(uploads_dir) if uploads_dir else ""
         self._build_config = build_config
         self._log_file = log_file
         self._process_factory = process_factory
+        self._engine_ready = engine_ready or _chatterbox_ready
         self._lock = threading.RLock()
         self._process = None
         self._running_id: Optional[str] = None
@@ -49,7 +78,8 @@ class JobQueue:
         for job in self._data["jobs"]:
             if job["status"] == RUNNING:  # the server stopped mid-book: resume it first
                 job["status"] = QUEUED
-                job["settings"]["skip_existing"] = True
+                if job_kind(job) == BOOK:
+                    job["settings"]["skip_existing"] = True
                 job["note"] = "resumes after restart"
                 job["estimate_seconds"] *= self._remaining_chapter_fraction(job)
         self._save()
@@ -134,30 +164,37 @@ class JobQueue:
 
         Only files written at or after this run started count, so numbered chapter files left over
         from an unrelated earlier job in the same output folder can never be mistaken for this job's
-        own progress.
+        own progress. A cast analysis reports the chapters its cast file says are analysed.
         """
         if job["status"] == DONE:
             return job["chapters"]
+        if job_kind(job) == CAST:
+            from audiobook_generator.core.cast import analysis_progress, load_cast
+            done, _ = analysis_progress(load_cast(job["settings"].get("cast_file")))
+            return min(done, job["chapters"])
         count = JobQueue._count_chapter_files(JobQueue._chapter_folder(job["settings"]), since=job.get("started_ts"))
         return min(count, job["chapters"])
 
     @staticmethod
     def _remaining_chapter_fraction(job: dict) -> float:
         """Fraction of a job's chapters not yet sitting on disk: what 'Skip chapters already made'
-        still has to generate, regardless of which run produced the ones already there."""
+        still has to generate, regardless of which run produced the ones already there. A cast
+        analysis always starts over."""
         total = job["chapters"]
-        if total <= 0:
+        if total <= 0 or job_kind(job) == CAST:
             return 1.0
         done = JobQueue._count_chapter_files(JobQueue._chapter_folder(job["settings"]))
         return max(0.0, (total - min(done, total)) / total)
 
     # ---- changes ----
 
-    def add(self, title: str, settings: dict, chapters: int, estimate_seconds: float, voice: str) -> int:
-        """Queue a book; returns its position among books still waiting (1 = next)."""
+    def add(self, title: str, settings: dict, chapters: int, estimate_seconds: float, voice: str,
+            kind: str = BOOK) -> int:
+        """Queue a book (or, kind=CAST, a cast analysis); returns its position among jobs still
+        waiting (1 = next)."""
         with self._lock:
             self._data["jobs"].append({
-                "id": uuid.uuid4().hex[:12], "title": title, "voice": voice, "chapters": chapters,
+                "id": uuid.uuid4().hex[:12], "kind": kind, "title": title, "voice": voice, "chapters": chapters,
                 "estimate_seconds": estimate_seconds, "status": QUEUED, "added": _now(), "started": None,
                 "started_ts": None, "finished": None, "note": "", "settings": settings,
             })
@@ -183,9 +220,12 @@ class JobQueue:
                 return False
             self._data["jobs"].remove(job)
             job["estimate_seconds"] *= self._remaining_chapter_fraction(job)
-            job.update(status=QUEUED, started=None, started_ts=None, finished=None,
-                       note="retry: finished chapters kept")
-            job["settings"]["skip_existing"] = True
+            if job_kind(job) == CAST:
+                job.update(status=QUEUED, started=None, started_ts=None, finished=None, note="retry")
+            else:
+                job.update(status=QUEUED, started=None, started_ts=None, finished=None,
+                           note="retry: finished chapters kept")
+                job["settings"]["skip_existing"] = True
             self._data["jobs"].append(job)
             self._save()
             return True
@@ -194,7 +234,7 @@ class JobQueue:
         """Remove this job's private copies of uploaded files."""
         if not self.uploads_dir:
             return
-        for key in ("input_file", "search_and_replace_file"):
+        for key in UPLOAD_KEYS:
             path = job["settings"].get(key)
             if path and os.path.abspath(path).startswith(self.uploads_dir + os.sep) and os.path.isfile(path):
                 os.remove(path)
@@ -221,7 +261,8 @@ class JobQueue:
         job["status"] = DONE if exitcode == 0 else FAILED
         job["finished"] = _now()
         if job["status"] == FAILED:
-            job["note"] = "failed; see the log (Retry keeps finished chapters)"
+            job["note"] = ("failed; see the log" if job_kind(job) == CAST
+                           else "failed; see the log (Retry keeps finished chapters)")
 
     def stop_current(self) -> bool:
         """Stop the running book and pause the queue (Resume starts the next one)."""
@@ -267,8 +308,15 @@ class JobQueue:
             job = next((j for j in self._data["jobs"] if j["status"] == QUEUED), None)
             if job is None:
                 return
-            config = self._build_config(**job["settings"])
-            process = self._process_factory(target=run_job, args=(config, self._log_file()))
+            if job_kind(job) == CAST:
+                process = self._process_factory(target=run_cast_job, args=(dict(job["settings"]), self._log_file()))
+            else:
+                # Never start a book while Chatterbox is unloaded (a cast analysis freed it and has
+                # not brought it back yet): its requests would all fail with 503.
+                if not self._engine_ready(job["settings"]):
+                    return
+                config = self._build_config(**job["settings"])
+                process = self._process_factory(target=run_job, args=(config, self._log_file()))
             process.start()
             job["status"], job["note"] = RUNNING, job.get("note", "")
             if not job.get("started"):

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import gradio as gr
 
 from audiobook_generator.ui import chatterbox_ui, web_ui
-from audiobook_generator.ui.job_queue import DONE, QUEUED, RUNNING
+from audiobook_generator.ui.job_queue import CAST, DONE, QUEUED, RUNNING
 
 
 def _fake_response(body: bytes = b"") -> MagicMock:
@@ -517,7 +517,7 @@ class TestChapterList(unittest.TestCase):
 
     def test_chapter_stats(self):
         text = f"One. Two! Three?{chatterbox_ui.PARAGRAPH_MARK} Four... \u201cFive.\u201d"
-        self.assertEqual(chatterbox_ui.chapter_stats(text)[1:], [5, 2])
+        self.assertEqual(chatterbox_ui.chapter_stats(text)[1:], [5, 2, 1])  # 5 sentences, 2 paragraphs, 1 quoted line
 
     def test_speed_change_retimes_but_keeps_ticks(self):
         rows = [[1, False, "T", "", "x"], [2, True, "A", "", "x"]]
@@ -1089,3 +1089,230 @@ class TestHostUiProcessFactory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVoiceModes(unittest.TestCase):
+    """Multi-voice settings travel with a job; old jobs (no voice-mode keys) build as single voice."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.patches = [patch.object(chatterbox_ui, "QUEUE_UPLOADS", os.path.join(self.tmp.name, "uploads")),
+                        patch.object(chatterbox_ui, "CASTS_DIR", os.path.join(self.tmp.name, "casts")),
+                        patch.dict(os.environ, {"EBOOK_LIBRARY_DIR": "/library"})]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def _queue(self, *extra, **kwargs):
+        with patch("os.path.isfile", side_effect=lambda p: p == "/library/book.epub" or os.path.exists(p)):
+            return chatterbox_ui.queue_settings("/library/book.epub", None, TABLE, *SETTINGS, "sentence", "chatterbox",
+                                                *extra, **kwargs)
+
+    def _finished_cast(self, key="k1", voice="Ada.wav"):
+        from audiobook_generator.core import cast as cast_store
+        cast = cast_store.new_cast(key, "/library/book.epub", "T", "A", "chatterbox", "Elena.wav", [2, 3])
+        cast["characters"] = {"ada": {"name": "Ada", "aliases": [], "gender": "female", "age": "adult", "lines": 4,
+                                      "voice": voice}}
+        cast["status"] = cast_store.STATUS_DONE
+        cast_store.save_cast(chatterbox_ui.cast_file_for(key), cast)
+        return cast
+
+    def test_old_jobs_build_as_single_voice(self):
+        settings = self._queue()
+        for key in ("voice_mode", "dialogue_voice", "cast_file"):
+            del settings[key]  # a job queued before multi-voice existed
+        config = chatterbox_ui.build_config(**settings)
+        self.assertEqual((config.voice_mode, config.dialogue_voice, config.cast_file), ("single", None, None))
+
+    def test_default_is_single_voice_and_carries_no_cast(self):
+        settings = self._queue()
+        self.assertEqual((settings["voice_mode"], settings["dialogue_voice"], settings["cast_file"]), ("single", None, None))
+
+    def test_dialogue_mode_needs_a_dialogue_voice_and_passes_it_through(self):
+        with self.assertRaises(gr.Error):
+            self._queue("dialogue", None)
+        settings = self._queue("dialogue", "Tom.wav")
+        config = chatterbox_ui.build_config(**settings)
+        self.assertEqual((config.voice_mode, config.dialogue_voice, config.voice_name), ("dialogue", "Tom.wav", "Elena.wav"))
+
+    def test_cast_mode_needs_a_finished_cast(self):
+        with self.assertRaises(gr.Error):
+            self._queue("cast", "Tom.wav", None)
+        with self.assertRaises(gr.Error):
+            self._queue("cast", "Tom.wav", "nocast")
+        from audiobook_generator.core import cast as cast_store
+        running = self._finished_cast("k2")
+        running["status"] = cast_store.STATUS_RUNNING
+        cast_store.save_cast(chatterbox_ui.cast_file_for("k2"), running)
+        with self.assertRaises(gr.Error):
+            self._queue("cast", "Tom.wav", "k2")
+
+    def test_cast_mode_snapshots_the_cast_with_the_narrator_and_builds_a_cast_config(self):
+        from audiobook_generator.core import cast as cast_store
+        self._finished_cast("k1")
+        settings = self._queue("cast", "Tom.wav", "k1")
+        self.assertTrue(settings["cast_file"].startswith(os.path.abspath(chatterbox_ui.QUEUE_UPLOADS)))
+        snapshot = cast_store.load_cast(settings["cast_file"])
+        self.assertEqual((snapshot["narrator_voice"], snapshot["characters"]["ada"]["voice"]), ("Elena.wav", "Ada.wav"))
+        config = chatterbox_ui.build_config(**settings)
+        self.assertEqual((config.voice_mode, config.cast_file), ("cast", settings["cast_file"]))
+        # Editing the cast afterwards does not touch the queued snapshot.
+        cast = cast_store.load_cast(chatterbox_ui.cast_file_for("k1"))
+        cast["characters"]["ada"]["voice"] = "Other.wav"
+        cast_store.save_cast(chatterbox_ui.cast_file_for("k1"), cast)
+        self.assertEqual(cast_store.load_cast(settings["cast_file"])["characters"]["ada"]["voice"], "Ada.wav")
+
+    def test_cast_voices_must_belong_to_the_engine(self):
+        self._finished_cast("k3", voice="af_heart")
+        with self.assertRaises(gr.Error):
+            self._queue("cast", "Tom.wav", "k3")
+
+    def test_build_config_ignores_a_cast_file_outside_cast_mode(self):
+        config = chatterbox_ui.build_config(
+            "/tmp/book.epub", "audiobook_output/Book", "Elena.wav", 1.0, [3], 0.35, 0.9, True, False, False,
+            "auto", "double", False, False, None, "INFO", "sentence", "chatterbox", "dialogue", "Tom.wav", "/x.json")
+        self.assertEqual((config.voice_mode, config.cast_file), ("dialogue", None))
+
+    def test_cast_mode_choice_needs_the_llm_configured(self):
+        with patch.dict(os.environ, {"LLM_BASE_URL": ""}):
+            self.assertEqual([v for _, v in chatterbox_ui.voice_mode_choices()], ["single", "dialogue"])
+        with patch.dict(os.environ, {"LLM_BASE_URL": "http://llm:11434/v1"}):
+            self.assertEqual([v for _, v in chatterbox_ui.voice_mode_choices()], ["single", "dialogue", "cast"])
+
+    def test_voice_mode_changed_shows_the_right_controls(self):
+        self.assertEqual([u["visible"] for u in chatterbox_ui.voice_mode_changed("single")], [False, False])
+        self.assertEqual([u["visible"] for u in chatterbox_ui.voice_mode_changed("dialogue")], [True, False])
+        self.assertEqual([u["visible"] for u in chatterbox_ui.voice_mode_changed("cast")], [True, True])
+
+
+class TestCastPanel(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.voices = os.path.join(self.tmp.name, "voices")
+        os.makedirs(self.voices)
+        for name in ("Ada.wav", "Bea.wav", "Cal.wav", "Elena.wav"):
+            open(os.path.join(self.voices, name), "w").close()
+        self.patches = [patch.object(chatterbox_ui, "CASTS_DIR", os.path.join(self.tmp.name, "casts")),
+                        patch.object(chatterbox_ui, "QUEUE_UPLOADS", os.path.join(self.tmp.name, "uploads")),
+                        patch.dict(os.environ, {"TTS_VOICES_DIR": self.voices, "EBOOK_LIBRARY_DIR": "/library",
+                                                "LLM_BASE_URL": "http://llm:11434/v1", "LLM_MODEL": "m"}),
+                        patch("audiobook_generator.core.cast.VOICE_GENDERS_FILE",
+                              os.path.join(self.tmp.name, "voice_genders.json"))]
+        for p in self.patches:
+            p.start()
+        from audiobook_generator.core import cast as cast_store
+        self.cast_store = cast_store
+        cast_store.save_voice_gender("Ada.wav", "female")
+        cast_store.save_voice_gender("Bea.wav", "female")
+        cast_store.save_voice_gender("Cal.wav", "male")
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def _save(self, key, status, characters):
+        cast = self.cast_store.new_cast(key, "/library/book.epub", "T", "A", "chatterbox", "Elena.wav", [1])
+        cast["characters"] = characters
+        cast["status"] = status
+        cast["stats"].update(lines=10, unknown_lines=1)
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for(key), cast)
+        return cast
+
+    def test_no_cast_yet_hides_the_table(self):
+        table, keys, status, seen = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertFalse(table["visible"])
+        self.assertIn("Analyse cast", status)
+        self.assertIsNone(chatterbox_ui.cast_overview(None, "chatterbox", "Elena.wav", None)[3])
+
+    def test_running_analysis_shows_progress(self):
+        cast = self._save("k", self.cast_store.STATUS_RUNNING, {})
+        cast["chapters_done"] = 1
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        table, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertFalse(table["visible"])
+        self.assertIn("1 of 1", status)
+
+    def test_finished_cast_gets_suggested_voices_saved_and_shown(self):
+        self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": ["Annie"], "gender": "female", "age": "adult", "lines": 9, "voice": None},
+            "bob": {"name": "Bob", "aliases": [], "gender": "male", "age": "adult", "lines": 3, "voice": None},
+        })
+        table, keys, status, seen = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertTrue(table["visible"])
+        self.assertEqual(keys, ["anne", "bob"])
+        rows = table["value"]
+        self.assertEqual([r[0] for r in rows], ["Anne", "Bob"])
+        self.assertEqual(rows[0][4], "Ada")     # first female voice; Elena (the narrator) is never suggested
+        self.assertEqual(rows[1][4], "Cal")
+        self.assertEqual(rows[0][5], "Annie")
+        saved = self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))
+        self.assertEqual((saved["characters"]["anne"]["voice"], saved["characters"]["bob"]["voice"]), ("Ada.wav", "Cal.wav"))
+        self.assertIn("9 of 10 lines attributed", status)
+        # Unchanged file: the table is left alone on the next refresh.
+        again = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", seen)
+        self.assertEqual(again[0], gr.update())
+        self.assertEqual(again[3], seen)
+
+    def test_editing_a_character_saves_and_refreshes(self):
+        self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": [], "gender": "unknown", "age": "adult", "lines": 9, "voice": "Ada.wav"}})
+        table, keys, message = chatterbox_ui.apply_cast_edit("k", "anne", "female", "Bea.wav", "chatterbox")
+        self.assertEqual(table["value"][0][2:5], ["female", "adult", "Bea"])
+        self.assertIn("Bea.wav", message)
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.apply_cast_edit("k", "anne", "female", "af_heart", "chatterbox")
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.apply_cast_edit("k", None, "female", "Bea.wav", "chatterbox")
+
+    def test_analysis_settings_copy_the_book_and_name_the_cast_file(self):
+        book = os.path.join(self.tmp.name, "mine.epub")
+        with open(book, "wb") as f:
+            f.write(b"epub bytes")
+        settings = chatterbox_ui.analysis_settings(None, book, TABLE, "chatterbox", "Elena.wav", "auto", "double",
+                                                   False, False, None)
+        self.assertEqual(settings["chapter_selection"], [2, 3])
+        self.assertEqual(settings["cast_key"], self.cast_store.cast_key(book))
+        self.assertEqual(settings["cast_file"], chatterbox_ui.cast_file_for(settings["cast_key"]))
+        self.assertTrue(settings["input_file"].startswith(os.path.abspath(chatterbox_ui.QUEUE_UPLOADS)))
+        self.assertEqual((settings["engine"], settings["voice"]), ("chatterbox", "Elena.wav"))
+        with patch.dict(os.environ, {"LLM_BASE_URL": ""}):
+            with self.assertRaises(gr.Error):
+                chatterbox_ui.analysis_settings(None, book, TABLE, "chatterbox", "Elena.wav", "auto", "double",
+                                                False, False, None)
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.analysis_settings(None, book, [[1, False, "A", "", ""]], "chatterbox", "Elena.wav", "auto",
+                                            "double", False, False, None)
+
+    def test_analysis_estimate_counts_dialogue_lines_of_ticked_chapters(self):
+        stats = [[100, 5, 2, 40], [200, 9, 3, 30], [300, 9, 3, 20]]
+        self.assertAlmostEqual(chatterbox_ui.analysis_estimate(TABLE, stats), 50 * chatterbox_ui.ANALYSIS_SECONDS_PER_LINE)
+        self.assertEqual(chatterbox_ui.analysis_estimate(TABLE, [[100, 5, 2]]), 0)  # stats from before the count existed
+
+    def test_voice_gender_is_saved_from_the_voice_lab(self):
+        self.assertEqual(chatterbox_ui.voice_gender_of("Elena.wav")["value"], "")
+        message = chatterbox_ui.save_voice_gender("Elena.wav", "female")
+        self.assertIn("Elena", message)
+        self.assertEqual(chatterbox_ui.voice_gender_of("Elena.wav")["value"], "female")
+        self.assertEqual(chatterbox_ui.engine_voices_with_gender("chatterbox"),
+                         [("Ada.wav", "female"), ("Bea.wav", "female"), ("Cal.wav", "male"), ("Elena.wav", "female")])
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.save_voice_gender(None, "female")
+
+    def test_queue_rows_name_cast_jobs_and_multi_voice_books(self):
+        cast_job = {"kind": CAST, "voice": "Elena.wav", "settings": {"engine": "chatterbox"}, "status": RUNNING,
+                    "chapters": 3}
+        self.assertEqual(chatterbox_ui._voice_column(cast_job), "cast analysis (LLM)")
+        book = {"voice": "Elena.wav", "settings": {"engine": "chatterbox", "voice_mode": "cast"}}
+        self.assertEqual(chatterbox_ui._voice_column(book), "Elena + cast")
+        book["settings"]["voice_mode"] = "dialogue"
+        self.assertEqual(chatterbox_ui._voice_column(book), "Elena + dialogue voice")
+        del book["settings"]["voice_mode"]
+        self.assertEqual(chatterbox_ui._voice_column(book), "Elena")
+        with patch.object(chatterbox_ui.JobQueue, "chapters_done", return_value=1):
+            self.assertIn("analysing cast · 1 of 3", chatterbox_ui._status_label(cast_job))

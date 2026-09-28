@@ -15,6 +15,11 @@ Environment:
                           to hide the Engine choice entirely and behave exactly as without Kokoro)
     KOKORO_DEFAULT_VOICE Kokoro voice id selected by default (default: the server's own
                           default_voice, else "af_heart")
+    LLM_BASE_URL         Local OpenAI-compatible chat endpoint for cast analysis, e.g.
+                          http://ollama:11434/v1 (optional: leave unset to hide the Cast voice mode)
+    LLM_MODEL            Chat model name for cast analysis
+    LLM_API_KEY          Key for that endpoint, if it wants one
+    LLM_UNLOAD_CHATTERBOX  "off" keeps Chatterbox's model loaded during a cast analysis (default on)
 """
 import glob
 import json
@@ -35,10 +40,16 @@ from gradio_log import Log
 
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
+from audiobook_generator.core import cast as cast_store
+from audiobook_generator.core.cast_llm import llm_configured
 from audiobook_generator.core.chapter_selection import preselect_chapters
-from audiobook_generator.tts_providers.openai_tts_provider import PARAGRAPH_MARK
+from audiobook_generator.core.chatterbox_control import chatterbox_url
+from audiobook_generator.core.dialogue import dialogue_lines
+from audiobook_generator.tts_providers.openai_tts_provider import (
+    PARAGRAPH_MARK, VOICE_MODE_CAST, VOICE_MODE_DIALOGUE, VOICE_MODE_SINGLE, VOICE_MODES,
+)
 from audiobook_generator.ui import library_index, web_ui
-from audiobook_generator.ui.job_queue import DONE, FAILED, QUEUED, RUNNING, JobQueue
+from audiobook_generator.ui.job_queue import CAST, DONE, FAILED, QUEUED, RUNNING, UPLOAD_KEYS, JobQueue, job_kind
 from audiobook_generator.ui.web_ui import (
     OUTPUT_ROOT,
     default_openai_voice,
@@ -57,15 +68,6 @@ FALLBACK_SETTINGS = {"exaggeration": 0.5, "cfg_weight": 0.5, "temperature": 0.8}
 SHORT_SAMPLE_SECONDS = 6.0
 PAUSE_FILTER = ("silenceremove=start_periods=1:start_threshold=-40dB:stop_periods=-1:"
                 "stop_duration=0.3:stop_threshold=-40dB:stop_silence=0.15")
-
-
-def chatterbox_url() -> str:
-    """Chatterbox root URL (no /v1)."""
-    explicit = os.environ.get("CHATTERBOX_URL", "").rstrip("/")
-    if explicit:
-        return explicit
-    base = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
-    return base[:-3] if base.endswith("/v1") else base
 
 
 def _post_json(path: str, payload: dict, timeout: float) -> bytes:
@@ -465,13 +467,15 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
                  sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
                  output_text: bool, title_mode: str, newline_mode: str, remove_endnotes: bool,
                  remove_reference_numbers: bool, search_and_replace_file, log_level: str,
-                 paced_unit_mode: str = "sentence", engine: str = "chatterbox") -> GeneralConfig:
+                 paced_unit_mode: str = "sentence", engine: str = "chatterbox",
+                 voice_mode: str = VOICE_MODE_SINGLE, dialogue_voice: Optional[str] = None,
+                 cast_file: Optional[str] = None) -> GeneralConfig:
     """GeneralConfig for the OpenAI provider pointed at Chatterbox or Kokoro (pauses in seconds).
 
-    paced_unit_mode and engine both default so books queued before either option existed still
-    build (as Chatterbox, sentence units). Kokoro always narrates in sentence units regardless of
-    paced_unit_mode: paragraph mode's gap detector was tuned on Chatterbox audio and saves nothing
-    on a server this fast (see the Narration units info text).
+    paced_unit_mode, engine and the voice-mode arguments all default so books queued before any
+    of them existed still build (as Chatterbox, sentence units, one voice). Kokoro always narrates
+    in sentence units regardless of paced_unit_mode: paragraph mode's gap detector was tuned on
+    Chatterbox audio and saves nothing on a server this fast (see the Narration units info text).
 
     Raises ValueError if engine is "kokoro" but KOKORO_BASE_URL isn't configured; queue_settings
     already refuses that earlier with a friendlier gr.Error at enqueue time, so this only guards a
@@ -504,6 +508,9 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     config.sentence_pause_ms = int(round(float(sentence_pause) * 1000))
     config.paragraph_pause_ms = int(round(float(paragraph_pause) * 1000))
     config.output_m4b = bool(output_m4b)
+    config.voice_mode = voice_mode if voice_mode in VOICE_MODES else VOICE_MODE_SINGLE
+    config.dialogue_voice = dialogue_voice or None
+    config.cast_file = cast_file if config.voice_mode == VOICE_MODE_CAST else None
 
     engine = engine or "chatterbox"
     if engine == "kokoro":
@@ -556,7 +563,7 @@ def sweep_orphaned_uploads(queue: JobQueue) -> None:
         return
     referenced = set()
     for job in queue.jobs():
-        for key in ("input_file", "search_and_replace_file"):
+        for key in UPLOAD_KEYS:
             path = job["settings"].get(key)
             if path:
                 referenced.add(os.path.abspath(path))
@@ -605,8 +612,13 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
                    output_text: bool, title_mode: str, newline_mode: str, remove_endnotes: bool,
                    remove_reference_numbers: bool, search_and_replace_file, log_level: str,
                    paced_unit_mode: str = "sentence", engine: str = "chatterbox",
-                   active_jobs: Optional[List[dict]] = None) -> dict:
-    """Validate the form and turn it into build_config keyword arguments for a queued book."""
+                   voice_mode: str = VOICE_MODE_SINGLE, dialogue_voice: Optional[str] = None,
+                   cast_key: Optional[str] = None, active_jobs: Optional[List[dict]] = None) -> dict:
+    """Validate the form and turn it into build_config keyword arguments for a queued book.
+
+    In cast mode the book's saved cast (see cast_store) must be finished and its voices must
+    belong to the engine; a private snapshot of it goes with the job, so later edits to the cast
+    (or a re-analysis) never change a book that is already queued."""
     if library_book:
         if not os.path.isfile(library_book):
             raise gr.Error("Pick the book from the list as you type (or clear the box to use an upload).")
@@ -624,6 +636,20 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
     if engine == "kokoro" and not kokoro_base_url():
         raise gr.Error("Kokoro is not configured (set KOKORO_BASE_URL first), or switch the Engine "
                        "back to Chatterbox.")
+    voice_mode = voice_mode or VOICE_MODE_SINGLE
+    if voice_mode not in VOICE_MODES:
+        raise gr.Error(f"Unknown voice mode '{voice_mode}'.")
+    cast_source = None
+    if voice_mode != VOICE_MODE_SINGLE and not dialogue_voice:
+        raise gr.Error("Pick a dialogue voice (it speaks quoted lines, and any speaker the cast doesn't know).")
+    if voice_mode == VOICE_MODE_CAST:
+        cast_source, cast = _finished_cast(cast_key)
+        wrong = cast_store.voices_belong_to_engine(cast, engine)
+        if wrong:
+            raise gr.Error(f"The cast uses {', '.join(wrong)}, which is not a {engine} voice. Pick "
+                           f"{engine} voices in the cast table, or switch the Engine.")
+        if voice in (c.get("voice") for c in cast["characters"].values()):
+            gr.Warning("The narrator's voice is also given to a character; they will sound the same.")
     output_dir = (output_dir or "").strip()
     if not output_dir:
         raise gr.Error("Set an output folder.")
@@ -641,6 +667,11 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
     # a disk error) that still leaves one behind.
     queued_input_file = library_book or _copy_for_queue(upload, ".epub")
     queued_replace_file = _copy_for_queue(replace_file, ".txt") if replace_file else None
+    queued_cast_file = None
+    if cast_source:
+        cast["narrator_voice"], cast["engine"] = voice, engine
+        cast_store.save_cast(cast_source, cast)
+        queued_cast_file = _copy_for_queue(cast_source, ".json")
     return {
         "input_file": queued_input_file,
         "output_dir": output_dir, "voice": voice, "speed": float(speed),
@@ -652,7 +683,236 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         "search_and_replace_file": queued_replace_file,
         "log_level": log_level, "paced_unit_mode": paced_unit_mode or "sentence",
         "engine": engine,
+        "voice_mode": voice_mode, "dialogue_voice": dialogue_voice or None, "cast_file": queued_cast_file,
     }
+
+
+# ---- Cast (multi-voice) ----
+
+CASTS_DIR = cast_store.CASTS_FOLDER  # inside the app data folder, next to queue.json
+CAST_COLUMNS = ["Character", "Lines", "Gender", "Age", "Voice", "Also called"]
+VOICE_MODE_CHOICES = [("Single voice", VOICE_MODE_SINGLE), ("Narrator + dialogue voice", VOICE_MODE_DIALOGUE)]
+CAST_MODE_CHOICE = ("Cast (LLM picks who speaks)", VOICE_MODE_CAST)
+# Rough placeholder for the queue's time column: the LLM's real speed is unknown until
+# experiments/multivoice/validate_multivoice.py reports time per 1,000 lines on the owner's machine.
+ANALYSIS_SECONDS_PER_LINE = 0.5
+_GENDER_CHOICES = [("female", "female"), ("male", "male"), ("unknown", "unknown")]
+VOICE_GENDER_CHOICES = [("not set", ""), ("female", "female"), ("male", "male"), ("neutral (fits anyone)", "neutral")]
+
+
+def voice_mode_choices() -> list:
+    """The Voice mode options: cast mode is offered only when a chat endpoint is configured."""
+    return VOICE_MODE_CHOICES + ([CAST_MODE_CHOICE] if llm_configured() else [])
+
+
+def book_cast_key(library_book, input_file) -> Optional[str]:
+    """The cast key of the book currently picked (library pick wins over an upload), or None."""
+    book = library_book if library_book and os.path.isfile(library_book) else input_file
+    book = book.name if hasattr(book, "name") else book
+    if not book or not os.path.isfile(book):
+        return None
+    return cast_store.cast_key(book)
+
+
+def cast_file_for(cast_key: str) -> str:
+    return cast_store.cast_path(cast_key, CASTS_DIR)
+
+
+def _finished_cast(cast_key: Optional[str]) -> Tuple[str, dict]:
+    """(path, cast) of a finished analysis for this key; gr.Error otherwise."""
+    if not cast_key:
+        raise gr.Error("Pick a book first.")
+    path = cast_file_for(cast_key)
+    cast = cast_store.load_cast(path)
+    if cast is None:
+        raise gr.Error("This book has no cast yet: press Analyse cast first.")
+    if cast.get("status") != cast_store.STATUS_DONE:
+        raise gr.Error("The cast analysis hasn't finished yet." if cast.get("status") == cast_store.STATUS_RUNNING
+                       else f"The cast analysis failed ({cast.get('error') or 'see the log'}); run it again.")
+    return path, cast
+
+
+def engine_voices_with_gender(engine: str) -> List[Tuple[str, str]]:
+    """(voice, gender) for every voice the engine offers: Kokoro's from its id prefixes,
+    Chatterbox's from the owner's mapping (neutral when unset)."""
+    if engine == "kokoro":
+        choices, _ = kokoro_voices_and_default()
+        return [(voice, cast_store.kokoro_voice_gender(voice)) for _, voice in choices]
+    genders = cast_store.load_voice_genders()
+    return [(voice, cast_store.voice_gender("chatterbox", voice, genders)) for _, voice in openai_voice_choices()]
+
+
+def engine_voice_choices(engine: str) -> list:
+    return kokoro_voices_and_default()[0] if engine == "kokoro" else openai_voice_choices()
+
+
+def cast_rows(cast: dict, engine: str) -> Tuple[list, list]:
+    """(table rows, character keys in row order), most lines first."""
+    rows, keys = [], []
+    labels = dict((value, label) for label, value in engine_voice_choices(engine))
+    for key, character in cast_store.ranked_characters(cast):
+        voice = character.get("voice") or ""
+        rows.append([character.get("name", key), int(character.get("lines", 0)), character.get("gender", "unknown"),
+                     character.get("age", "unknown"), labels.get(voice, voice) if voice else "(dialogue voice)",
+                     ", ".join(character.get("aliases", []))])
+        keys.append(key)
+    return rows, keys
+
+
+def _fill_missing_voices(cast: dict, path: str, engine: str, narrator_voice: Optional[str]) -> dict:
+    """Give every character without a voice the automatic suggestion and save, so what the table
+    shows is exactly what a queued book would use."""
+    if any(not c.get("voice") for c in cast["characters"].values()):
+        suggestions = cast_store.suggest_voices(cast, engine_voices_with_gender(engine), narrator_voice)
+        for key, voice in suggestions.items():
+            cast["characters"][key]["voice"] = voice
+        if suggestions:
+            cast_store.save_cast(path, cast)
+    return cast
+
+
+def _cast_summary(cast: dict) -> str:
+    stats = cast.get("stats", {})
+    lines, unknown = int(stats.get("lines", 0)), int(stats.get("unknown_lines", 0))
+    known = lines - unknown
+    parts = [f"**Cast ready**: {len(cast['characters'])} characters, {known} of {lines} lines attributed"]
+    if unknown:
+        parts.append(f"{unknown} unknown (spoken by the dialogue voice)")
+    if stats.get("invalid_after_retry"):
+        parts.append(f"{stats['invalid_after_retry']} window(s) the LLM never answered usably")
+    return " · ".join(parts) + ". Click a row to change its gender or voice, then **Add to queue**."
+
+
+def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional[str], seen: Optional[list]) -> tuple:
+    """(table update, character keys, status text, seen) for the picked book's cast.
+
+    `seen` is [path, mtime, status] of what the table currently shows; when the cast file hasn't
+    changed since, the table is left alone (gr.update()) so a 3-second refresh never disturbs a
+    row the owner has selected.
+    """
+    if not cast_key:
+        return gr.update(value=None, visible=False), [], "Pick a book, tick its chapters, then press **Analyse cast**.", None
+    path = cast_file_for(cast_key)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return gr.update(value=None, visible=False), [], "No cast yet for this book: press **Analyse cast**.", None
+    cast = cast_store.load_cast(path)
+    if cast is None:
+        return gr.update(value=None, visible=False), [], "The cast file could not be read; run **Analyse cast** again.", None
+    stamp = [path, mtime, cast.get("status"), engine, narrator_voice]
+    if seen == stamp:
+        return gr.update(), gr.update(), gr.update(), seen
+    if cast.get("status") == cast_store.STATUS_RUNNING:
+        done, total = cast_store.analysis_progress(cast)
+        return (gr.update(value=None, visible=False), [],
+                f"⏳ **Analysing cast**: {done} of {total} chapters done, {len(cast['characters'])} characters so far.",
+                stamp)
+    if cast.get("status") == cast_store.STATUS_FAILED:
+        return (gr.update(value=None, visible=False), [],
+                f"✗ The cast analysis failed: {cast.get('error') or 'see the log'}. Press **Analyse cast** to try again.",
+                stamp)
+    cast = _fill_missing_voices(cast, path, engine, narrator_voice)
+    rows, keys = cast_rows(cast, engine)
+    stamp[1] = os.path.getmtime(path)  # _fill_missing_voices may just have saved
+    return gr.update(value=rows, visible=True), keys, _cast_summary(cast), stamp
+
+
+def select_cast_row(cast_key: Optional[str], keys: list, engine: str, evt: gr.SelectData) -> tuple:
+    """Clicking a row loads that character into the editor (name, gender, voice)."""
+    row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    if not cast_key or not (0 <= row < len(keys)):
+        return None, "", gr.update(), gr.update()
+    cast = cast_store.load_cast(cast_file_for(cast_key)) or {"characters": {}}
+    character = cast["characters"].get(keys[row])
+    if not character:
+        return None, "", gr.update(), gr.update()
+    return (keys[row], f"Editing **{character.get('name', keys[row])}**",
+            gr.update(value=character.get("gender", "unknown")),
+            gr.update(choices=engine_voice_choices(engine), value=character.get("voice") or None))
+
+
+def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gender: str, voice: Optional[str],
+                    engine: str) -> tuple:
+    """Save the editor's gender and voice for the selected character; returns the refreshed table."""
+    if not cast_key or not character_key:
+        raise gr.Error("Click a character in the cast table first.")
+    path = cast_file_for(cast_key)
+    cast = cast_store.load_cast(path)
+    if cast is None or character_key not in cast["characters"]:
+        raise gr.Error("That character is no longer in the cast (was it re-analysed?).")
+    if not voice:
+        raise gr.Error("Pick a voice for the character.")
+    if cast_store.voices_belong_to_engine({"characters": {"x": {"voice": voice}}}, engine):
+        raise gr.Error(f"'{voice}' is not a {engine} voice.")
+    character = cast["characters"][character_key]
+    character["gender"] = gender if gender in cast_store.GENDERS else "unknown"
+    character["voice"] = voice
+    cast_store.save_cast(path, cast)
+    rows, keys = cast_rows(cast, engine)
+    return gr.update(value=rows, visible=True), keys, f"Saved **{character.get('name', character_key)}**: {gender}, {voice}."
+
+
+def analysis_settings(library_book, input_file, chapter_table, engine: str, voice: str, title_mode: str,
+                      newline_mode: str, remove_endnotes: bool, remove_reference_numbers: bool,
+                      search_and_replace_file, log_level: str = "INFO") -> dict:
+    """Validate the form for a cast analysis and return the analysis job's settings."""
+    if not llm_configured():
+        raise gr.Error("No LLM is configured (set LLM_BASE_URL and LLM_MODEL first).")
+    if library_book:
+        if not os.path.isfile(library_book):
+            raise gr.Error("Pick the book from the list as you type (or clear the box to use an upload).")
+        if not _within_root(library_book, library_index.library_dir()):
+            raise gr.Error("That book is outside the ebook library folder.")
+    upload = input_file.name if hasattr(input_file, "name") else input_file
+    if not library_book and not upload:
+        raise gr.Error("Pick a book from the library or upload an EPUB first.")
+    if upload and not library_book and not os.path.isfile(upload):
+        raise gr.Error("The uploaded EPUB could not be read.")
+    selection = selected_chapter_numbers(chapter_table)
+    if not selection:
+        raise gr.Error("Tick the chapters to analyse.")
+    replace_file = (search_and_replace_file.name if hasattr(search_and_replace_file, "name")
+                    else search_and_replace_file)
+    if replace_file and not os.path.isfile(replace_file):
+        raise gr.Error("The search & replace file could not be read.")
+    book = library_book or upload
+    key = cast_store.cast_key(book)
+    return {
+        "input_file": library_book or _copy_for_queue(upload, ".epub"),
+        "chapter_selection": selection, "title_mode": title_mode, "newline_mode": newline_mode,
+        "remove_endnotes": bool(remove_endnotes), "remove_reference_numbers": bool(remove_reference_numbers),
+        "search_and_replace_file": _copy_for_queue(replace_file, ".txt") if replace_file else None,
+        "engine": engine or "chatterbox", "voice": voice, "log_level": log_level,
+        "cast_key": key, "cast_file": cast_file_for(key),
+    }
+
+
+def analysis_estimate(table, stats: list) -> float:
+    """Seconds the LLM pass is guessed to take for the ticked chapters (ANALYSIS_SECONDS_PER_LINE)."""
+    stats = stats or []
+    chosen = [stats[n - 1] for n in selected_chapter_numbers(table) if 0 < n <= len(stats)]
+    return sum((s[3] if len(s) > 3 else 0) for s in chosen) * ANALYSIS_SECONDS_PER_LINE
+
+
+def voice_mode_changed(voice_mode: str) -> tuple:
+    """Show the dialogue voice for the two multi-voice modes and the cast panel for cast mode."""
+    multi = voice_mode in (VOICE_MODE_DIALOGUE, VOICE_MODE_CAST)
+    return gr.update(visible=multi), gr.update(visible=voice_mode == VOICE_MODE_CAST)
+
+
+def voice_gender_of(voice: Optional[str]) -> dict:
+    """Voice lab: the recorded gender of a Chatterbox voice ("" when none)."""
+    return gr.update(value=cast_store.load_voice_genders().get(voice or "", ""))
+
+
+def save_voice_gender(voice: Optional[str], gender: str) -> str:
+    """Voice lab: record a Chatterbox voice's gender for cast suggestions."""
+    if not voice:
+        raise gr.Error("Pick a voice first.")
+    cast_store.save_voice_gender(voice, gender or None)
+    label = dict((value, label) for label, value in VOICE_GENDER_CHOICES).get(gender or "", "not set")
+    return f"**{os.path.splitext(voice)[0]}**: {label}. Cast suggestions use this."
 
 
 def generation_estimate(table, stats: list, engine: str = "chatterbox") -> float:
@@ -666,7 +926,8 @@ def generation_estimate(table, stats: list, engine: str = "chatterbox") -> float
 def _status_label(job: dict) -> str:
     note = f" · {job['note']}" if job.get("note") else ""
     if job["status"] == RUNNING:
-        return f"▶ generating · {JobQueue.chapters_done(job)} of {job['chapters']} chapters done"
+        verb = "analysing cast" if job_kind(job) == CAST else "generating"
+        return f"▶ {verb} · {JobQueue.chapters_done(job)} of {job['chapters']} chapters done"
     if job["status"] == QUEUED:
         return f"waiting{note}"
     if job["status"] == DONE:
@@ -681,10 +942,19 @@ QUEUE_COLUMNS = ["#", "Book", "Voice", "Chapters", "Status", "Generating time"]
 
 def _voice_column(job: dict) -> str:
     """Voice column text: the bare (extension-stripped) file name for Chatterbox, prefixed with
-    the engine name for Kokoro (its ids carry no file extension to strip)."""
-    if job.get("settings", {}).get("engine", "chatterbox") == "kokoro":
-        return f"Kokoro · {job['voice']}"
-    return os.path.splitext(job["voice"])[0]
+    the engine name for Kokoro (its ids carry no file extension to strip); a cast analysis says
+    so, and a multi-voice book adds its mode."""
+    if job_kind(job) == CAST:
+        return "cast analysis (LLM)"
+    settings = job.get("settings", {})
+    voice = f"Kokoro · {job['voice']}" if settings.get("engine", "chatterbox") == "kokoro" \
+        else os.path.splitext(job["voice"])[0]
+    mode = settings.get("voice_mode", VOICE_MODE_SINGLE)
+    if mode == VOICE_MODE_CAST:
+        return f"{voice} + cast"
+    if mode == VOICE_MODE_DIALOGUE:
+        return f"{voice} + dialogue voice"
+    return voice
 
 
 def queue_view(queue: JobQueue) -> tuple:
@@ -752,10 +1022,10 @@ def _about(seconds: float) -> str:
 
 
 def chapter_stats(text: str) -> list:
-    """[characters, sentences, paragraphs] of a chapter parsed with paragraph marks."""
+    """[characters, sentences, paragraphs, dialogue lines] of a chapter parsed with paragraph marks."""
     paragraphs = [p for p in (" ".join(part.split()) for part in text.split(PARAGRAPH_MARK)) if p]
     plain = " ".join(paragraphs)
-    return [len(plain), max(1, len(_SENTENCE_END.findall(plain))), max(1, len(paragraphs))]
+    return [len(plain), max(1, len(_SENTENCE_END.findall(plain))), max(1, len(paragraphs)), len(dialogue_lines(text))]
 
 
 def _engine_estimate_constants(engine: str) -> Tuple[float, float, float]:
@@ -767,7 +1037,7 @@ def _engine_estimate_constants(engine: str) -> Tuple[float, float, float]:
 
 def listening_seconds(stats: list, speed, sentence_pause, paragraph_pause, engine: str = "chatterbox") -> float:
     """Speech plus the inserted pauses (both shrink with speed)."""
-    characters, sentences, paragraphs = stats
+    characters, sentences, paragraphs = stats[:3]
     chars_per_second, _, _ = _engine_estimate_constants(engine)
     pauses = (max(0, sentences - paragraphs) * float(sentence_pause or 0)
               + max(0, paragraphs - 1) * float(paragraph_pause or 0))
@@ -887,18 +1157,20 @@ def refresh_voices() -> tuple:
     choices = openai_voice_choices()
     default = default_openai_voice(choices)
     return (gr.update(choices=choices, value=default), gr.update(choices=choices, value=default),
-            gr.update(choices=own_voice_choices()))
+            gr.update(choices=own_voice_choices()), gr.update(choices=choices, value=default))
 
 
-def engine_changed(engine: str) -> dict:
-    """Switching the Make tab's engine swaps the Voice dropdown to that engine's own choices and
-    default (Chatterbox's file list, or Kokoro's English voices from its live API)."""
+def engine_changed(engine: str) -> tuple:
+    """Switching the Make tab's engine swaps the Voice, Dialogue voice and cast-editor voice
+    dropdowns to that engine's own choices and default (Chatterbox's file list, or Kokoro's
+    English voices from its live API)."""
     if engine == "kokoro":
         choices, default = kokoro_voices_and_default()
     else:
         choices = openai_voice_choices()
         default = default_openai_voice(choices)
-    return gr.update(choices=choices, value=default)
+    return gr.update(choices=choices, value=default), gr.update(choices=choices, value=default), \
+        gr.update(choices=choices, value=None)
 
 
 def _sync_if_chatterbox(value: str, engine: str) -> dict:
@@ -933,6 +1205,31 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         queue.tick()
         gr.Info(f"Added '{title}' to the queue" + ("." if position <= 1 else f" (#{position} in line)."))
         return refresh_queue()
+
+    def queue_analysis(library_book, input_file, chapter_table, stats, engine, voice, title_mode, newline_mode,
+                       remove_endnotes, remove_reference_numbers, search_and_replace_file, log_level) -> tuple:
+        """Queue the LLM pass over the ticked chapters as a job of its own (it runs when the books
+        before it are done, never alongside one)."""
+        job_settings = analysis_settings(library_book, input_file, chapter_table, engine, voice, title_mode,
+                                         newline_mode, remove_endnotes, remove_reference_numbers,
+                                         search_and_replace_file, log_level)
+        for job in queue.jobs():
+            if (job_kind(job) == CAST and job["status"] in (QUEUED, RUNNING)
+                    and job["settings"].get("cast_key") == job_settings["cast_key"]):
+                raise gr.Error("This book's cast analysis is already in the queue.")
+        book = job_settings["input_file"]
+        title = f"Cast: {library_index.book_title(book, library_index.load_index()) or os.path.basename(book)}"
+        position = queue.add(title, job_settings, len(job_settings["chapter_selection"]),
+                             analysis_estimate(chapter_table, stats), voice, kind=CAST)
+        queue.tick()
+        gr.Info("Cast analysis queued" + ("." if position <= 1 else f" (#{position} in line)."))
+        return (*refresh_queue(), job_settings["cast_key"],
+                "⏳ Cast analysis queued. This panel updates as it runs.")
+
+    def refresh_cast(voice_mode, cast_key, engine, voice, seen) -> tuple:
+        if voice_mode != VOICE_MODE_CAST:
+            return gr.update(), gr.update(), gr.update(), seen
+        return cast_overview(cast_key, engine, voice, seen)
 
     def delete_voice(name: Optional[str], current_lab_voice: str, current_voice: str, engine: str) -> tuple:
         """Delete an own voice after the browser confirms (see the button's js=); None means the
@@ -1009,6 +1306,32 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                             interactive=False, visible=False)
                     speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed",
                                       info="1.0 recommended (other speeds are stretched after generation).")
+            with gr.Row(equal_height=True):
+                voice_mode = gr.Radio(voice_mode_choices(), value=VOICE_MODE_SINGLE, label="Voice mode", scale=2,
+                                      info="Single voice reads everything as before. The other modes give quoted "
+                                           "lines their own voice; Cast asks the local LLM who speaks each line.")
+                dialogue_voice = gr.Dropdown(choices, value=default_voice, label="Dialogue voice", scale=1,
+                                             allow_custom_value=True, visible=False,
+                                             info="Quoted lines (in cast mode: lines whose speaker is unknown).")
+            with gr.Column(visible=False) as cast_panel:
+                with gr.Row(equal_height=True):
+                    analyse_button = gr.Button("🎭 Analyse cast", scale=0, min_width=160)
+                    cast_status = gr.Markdown("Pick a book, tick its chapters, then press **Analyse cast**.")
+                cast_table = gr.Dataframe(headers=CAST_COLUMNS, datatype=["str", "number", "str", "str", "str", "str"],
+                                          interactive=False, wrap=True, visible=False,
+                                          label="Cast: click a character to change its gender or voice",
+                                          column_widths=["22%", "8%", "10%", "10%", "22%", "28%"], max_height=400)
+                with gr.Row(equal_height=True):
+                    cast_editing = gr.Markdown("Click a character in the table.")
+                    cast_gender = gr.Dropdown(_GENDER_CHOICES, value="unknown", label="Gender", scale=1)
+                    cast_voice = gr.Dropdown(choices, value=None, label="Voice", allow_custom_value=True, scale=2)
+                    with gr.Column(scale=0, min_width=100):
+                        cast_sample_button = gr.Button("▶ Sample", size="sm")
+                        cast_apply_button = gr.Button("Save", size="sm", variant="primary")
+                cast_key_state = gr.State(None)
+                cast_keys_state = gr.State([])
+                cast_selected = gr.State(None)
+                cast_seen = gr.State(None)
             with gr.Row(equal_height=True):
                 sentence_pause = gr.Slider(0.0, 1.5, value=0.35, step=0.05, label="Pause after sentences (s)")
                 paragraph_pause = gr.Slider(0.0, 3.0, value=0.9, step=0.1, label="Pause between paragraphs (s)")
@@ -1098,6 +1421,14 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                     add_button = gr.Button("Add voice")
             add_status = gr.Markdown()
 
+            gr.Markdown("### Voice gender (for cast suggestions)")
+            with gr.Row(equal_height=True):
+                lab_gender = gr.Dropdown(VOICE_GENDER_CHOICES, value="", label="Gender of the voice selected above",
+                                         info="Multi-voice books suggest voices for characters by gender. "
+                                              "Chatterbox voice files carry no gender, so set it here.")
+                save_gender_button = gr.Button("Save gender")
+            gender_status = gr.Markdown()
+
             gr.Markdown("### Delete a voice")
             with gr.Row(equal_height=True):
                 delete_voice_dropdown = gr.Dropdown(own_voice_choices(), value=None, label="Your voices",
@@ -1107,7 +1438,8 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
 
         settings = [output_dir, voice, speed, sentence_pause, paragraph_pause, output_m4b, skip_existing,
                     output_text, title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
-                    search_and_replace_file, log_level, paced_unit_mode, engine]
+                    search_and_replace_file, log_level, paced_unit_mode, engine, voice_mode, dialogue_voice,
+                    cast_key_state]
         # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
         # this re-runs the auto-selection. Ticks, speed, pauses, engine and "Tick all" only touch the table.
         timing = [speed, sentence_pause, paragraph_pause, engine]
@@ -1121,8 +1453,29 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         # once, from the upload, instead of once from the stale library pick and again from the
         # upload (F-42b).
         input_file.change(uploaded_book_selected, inputs=input_file, outputs=[output_dir, library_book]) \
-            .then(chapter_overview, inputs=overview_inputs, outputs=overview_outputs)
+            .then(chapter_overview, inputs=overview_inputs, outputs=overview_outputs) \
+            .then(book_cast_key, inputs=[library_book, input_file], outputs=cast_key_state)
         queue_outputs = [queue_table, queue_ids, queue_status]
+
+        # Cast mode: the cast key follows the picked book; the panel follows the cast file.
+        cast_view_inputs = [cast_key_state, engine, voice, cast_seen]
+        cast_view_outputs = [cast_table, cast_keys_state, cast_status, cast_seen]
+        library_book.change(book_cast_key, inputs=[library_book, input_file], outputs=cast_key_state)
+        cast_key_state.change(cast_overview, inputs=cast_view_inputs, outputs=cast_view_outputs)
+        voice_mode.change(voice_mode_changed, inputs=voice_mode, outputs=[dialogue_voice, cast_panel]) \
+            .then(refresh_cast, inputs=[voice_mode, *cast_view_inputs], outputs=cast_view_outputs)
+        queue_timer.tick(refresh_cast, inputs=[voice_mode, *cast_view_inputs], outputs=cast_view_outputs)
+        analyse_button.click(queue_analysis,
+                             inputs=[library_book, input_file, chapter_table, chapter_stats_state, engine, voice,
+                                     title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
+                                     search_and_replace_file, log_level],
+                             outputs=[*queue_outputs, cast_key_state, cast_status])
+        cast_table.select(select_cast_row, inputs=[cast_key_state, cast_keys_state, engine],
+                          outputs=[cast_selected, cast_editing, cast_gender, cast_voice])
+        cast_apply_button.click(apply_cast_edit, inputs=[cast_key_state, cast_selected, cast_gender, cast_voice, engine],
+                                outputs=[cast_table, cast_keys_state, cast_status])
+        cast_sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
+            .then(sample_voice, inputs=[engine, cast_voice, speed], outputs=sample_audio)
         selection_outputs = [*queue_outputs, selected_job, selected_info]
         enqueue_button.click(enqueue, inputs=[library_book, input_file, chapter_table, chapter_stats_state, *settings],
                              outputs=queue_outputs)
@@ -1146,9 +1499,11 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         chapter_table.change(chapter_summary, inputs=[chapter_table, chapter_stats_state, *timing],
                              outputs=chapters_info)
 
-        engine.change(engine_changed, inputs=engine, outputs=voice)
+        engine.change(engine_changed, inputs=engine, outputs=[voice, dialogue_voice, cast_voice])
         voice.input(_sync_if_chatterbox, inputs=[voice, engine], outputs=lab_voice)
         lab_voice.input(_sync_if_chatterbox, inputs=[lab_voice, engine], outputs=voice)
+        lab_voice.change(voice_gender_of, inputs=lab_voice, outputs=lab_gender)
+        save_gender_button.click(save_voice_gender, inputs=[lab_voice, lab_gender], outputs=gender_status)
         # The player stays hidden until the first sample, then shows before the audio arrives.
         sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
             .then(sample_voice, inputs=[engine, voice, speed], outputs=sample_audio)
@@ -1170,7 +1525,8 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                " ? [name, lab, mk, eng] : [null, lab, mk, eng]",
         )
 
-        ui.load(refresh_voices, inputs=None, outputs=[voice, lab_voice, delete_voice_dropdown])
+        ui.load(refresh_voices, inputs=None, outputs=[voice, lab_voice, delete_voice_dropdown, dialogue_voice])
+        ui.load(voice_gender_of, inputs=lab_voice, outputs=lab_gender)
         ui.load(refresh_library, inputs=None, outputs=library_book)
         ui.load(load_saved_settings, inputs=None, outputs=[exaggeration, cfg_weight, temperature])
         ui.load(refresh_queue, inputs=None, outputs=queue_outputs)

@@ -1,0 +1,207 @@
+"""The cast analysis job: the whole book pass on a generated EPUB with a scripted LLM, and the
+unload -> analyse -> reload order around it (also when the analysis fails)."""
+import hashlib
+import json
+import os
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from ebooklib import epub
+
+from audiobook_generator.core import cast as cast_store
+from audiobook_generator.core import chatterbox_control
+from audiobook_generator.core.cast_analysis import analyse_book, run_cast_analysis
+
+CHAPTERS = [
+    ("One", ['Ada Marsh put the lamp down. "You left the gate open," she said.',
+             '"I did not," said Tom. He went on writing.', '"Then who did?"']),
+    ("Two", ['"The goats are in the beans," said their mother.', '"Yes, Mrs. Marsh," said Tom.']),
+]
+
+
+def _write_epub(path: str) -> None:
+    book = epub.EpubBook()
+    book.set_identifier("invented-1")
+    book.set_title("An Invented Book")
+    book.add_author("Nobody Real")
+    items = []
+    for n, (title, paragraphs) in enumerate(CHAPTERS, 1):
+        body = "".join(f"<p>{p}</p>" for p in paragraphs)
+        item = epub.EpubHtml(title=title, file_name=f"c{n}.xhtml", lang="en")
+        item.content = f"<html><body><h1>{title}</h1>{body}</body></html>"
+        book.add_item(item)
+        items.append(item)
+    book.toc = items
+    book.spine = ["nav"] + items
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    epub.write_epub(path, book)
+
+
+class ScriptedChat:
+    def __init__(self, *replies):
+        self.replies, self.prompts = list(replies), []
+
+    def __call__(self, messages):
+        self.prompts.append(messages)
+        return json.dumps(self.replies.pop(0))
+
+
+class TestAnalyseBook(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.book = os.path.join(self.tmp.name, "book.epub")
+        _write_epub(self.book)
+        self.settings = {"input_file": self.book, "chapter_selection": [1, 2], "title_mode": "auto",
+                         "newline_mode": "double", "remove_endnotes": False, "remove_reference_numbers": False,
+                         "search_and_replace_file": None, "engine": "chatterbox", "voice": "Narrator.wav",
+                         "cast_file": os.path.join(self.tmp.name, "casts", "k.json"), "cast_key": "k"}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_the_cast_covers_every_chapter_keyed_by_its_text_hash(self):
+        chat = ScriptedChat(
+            {"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"},
+             "characters": [{"name": "Ada Marsh", "gender": "female", "age": "adult"},
+                            {"name": "Tom", "gender": "male", "age": "child"}]},
+            {"speakers": {"1": "Mrs. Marsh", "2": "Tom"},
+             "characters": [{"name": "Mrs. Marsh", "gender": "female", "age": "adult"}]},
+        )
+        cast = analyse_book(self.settings, chat=chat)
+        self.assertEqual(cast["status"], "done")
+        self.assertEqual((cast["book"]["title"], cast["book"]["author"]), ("An Invented Book", "Nobody Real"))
+        self.assertEqual((cast["chapters_done"], cast["chapters_total"]), (2, 2))
+        self.assertEqual({k: c["lines"] for k, c in cast["characters"].items()}, {"ada marsh": 2, "tom": 2, "marsh": 1})
+        self.assertEqual(cast["characters"]["tom"]["gender"], "male")
+        numbers = sorted(ch["number"] for ch in cast["chapters"].values())
+        self.assertEqual(numbers, [1, 2])
+        # The chapter keys are SHA-1s of the exact chapter text a book job would hash.
+        from audiobook_generator.book_parsers.base_book_parser import get_book_parser
+        from audiobook_generator.core.cast_analysis import parsing_config
+        chapters = [(t, x) for t, x in get_book_parser(parsing_config(self.settings)).get_chapters(" @BRK#") if x.strip()]
+        for _, text in chapters:
+            self.assertIn(hashlib.sha1(text.encode("utf-8")).hexdigest(), cast["chapters"])
+        saved = cast_store.load_cast(self.settings["cast_file"])
+        self.assertEqual(saved["chapters"], cast["chapters"])
+        self.assertEqual(saved["stats"]["lines"], 5)
+        self.assertEqual(len(chat.prompts), 2)
+
+    def test_a_failure_is_recorded_in_the_cast_file_and_raised(self):
+        def chat(messages):
+            raise ConnectionError("LLM down")
+        with self.assertRaises(ConnectionError):
+            analyse_book(self.settings, chat=chat)
+        saved = cast_store.load_cast(self.settings["cast_file"])
+        self.assertEqual((saved["status"], saved["error"], saved["chapters_done"]), ("failed", "LLM down", 0))
+
+    def test_only_selected_chapters_are_analysed(self):
+        self.settings["chapter_selection"] = [2]
+        cast = analyse_book(self.settings, chat=ScriptedChat({"speakers": {"1": "Mother", "2": "Tom"}}))
+        self.assertEqual([ch["number"] for ch in cast["chapters"].values()], [2])
+
+
+class TestRunCastAnalysisOrder(unittest.TestCase):
+    """The queue's process target: Chatterbox is unloaded before the LLM pass and reloaded after,
+    whether or not the pass succeeded."""
+
+    def _run(self, analysis, unload_allowed=True, unload_ok=True):
+        events = []
+
+        def analyse(settings):
+            events.append("analyse")
+            return analysis()
+        exits = []
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("audiobook_generator.core.cast_analysis.setup_logging"):  # keep the failure's traceback out of the test output
+            run_cast_analysis({}, os.path.join(tmp, "log.txt"), unload_allowed=lambda: unload_allowed,
+                              unload=lambda: events.append("unload") or unload_ok,
+                              reload=lambda: events.append("reload") or True, analyse=analyse, exit=exits.append)
+        return events, exits
+
+    def test_unload_then_analyse_then_reload_and_exit_0(self):
+        events, exits = self._run(lambda: {"status": "done"})
+        self.assertEqual(events, ["unload", "analyse", "reload"])
+        self.assertEqual(exits, [0])
+
+    def test_reload_happens_even_when_the_analysis_fails_and_exit_is_1(self):
+        def boom():
+            raise RuntimeError("LLM exploded")
+        events, exits = self._run(boom)
+        self.assertEqual(events, ["unload", "analyse", "reload"])
+        self.assertEqual(exits, [1])
+
+    def test_no_reload_when_the_setting_kept_chatterbox_loaded(self):
+        events, exits = self._run(lambda: {}, unload_allowed=False)
+        self.assertEqual(events, ["analyse"])
+        self.assertEqual(exits, [0])
+
+    def test_no_reload_when_the_unload_itself_failed(self):
+        events, _ = self._run(lambda: {}, unload_ok=False)
+        self.assertEqual(events, ["unload", "analyse"])
+
+
+class TestChatterboxControl(unittest.TestCase):
+
+    def test_unload_setting_defaults_on(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(chatterbox_control.unload_enabled())
+        for value in ("off", "0", "false", "No"):
+            with patch.dict(os.environ, {"LLM_UNLOAD_CHATTERBOX": value}):
+                self.assertFalse(chatterbox_control.unload_enabled())
+        with patch.dict(os.environ, {"LLM_UNLOAD_CHATTERBOX": "on"}):
+            self.assertTrue(chatterbox_control.unload_enabled())
+
+    def test_model_loaded_reads_model_info_and_none_when_unreachable(self):
+        with patch.dict(os.environ, {"OPENAI_BASE_URL": "http://cb:8004/v1"}):
+            with patch.object(chatterbox_control, "_get_json", return_value={"loaded": True}):
+                self.assertTrue(chatterbox_control.model_loaded())
+            with patch.object(chatterbox_control, "_get_json", return_value={"loaded": False}):
+                self.assertFalse(chatterbox_control.model_loaded())
+            with patch.object(chatterbox_control, "_get_json", side_effect=OSError("down")):
+                self.assertIsNone(chatterbox_control.model_loaded())
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(chatterbox_control.model_loaded())
+
+    def test_reload_posts_restart_then_waits_for_loaded(self):
+        answers = iter([{"loaded": False}, {"loaded": False}, {"loaded": True}])
+        posted = []
+        with patch.dict(os.environ, {"OPENAI_BASE_URL": "http://cb:8004/v1"}), \
+                patch.object(chatterbox_control, "_post", side_effect=lambda path, timeout: posted.append(path)), \
+                patch.object(chatterbox_control, "_get_json", side_effect=lambda path, timeout: next(answers)), \
+                patch.object(chatterbox_control.time, "sleep"):
+            self.assertTrue(chatterbox_control.reload())
+        self.assertEqual(posted, ["/restart_server"])
+
+    def test_wait_gives_up_after_the_timeout(self):
+        clock = iter(range(0, 10_000, 100))
+        with patch.dict(os.environ, {"OPENAI_BASE_URL": "http://cb:8004/v1"}), \
+                patch.object(chatterbox_control, "_get_json", return_value={"loaded": False}):
+            self.assertFalse(chatterbox_control.wait_until_loaded(timeout=300, sleep=lambda s: None, clock=lambda: next(clock)))
+
+    def test_unload_posts_and_reports_failure_without_raising(self):
+        with patch.dict(os.environ, {"OPENAI_BASE_URL": "http://cb:8004/v1"}):
+            with patch.object(chatterbox_control, "_post", return_value=b"{}") as post:
+                self.assertTrue(chatterbox_control.unload())
+                self.assertEqual(post.call_args.args[0], "/api/unload")
+            with patch.object(chatterbox_control, "_post", side_effect=OSError("down")):
+                self.assertFalse(chatterbox_control.unload())
+
+    def test_ready_for_book_is_false_while_unloaded_and_kicks_off_one_reload(self):
+        started = []
+        with patch.dict(os.environ, {"OPENAI_BASE_URL": "http://cb:8004/v1"}), \
+                patch.object(chatterbox_control, "model_loaded", return_value=False), \
+                patch.object(chatterbox_control.threading, "Thread") as thread:
+            thread.return_value.is_alive.return_value = True
+            thread.return_value.start.side_effect = lambda: started.append(1)
+            chatterbox_control._reload_thread = None
+            self.assertFalse(chatterbox_control.ready_for_book())
+            self.assertFalse(chatterbox_control.ready_for_book())
+        chatterbox_control._reload_thread = None
+        self.assertEqual(started, [1])
+        with patch.object(chatterbox_control, "model_loaded", return_value=True):
+            self.assertTrue(chatterbox_control.ready_for_book())
+        with patch.object(chatterbox_control, "model_loaded", return_value=None):
+            self.assertTrue(chatterbox_control.ready_for_book())
