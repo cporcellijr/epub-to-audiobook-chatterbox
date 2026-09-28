@@ -604,3 +604,69 @@ without the LLM; those lines, and every line decided in earlier windows, are sho
 is mostly untagged by design, so real books should gain more). Ten lines per request instead of 20
 scored 218, so the window stays at 20.
 
+## 15. Character profiles for picking voices (2026-09-28)
+
+The owner asked for something like the KOReader X-Ray plugins to help choose cast voices.
+[koreader-xray-plugin](https://github.com/0zd3m1r/koreader-xray-plugin) sends Gemini or ChatGPT only
+the title and author and relies on the model having read the book; a local 14B model mostly hasn't,
+and invents characters. [KoCharacters](https://github.com/nefelodamon/KoCharacters) sends page text,
+which is the approach taken here. Two of its ideas are used (personality as lasting traits, not
+events; a verbatim first-appearance quote). No code was borrowed.
+
+### 15.1 What it does
+
+`core/cast_profiles.py` (new) runs at the end of the cast job, after the last chapter's attribution,
+while Chatterbox is still unloaded. The 15 most-spoken characters with at least 3 lines get one request
+each. The request carries up to 6,000 characters of the paragraphs where the character speaks (shown
+as `[Name] "..."`, as in the attribution windows) or where the narration names them (name, aliases,
+first name; never a bare surname or a description's first word). It takes their first three passages,
+then an even spread over the rest, with chapter headings and `[...]` for gaps. The model answers with
+role, gender, age, description, relationships and a 4-12 word voice note; a gender or age the
+attribution left unknown is filled in. Every character, however minor, gets the first line it speaks,
+quoted by code. An unusable reply is asked again once, then skipped. Any other error (LLM down,
+timeout) ends the stage and is noted in `profile_error`; the analysis still finishes as done.
+
+Two corrections by code, both from the live run below:
+- A voice-note clause naming an accent or origin the excerpts never mention is dropped. The model
+  gave one character "a slight southern drawl"; no accent word appears anywhere in the book.
+- A character with under a tenth of the most-spoken character's lines is "minor" (an antagonist stays
+  one). The model sees one character's passages at a time, so it can't judge how big a part is.
+
+UI: the cast table gains **Role** and **Sounds like** columns. Clicking a row shows the profile under
+the editor: role, gender, age and line count, then the description, the voice note, relationships and
+the first line. While the job runs, the status reads "Writing character profiles: n of m" after the
+chapters. The summary counts the profiles and says if they stopped early. Casts analysed before this
+have no profiles until they are analysed again (voice picks carry over).
+
+### 15.2 Measured on the owner's machine
+
+Run in the deployed container through the queue's own process target (`run_cast_analysis`: unload
+Chatterbox, attribute, profile, reload) on scratch copies of the two real casts (a 3-chapter and a
+4-chapter book, 218 and 291 dialogue lines, qwen2.5:14b through Ollama):
+- All 10 profiles usable, no retries, no errors, in both runs. A profile took 2-6 s, against 15-20 s of
+  attribution per chapter, so the profile stage adds well under a minute. Every existing voice pick carried over, and
+  Chatterbox came back loaded (Docker shows it unhealthy for the minute it is unloaded).
+- First prompt: one voice note was the prompt's own example word for word ("brisk older woman, dry
+  and impatient"); one invented an accent; both 3-7 line characters came back "supporting"; one
+  relationships field listed everyone else as "not mentioned in the excerpts". Now: the example is
+  gone, the accent guard and minor rule are in, and "not mentioned" filler is dropped. On a rerun of
+  the same casts none of the four recurred.
+- A profile surfaced a real voice mismatch. "the doctor" had been given a male voice because the
+  attribution left their gender unknown. The profile found she was a woman and set female.
+  Voices already picked are never changed, so the table now shows the mismatch for the owner to fix.
+- Spot-checked against the text: a family detail one profile gave is in the book; "southern drawl" was not.
+- Remaining weaknesses: roles vary between books of the same series (one character is "protagonist"
+  in one and "supporting" in the next); the notes lean on the book's register ("breathy" three times
+  in one cast).
+
+### 15.3 Tests
+
+523 app tests pass (501 before; 22 new). `cast_profiles_test.py` (18) covers: name forms, passage
+finding and rendering, the spread order and the budget, first lines, candidates, reply parsing
+(role words, bad values, clipping, filler, unusable replies), the accent guard, the minor rule,
+retry-then-skip and the error stop. `cast_analysis_test.py` (1) runs the whole job with profiles and
+with a profile-stage LLM failure. `chatterbox_ui_test.py` (3) covers the new columns and summary, the
+click-to-profile text and the progress line. Not verified by clicking through a browser: the deployed
+page's config carries the new columns, and the same UI functions were run over the live casts
+inside the container.
+
