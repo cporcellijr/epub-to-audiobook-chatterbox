@@ -38,6 +38,8 @@ except ImportError:
 # Import the singleton config_manager
 from config import config_manager
 
+import fast_t3  # compiled T3 token loop (F-45)
+
 logger = logging.getLogger(__name__)
 
 # Log BF16 setting at module load so it's visible in startup logs
@@ -102,6 +104,15 @@ def _resolve_bf16_setting() -> bool:
 
 BF16_ENABLED: bool = _resolve_bf16_setting()
 
+# --- Compiled T3 token loop (F-45) ---
+# TTS_COMPILE: run the per-token transformer step from a static KV cache through
+# torch.compile (CUDA graphs), see fast_t3.py. Off by default. Applies only to the
+# Original model with TTS_BF16 on and CUDA; anything else, or any failure, keeps the
+# stock loop. Compiling happens during model load (about 17 s) so requests never pay for it.
+#   off (default) — stock token loop
+#   on / 1 / true  — compiled loop (measured 2.35x faster requests, WORKLOG section 12)
+COMPILE_ENABLED: bool = fast_t3.resolve_compile_setting()
+
 # --- Global Module Variables ---
 chatterbox_model: Optional[ChatterboxTTS] = None
 MODEL_LOADED: bool = False
@@ -116,6 +127,9 @@ loaded_model_class_name: Optional[str] = None  # "ChatterboxTTS" or "ChatterboxT
 # Voice conditioning cache: avoids re-encoding the same voice file on every request.
 # Key: (resolved_path, file_mtime, exaggeration) — mtime invalidates if file changes.
 _conds_cache: dict = {}
+
+# The compiled T3 loop installed on the loaded model, or None when the stock loop runs.
+compiled_t3: Optional["fast_t3.CompiledT3"] = None
 
 # Serializes the conds-setting + generate() section of synthesize(), and the model
 # swaps in load_model()/unload_model()/reload_model(). The server runs endpoints in a
@@ -269,6 +283,7 @@ def get_model_info() -> dict:
         ),
         "turbo_available_in_package": TURBO_AVAILABLE,
         "multilingual_available_in_package": MULTILINGUAL_AVAILABLE,
+        "compiled_t3": compiled_t3 is not None,
         "supports_multilingual": loaded_model_type == "multilingual",
         "supported_languages": (
             SUPPORTED_LANGUAGES if loaded_model_type == "multilingual" else {"en": "English"}
@@ -426,6 +441,7 @@ def load_model() -> bool:
                 MODEL_LOADED = False
                 return False
 
+            install_fast_path()
             return True
 
         except Exception as e:
@@ -435,6 +451,55 @@ def load_model() -> bool:
             chatterbox_model = None
             MODEL_LOADED = False
             return False
+
+
+def install_fast_path() -> bool:
+    """Install the compiled T3 loop (F-45) on the loaded model when TTS_COMPILE and the model
+    allow it, warming it up on its worker thread. Any failure keeps the stock loop.
+
+    Returns:
+        bool: True when the compiled loop is installed.
+    """
+    global compiled_t3
+
+    with _synthesis_lock:
+        if compiled_t3 is not None:
+            return True
+        if not MODEL_LOADED or chatterbox_model is None:
+            reason = "no model is loaded"
+        else:
+            reason = fast_t3.install_reason(COMPILE_ENABLED, loaded_model_type, BF16_ENABLED, model_device)
+        if reason is not None:
+            logger.info(
+                f"Compiled T3 loop not installed: {reason} "
+                f"(TTS_COMPILE={os.environ.get('TTS_COMPILE', 'off')})."
+            )
+            return False
+        try:
+            compiled_t3 = fast_t3.install(chatterbox_model, autocast_enabled=BF16_ENABLED)
+            return True
+        except Exception as e:
+            compiled_t3 = None
+            logger.warning(
+                f"Compiled T3 loop could not be installed; serving with the stock loop: {e}",
+                exc_info=True,
+            )
+            return False
+
+
+def teardown_fast_path() -> None:
+    """Restore the stock T3 loop and release the compiled state (before an unload or reload)."""
+    global compiled_t3
+
+    with _synthesis_lock:
+        fast, compiled_t3 = compiled_t3, None
+        if fast is None:
+            return
+        try:
+            fast_t3.uninstall(chatterbox_model, fast)
+            logger.info("Compiled T3 loop removed; stock loop restored.")
+        except Exception as e:
+            logger.warning(f"Compiled T3 loop teardown failed: {e}", exc_info=True)
 
 
 def synthesize(
@@ -510,34 +575,41 @@ def synthesize(
             # Call the core model's generate method.
             # autocast promotes float32 inputs to bfloat16 to match T3/S3Gen weights,
             # keeping numerically sensitive ops (softmax, norms) in float32 automatically.
-            try:
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=BF16_ENABLED):
-                    if loaded_model_type == "multilingual":
-                        wav_tensor = chatterbox_model.generate(
+            def generate() -> torch.Tensor:
+                # Autocast and its cache are thread-local, so the whole unit runs on whichever
+                # thread generates: this one, or the compiled loop's worker thread.
+                try:
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=BF16_ENABLED):
+                        if loaded_model_type == "multilingual":
+                            return chatterbox_model.generate(
+                                text=text,
+                                language_id=language,
+                                audio_prompt_path=effective_prompt,
+                                temperature=temperature,
+                                exaggeration=exaggeration,
+                                cfg_weight=cfg_weight,
+                            )
+                        return chatterbox_model.generate(
                             text=text,
-                            language_id=language,
                             audio_prompt_path=effective_prompt,
                             temperature=temperature,
                             exaggeration=exaggeration,
                             cfg_weight=cfg_weight,
                         )
-                    else:
-                        wav_tensor = chatterbox_model.generate(
-                            text=text,
-                            audio_prompt_path=effective_prompt,
-                            temperature=temperature,
-                            exaggeration=exaggeration,
-                            cfg_weight=cfg_weight,
-                        )
-            finally:
-                # T3.inference builds a fresh T3HuggingfaceBackend wrapper on every call (it
-                # resets self.compiled to False each time), and generate() runs inside
-                # torch.autocast above. Autocast's cache of casted weights is not released
-                # when the wrapper is discarded, so GPU memory grew with every request (+461
-                # live CUDA tensors / +248 MB over 240 requests). Clearing the cache after
-                # every attempt, including one that raised, keeps it flat.
-                if BF16_ENABLED:
-                    torch.clear_autocast_cache()
+                finally:
+                    # T3.inference builds a fresh T3HuggingfaceBackend wrapper on every call (it
+                    # resets self.compiled to False each time), and generate() runs inside
+                    # torch.autocast above. Autocast's cache of casted weights is not released
+                    # when the wrapper is discarded, so GPU memory grew with every request (+461
+                    # live CUDA tensors / +248 MB over 240 requests). Clearing the cache after
+                    # every attempt, including one that raised, keeps it flat.
+                    if BF16_ENABLED:
+                        torch.clear_autocast_cache()
+
+            # CUDA graphs replay only on the thread that recorded them (see fast_t3.py), so a
+            # compiled model generates on its dedicated worker thread while this thread keeps
+            # _synthesis_lock held and waits for the result.
+            wav_tensor = fast_t3.run(generate) if compiled_t3 is not None else generate()
 
             # Store conds in cache after first compute for this voice.
             if conds_key is not None and effective_prompt is not None:
@@ -568,7 +640,8 @@ def unload_model() -> bool:
     with _synthesis_lock:
         logger.info("Initiating model unload sequence...")
 
-        # 1. Unload existing model
+        # 1. Unload existing model (its compiled loop first: it holds the static cache and graphs)
+        teardown_fast_path()
         if chatterbox_model is not None:
             logger.info("Unloading TTS model from memory...")
             del chatterbox_model
@@ -619,7 +692,8 @@ def reload_model() -> bool:
     with _synthesis_lock:
         logger.info("Initiating model hot-swap/reload sequence...")
 
-        # 1. Unload existing model
+        # 1. Unload existing model (its compiled loop first; load_model() reinstalls one)
+        teardown_fast_path()
         if chatterbox_model is not None:
             logger.info("Unloading existing TTS model from memory...")
             del chatterbox_model

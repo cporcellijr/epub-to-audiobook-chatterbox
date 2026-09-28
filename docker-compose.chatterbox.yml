@@ -19,6 +19,9 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - TTS_BF16=auto
+      # Compiled T3 token loop (F-45): "on" compiles the per-token step with CUDA graphs at
+      # model load for ~2.3x faster generation; off until validated (see .env.example).
+      - TTS_COMPILE=${TTS_COMPILE:-off}
       # Whole-folder mount below (not a single-file one) so config saves can rename
       # instead of copying onto a mount point (F-52); host file path is unchanged.
       - CHATTERBOX_CONFIG_PATH=/app/data/config.yaml
