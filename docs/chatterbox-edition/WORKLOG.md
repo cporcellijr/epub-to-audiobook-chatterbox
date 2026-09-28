@@ -448,6 +448,143 @@ alias merging rules; retry-then-unknown and continued lines; cast persistence an
 old jobs (no `kind`, no voice-mode keys) building as single-voice books; `queue_settings` validation and
 the cast snapshot; the cast panel and editor.
 
+## 14. Adaptive delivery (2026-09-28)
+
+Dialogue lines that are whispered are read softer and quieter, shouted lines more excited and a
+little louder, around a per-book baseline. Built on branch `feature/adaptive-delivery`, no GPU
+needed for the code itself; the accuracy measurement (13.3 below) ran against the real Chatterbox
+and the local `qwen2.5:14b` LLM.
+
+### 14.1 Presets and the peak guard (`core/delivery.py`, new)
+
+Three moods -- `soft`, `normal`, `excited` -- each a `(exaggeration, cfg_weight, temperature,
+gain_db)` preset computed from the book's own baseline sliders `(b_exag, b_cfg, b_temp)`, approved
+by ear at the owner's baseline (exaggeration 0.73, CFG 0.5, temperature 0.61):
+
+```
+soft:    exaggeration = max(0.25, round(b_exag * 0.48, 2))   cfg = max(0.2, b_cfg - 0.15)   temperature = max(0.3, b_temp - 0.11)   -6 dB
+normal:  b_exag, b_cfg, b_temp unchanged                                                                                              0 dB
+excited: exaggeration = min(1.0,  b_exag + 0.27)              cfg = max(0.2, b_cfg - 0.1)    temperature = min(0.9, b_temp + 0.09)    +1.5 dB
+```
+
+At the approved baseline these reproduce the approved numbers exactly (soft 0.35/0.35/0.5, excited
+1.0/0.4/0.7) -- tested. Every unit spoken with adaptive delivery on gets a peak guard
+(`delivery.peak_guard`, `PEAK_GUARD_DBFS = -1.0`): if its peak exceeds -1 dBFS after the mood's gain
+it is turned down to exactly -1 dBFS. A +2 dB version of the excited preset was tried first and
+audibly clipped on the owner's voice; -1 dB did not, hence the guard threshold.
+
+`delivery.saved_chatterbox_defaults()` reads Chatterbox's own saved generation defaults
+(`CHATTERBOX_CONFIG`'s `generation_defaults`, one retry after F-52's short delay) for whichever of
+the three baseline sliders a book doesn't override, falling back to the approved baseline when the
+file can't be read. It deliberately duplicates `ui.chatterbox_ui`'s read of that file rather than
+importing it: `chatterbox_ui` already imports the TTS provider, so the reverse import would be
+circular.
+
+### 14.2 Rule-based mood cues (no LLM)
+
+`delivery.mood_of(before, quote_text, after)` looks at the narration right before a dialogue line
+(only when it is a lead-in speech tag, i.e. it ends in `,` or `:` -- "she whispered," but not an
+unrelated sentence that happens to precede the quote), the narration right after it, and the
+quotation's own text:
+
+- soft cues: whispered, murmured, breathed, hissed, muttered, mumbled, and the adverb phrases
+  softly / quietly / gently / under (his|her|their) breath / in a whisper / in a low voice;
+- excited cues: shouted, yelled, screamed, shrieked, roared, bellowed, cried (out), exclaimed, and
+  the adverbs loudly / angrily / furiously; a quotation whose last sentence ends in `!` is excited
+  unless a soft cue applies -- soft always wins, including over `!`.
+
+`delivery.segment_moods(paragraphs)` applies this per dialogue line of a chapter (mirroring
+`speech_tags.tagged_speakers`'s paragraph walk): narration is always `normal`; a continued
+quotation (`Segment.continues`) inherits the previous line's mood outright, ignoring its own
+surrounding text entirely (tested with a line whose own narration would say "excited" on its own
+but which must still inherit the previous line's "soft").
+
+### 14.3 Cast mode: LLM moods measured, then turned off
+
+The attribution prompt (`core/cast_llm.py`) can ask the model for an optional per-line mood
+alongside the speaker (`PROMPTS["moods_shape"]`/`PROMPTS["moods_rule"]`, gated by the module
+constant `ASK_LLM_FOR_MOODS`): `parse_reply` accepts a `"moods": {"N": "soft|normal|excited"}` for
+the asked ids, and a missing or invalid value becomes `"normal"` rather than an error (unlike
+`"speakers"`, which stays strict). `attribute_chapter` now returns `(lines, moods)`: a rule cue
+(from `delivery.segment_moods`, recomputed for the whole chapter once) always overrides the LLM's
+guess; a line never asked (speech-tag anchored, or continuing another line) gets the rule mood only.
+Moods are saved per chapter in the cast file (`chapters[hash]["moods"]`) and the cast summary the UI
+shows after analysis now adds a "N soft, M excited" count when either is non-zero.
+
+**Measured against the labelled multivoice fixture** (`docs/chatterbox-edition/experiments/multivoice/fixture`,
+270 dialogue lines, real `qwen2.5:14b` over `blackcat-net`, Chatterbox unloaded for the pass):
+adding the moods clause to the prompt dropped speaker attribution from the current baseline
+**221/270 to 198/270** -- well past the 219/270 floor this task set for reverting. `ASK_LLM_FOR_MOODS`
+is therefore **`False`** in the shipped code: cast-mode moods come from the rule cues only (the
+same `delivery.segment_moods` the non-LLM voice modes use), plus whatever the speech-tag anchors
+and continuations resolve to. Rule cues on the fixture: 266 normal / 3 soft / 1 excited (it is
+mostly plain dialogue, as expected of invented sample text); with `ASK_LLM_FOR_MOODS` on, the LLM
+additionally reassigned 5 lines to soft and 5 to excited that the rules had called normal -- not
+enough lines to justify a ~10-point accuracy cost. `parse_reply`/`attribute_chapter` still accept
+and merge a `"moods"` reply correctly (tested) if the constant is ever switched back on after a
+better-worded prompt is measured not to cost accuracy; the diagnostic script now also reports
+`MOODS_FROM_RULES`/`MOODS_ADDED_BY_LLM` so a future attempt can be checked the same way.
+
+### 14.4 Provider (`tts_providers/openai_tts_provider.py`)
+
+New `GeneralConfig` fields: `adaptive_delivery` (bool) and `delivery_exaggeration` /
+`delivery_cfg_weight` / `delivery_temperature` (`None` = Chatterbox's saved defaults, today's
+behaviour). `_is_chatterbox_engine()` (`config.model_name == "chatterbox"`, exactly what
+`chatterbox_ui.build_config` sets) gates everything below, so Kokoro and the real OpenAI API are
+never affected regardless of what a config carries (tested directly, independent of
+`build_config`'s own zeroing, as defence in depth).
+
+- **A baseline with adaptive delivery off** sends the resolved baseline triple via the OpenAI SDK's
+  `extra_body` on every request (today's unit building, unchanged) -- so a per-book "voice" works
+  without the mood swings.
+- **Adaptive delivery on** always builds units inside narration/dialogue segments (new
+  `adaptive_units`/`adaptive_paragraph_units`, mirroring `voiced_units`/`voiced_paragraph_units`
+  with an added per-segment mood), even in single voice mode (with the narrator voice for every
+  segment, so a unit can still carry its segment's mood). Cast mode reads the cast's saved
+  per-chapter moods for a dialogue line, with a rule cue detected fresh from the current text still
+  overriding it, mirroring `attribute_chapter`'s own precedence; other modes are rules-only. Each
+  unit's mood preset is sent via `extra_body`, and the preset's gain plus the peak guard are applied
+  to the decoded audio before the configured pauses are joined. The mood is logged in the per-unit
+  INFO line the same way `voice=` already is.
+- **Neither applies**: byte-for-byte today's request (proven with a test that fails if the change
+  is reverted: 6 of 9 new provider tests fail against the pre-change file, from a missing
+  `extra_body` key to a wrong exported peak level).
+
+### 14.5 UI
+
+Make tab: an "Adaptive delivery" checkbox (default on, visible only while the engine is Chatterbox)
+next to a live "Delivery for this book: exaggeration … · CFG … · temperature …, from the Voice lab"
+line that follows the Voice lab sliders. `build_config`/`queue_settings` gained the four settings as
+keyword arguments defaulting to off/`None`, so a job queued before this feature builds unchanged;
+**Add to queue** captures the Voice lab sliders' *current* values as the book's baseline, so editing
+the sliders afterwards never changes a queued or running book. Voice lab: a
+"▶ Play soft / normal / excited" button plays the phrase three times through `/tts` at the three
+presets around the current sliders (gain and peak guard applied, same as a real book), one clip with
+~1 s gaps, reusing the existing preview temp-file handling.
+
+### 14.6 Tests
+
+473 app tests pass (421 before; 52 new, in `tests/audiobook_generator/core/delivery_test.py` (24),
+`tests/audiobook_generator/tts_providers/delivery_provider_test.py` (9), and new cases in
+`cast_llm_test.py` (8), `cast_analysis_test.py` (1) and `chatterbox_ui_test.py` (10)); 49 pass in
+`chatterbox/` (44 before; 5 new, `chatterbox/tests/test_openai_speech_request.py`, pure Pydantic
+validation, no GPU). They cover: the approved-baseline and relative presets (including both floor
+clamps and both ceiling clamps); the peak guard (a loud clip guarded to exactly -1 dBFS, a quiet one
+left alone, silence left alone); every mood cue (each soft/excited verb and adverb phrase, the
+lead-in-must-end-in-,-or-: gate, soft winning over `!` and over an excited cue); continued lines
+inheriting the previous line's mood regardless of their own text; reading Chatterbox's saved
+defaults (full, partial, missing-then-retried); `OpenAISpeechRequest`'s new fields and their ranges;
+LLM moods parsed and invalid ones defaulted to normal, rules overriding the LLM, lines never asked
+getting rules only, and moods saved per chapter; the provider's baseline-via-extra_body with
+adaptive off, mood presets and gain/peak-guard with it on (including the narrator-voice-for-every-
+segment rule in single voice mode and the mood appearing in the log line), Kokoro's total exemption,
+and adaptive-off-with-no-baseline sending exactly today's request kwargs; `build_config`/
+`queue_settings` defaults, an explicit baseline travelling with a queued job, Kokoro zeroing the
+baseline out, and old jobs without the new keys building with delivery off; the Make tab's baseline
+line text, the engine toggle's checkbox/line visibility, the Play-soft/normal/excited button's three
+presets and concatenated clip; and the cast summary's mood counts. Deploy: restart (bind-mounted
+`./src`) plus, for the Chatterbox image, a rebuild (`chatterbox/server.py` changed).
+
 Not verified without a GPU or an LLM: attribution quality of any real model, the `response_format`
 fallback against a real server, the real unload/reload timing, how a two-voice book actually sounds
 (short narration fragments such as "he said." are now their own requests, which Chatterbox may read

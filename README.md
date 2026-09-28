@@ -59,6 +59,16 @@ The repo holds the whole stack:
   `casts/` in the app data folder, and **Add to queue** carries a snapshot of it with the job. Units
   never span a change of voice; the pause between narration and a quote is the sentence pause.
   Validation on a real LLM: `docs/chatterbox-edition/experiments/multivoice/`.
+- **Adaptive delivery** (Chatterbox only, Make tab checkbox, on by default): dialogue tagged
+  whispered/murmured/shouted/screamed and the like (rule-based, or the cast's own read in Cast mode)
+  is spoken softer and quieter, or more excited and a little louder, around this book's baseline
+  sliders (its Voice lab exaggeration/CFG/temperature, shown live under the checkbox) instead of one
+  flat delivery for the whole book. A per-book baseline (the Voice lab sliders at the moment you
+  **Add to queue**) is sent even with adaptive delivery switched off, so a book can have its own
+  "voice" without the mood swings. Every adaptive line gets a peak guard so an excited take can never
+  clip. Voice lab has a **▶ Play soft / normal / excited** button to audition the three deliveries
+  around the current sliders before queuing a book. See `docs/chatterbox-edition/WORKLOG.md` #14 for
+  the presets, the rule cues and a measured LLM-mood accuracy trade-off.
 - **Single M4B** per book with chapter markers, cover art, title/author tags. Chapters are generated in a
   hidden `.chapters` folder and merged only when all succeed, so a library scanner never sees a
   half-finished book; a failed book can be resumed with "Skip chapters already made".
