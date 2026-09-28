@@ -6,9 +6,7 @@ import io
 from pydub import AudioSegment
 from mutagen.id3._frames import TIT2, TPE1, TALB, TRCK, APIC
 from mutagen.id3 import ID3, ID3NoHeaderError
-from typing import List
 from sentencex import segment
-import os
 
 logger = logging.getLogger(__name__)
 

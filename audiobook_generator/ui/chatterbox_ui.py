@@ -33,7 +33,7 @@ from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.tts_providers.openai_tts_provider import PARAGRAPH_MARK
 from audiobook_generator.ui import library_index, web_ui
-from audiobook_generator.ui.job_queue import DONE, FAILED, QUEUED, RUNNING, STOPPED, JobQueue
+from audiobook_generator.ui.job_queue import DONE, FAILED, QUEUED, RUNNING, JobQueue
 from audiobook_generator.ui.web_ui import (
     OUTPUT_ROOT,
     default_openai_voice,

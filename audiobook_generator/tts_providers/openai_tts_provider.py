@@ -3,9 +3,7 @@ import io
 import logging
 import math
 import subprocess
-import tempfile
 import time
-import os
 from typing import Callable, List, Tuple
 
 from pydub import AudioSegment
