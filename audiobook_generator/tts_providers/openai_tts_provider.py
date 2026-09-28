@@ -354,7 +354,9 @@ class OpenAITTSProvider(BaseTTSProvider):
         self.price = get_price(config.model_name)
         super().__init__(config)
 
-        self.client = OpenAI(max_retries=4)  # User should set OPENAI_API_KEY environment variable
+        # base_url=None falls back to OPENAI_BASE_URL exactly as before; a per-config URL (e.g.
+        # Kokoro's) must win over that env var, since both can be set at once.
+        self.client = OpenAI(max_retries=4, base_url=config.openai_base_url)  # OPENAI_API_KEY env var still required
 
     def __str__(self) -> str:
         return super().__str__()

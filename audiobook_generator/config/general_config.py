@@ -33,6 +33,8 @@ class GeneralConfig:
         # OpenAI specific arguments
         self.instructions = getattr(args, 'instructions', None)
         self.speed = getattr(args, 'speed', None)
+        # Per-config OpenAI-compatible endpoint (e.g. Kokoro); None = read OPENAI_BASE_URL as before
+        self.openai_base_url = getattr(args, 'openai_base_url', None)
         # Paced narration: speak sentence-sized units and insert these pauses (ms); None = off
         self.sentence_pause_ms = getattr(args, 'sentence_pause_ms', None)
         self.paragraph_pause_ms = getattr(args, 'paragraph_pause_ms', None)

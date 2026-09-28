@@ -43,6 +43,7 @@ def get_openai_config():
         output_format='mp3',
         model_name='tts-1',
         speed=1.0,
-        paced_unit_mode=None
+        paced_unit_mode=None,
+        openai_base_url=None
     )
     return GeneralConfig(args)

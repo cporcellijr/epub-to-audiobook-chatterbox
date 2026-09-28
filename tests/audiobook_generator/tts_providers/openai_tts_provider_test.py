@@ -62,6 +62,26 @@ class TestOpenAiTtsProvider(unittest.TestCase):
         self.assertEqual(tts_provider.config.output_format, "mp3")
 
 
+class TestOpenAiBaseUrl(unittest.TestCase):
+    """A per-config base URL (e.g. Kokoro's) must win over the ambient OPENAI_BASE_URL, since a
+    container can have both set at once (Chatterbox's env var plus a Kokoro-selected book)."""
+
+    @patch.dict('os.environ', {'OPENAI_API_KEY': 'fake_key', 'OPENAI_BASE_URL': 'http://chatterbox:8004/v1'})
+    @patch('audiobook_generator.tts_providers.openai_tts_provider.OpenAI')
+    def test_per_config_base_url_overrides_the_ambient_env_var(self, mock_openai):
+        config = get_openai_config()
+        config.openai_base_url = 'http://kokoro:8880/v1'
+        get_tts_provider(config)
+        self.assertEqual(mock_openai.call_args.kwargs['base_url'], 'http://kokoro:8880/v1')
+
+    @patch.dict('os.environ', {'OPENAI_API_KEY': 'fake_key'})
+    @patch('audiobook_generator.tts_providers.openai_tts_provider.OpenAI')
+    def test_no_config_base_url_passes_none_through_unchanged(self, mock_openai):
+        config = get_openai_config()
+        get_tts_provider(config)
+        self.assertIsNone(mock_openai.call_args.kwargs['base_url'])
+
+
 class TestCreateSpeechRetry(unittest.TestCase):
     """F-02: a unit request must survive Chatterbox being temporarily unavailable (still
     loading its model after a restart) instead of failing the chapter after the SDK's own
