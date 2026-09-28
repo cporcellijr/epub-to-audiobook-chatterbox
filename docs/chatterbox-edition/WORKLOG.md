@@ -829,3 +829,38 @@ real change the owner should hear. Characters were re-fitted around it; all 6 pr
 
 Not tested in a browser: the collapsed section and the automatic Voice and slider updates. The live
 page carries the new controls, and the same handlers ran over the live cast.
+
+## 18. First-person books: the narrator reads the "I" character's lines (2026-09-28)
+
+The usual audiobook convention is one performer for a first-person narrator, so their dialogue
+should be in the narrator's voice rather than a voice of its own. About 28% of a 150-book sample of
+the owner's library reads as first person: narration outside quotes using "I" more than 1.5 times as
+often as "he" and "she".
+
+`cast.narrating_character` is the book tone's viewpoint character (§17.2), unless the owner gave
+that character a voice of their own in the advanced editor. That character:
+- speaks their lines in whatever narrator voice the book is queued with (the provider's voice rule);
+- gets no suggested voice, and one they held from an earlier suggestion is freed for others;
+- has no delivery offset and doesn't count in the cast's delivery average (§17.3).
+
+The narrator pick uses their gender and their own profile's voice targets before the tone's.
+The cast table shows "(narrator's voice)". The editor offers "(the narrator's voice)" as the first
+choice, and saving it switches back from an own voice. Sample plays the Make tab's narrator.
+
+Live check on the owner's machine: a full analysis of the first three story chapters of a
+first-person novel from the library, into a scratch cast.
+- The tone came back as first person, "introspective melancholic", measured pace, moderate
+  intensity, asking for a female narrator (medium, clear, even).
+- The page set the narrator to Jade and kept the saved sliders (nothing to nudge). The narrating
+  character (45 of 103 lines) showed "(narrator's voice)", and all 9 profiles were usable.
+- The book never names its narrator, so attribution called them "I". The first summary said "I
+  tells the story"; an unnamed narrator is now described as such.
+- The same run showed two older rough edges, now fixed. The attribution model had listed "Unknown"
+  as a character (0 lines, yet given a voice), and `parse_reply` now drops such names. Relationships
+  like "Bea: unknown" are dropped as filler.
+
+Tests: 573 pass (566 before; 7 new). They cover the narrating character and the owner override,
+no suggestion and a freed voice, the narrator following their profile, no delivery offset, the
+provider's voice rule, the table/editor/Sample flow, the unnamed narrator, and "Unknown" as a
+character. Not measured by ear: whether one voice for narration and the narrator's dialogue sounds
+right across a whole first-person book.

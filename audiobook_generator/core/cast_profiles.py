@@ -285,7 +285,8 @@ def parse_profile(reply: str) -> dict:
         raise ProfileError("no description in the reply")
     profile["relationships"] = "; ".join(
         part.strip() for part in profile["relationships"].split(";")
-        if part.strip() and not re.search(r"\bnot (mentioned|described|shown)\b|\bno (interaction|relationship)", part, re.I))
+        if part.strip() and not re.search(r"\bnot (mentioned|described|shown)\b|\bno (interaction|relationship)"
+                                          r"|(^|:)\s*unknown\W*$", part.strip(), re.I))
     return profile
 
 

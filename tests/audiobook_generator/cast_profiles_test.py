@@ -137,6 +137,8 @@ class TestParseProfile(unittest.TestCase):
     def test_filler_about_characters_the_excerpts_never_connect_is_dropped(self):
         profile = parse_profile(_profile(relationships="Bea: rough with her; Cal, Dee: not mentioned in the excerpts"))
         self.assertEqual(profile["relationships"], "Bea: rough with her")
+        profile = parse_profile(_profile(relationships="Dee: receptionist; Bea: unknown; Dr. Lowe: Unknown."))
+        self.assertEqual(profile["relationships"], "Dee: receptionist")
 
     def test_an_accent_needs_the_excerpts_to_name_it(self):
         note = "calm and introspective, with a slight southern drawl"

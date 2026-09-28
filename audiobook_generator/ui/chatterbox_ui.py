@@ -1141,11 +1141,17 @@ def _cast_summary(cast: dict) -> str:
     return text + "\n\n" + book_tone_text(cast) if cast.get("book_tone") else text
 
 
+def _unnamed_narrator(name: str) -> bool:
+    """A first-person narrator the book never names: attribution calls them "I" (seen live)."""
+    return cast_store.normalize_name(name) in ("i", "me", "myself", "narrator", "the narrator")
+
+
 def book_tone_text(cast: dict) -> str:
     """The book's narration and the narrator picked for it, in one line."""
     tone = cast.get("book_tone") or {}
+    named = tone.get("pov_character") and not _unnamed_narrator(tone["pov_character"])
     facts = [w for w in (f"{tone['point_of_view']} person" if tone.get("point_of_view") else "",
-                         f"narrated by {tone['pov_character']}" if tone.get("pov_character") else "",
+                         f"narrated by {tone['pov_character']}" if named else "",
                          tone.get("tone") or "", f"{tone['pace']} pace" if tone.get("pace") else "",
                          f"{tone['intensity']} narration" if tone.get("intensity") else "") if w]
     text = "**Book:** " + " · ".join(facts)
@@ -1156,8 +1162,10 @@ def book_tone_text(cast: dict) -> str:
                  f"{suggestion['temperature']:.2f}, picked from the book's tone")
     narrating = cast_store.narrating_character(cast)
     if narrating:
-        text += (f"  \n{cast['characters'][narrating].get('name', narrating)} tells the story, so their lines "
-                 "are read in the narrator's voice.")
+        name = cast["characters"][narrating].get("name", narrating)
+        text += ("  \nThe unnamed first-person narrator (\"I\") speaks their own lines in the narrator's voice."
+                 if _unnamed_narrator(name) else
+                 f"  \n{name} tells the story, so their lines are read in the narrator's voice.")
     return text
 
 

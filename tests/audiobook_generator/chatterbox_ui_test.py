@@ -1602,16 +1602,16 @@ class TestCastPanel(unittest.TestCase):
 
     def test_a_first_person_narrator_shares_the_narrators_voice_unless_given_their_own(self):
         cast = self._save("k", self.cast_store.STATUS_DONE, {
-            "me": {"name": "Me", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav",
+            "me": {"name": "Nora", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav",
                    "profile": {"description": "Tells the story.", "first_line": {"chapter": 1, "text": '"Hi."'}}},
             "bob": {"name": "Bob", "aliases": [], "gender": "male", "age": "adult", "lines": 3, "voice": None},
         })
-        cast["book_tone"] = {"point_of_view": "first", "pov_character": "Me", "pov_key": "me", "tone": "wry"}
+        cast["book_tone"] = {"point_of_view": "first", "pov_character": "Nora", "pov_key": "me", "tone": "wry"}
         self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
         table, keys, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
         self.assertEqual(table["value"][keys.index("me")][5], "(narrator's voice)")
         self.assertIsNone(self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))["characters"]["me"]["voice"])
-        self.assertIn("Me tells the story, so their lines are read in the narrator's voice.", status)
+        self.assertIn("Nora tells the story, so their lines are read in the narrator's voice.", status)
         _, _, _, voice, profile, _ = chatterbox_ui.select_cast_row("k", keys, "chatterbox", MagicMock(index=[0, 0]))
         self.assertEqual(voice["value"], chatterbox_ui.NARRATOR_VOICE)
         self.assertEqual(voice["choices"][0], chatterbox_ui.NARRATOR_VOICE_CHOICE)
@@ -1628,6 +1628,12 @@ class TestCastPanel(unittest.TestCase):
         self.assertIn("narrator's voice", message)
         with self.assertRaises(gr.Error):  # only the narrating character can follow the narrator
             chatterbox_ui.apply_cast_edit("k", "bob", "male", chatterbox_ui.NARRATOR_VOICE, "chatterbox")
+        # Seen live: a narrator the book never names is attributed as "I".
+        unnamed = {"characters": {"i": {"name": "I", "lines": 45}},
+                   "book_tone": {"point_of_view": "first", "pov_character": "I", "pov_key": "i", "tone": "wry"}}
+        text = chatterbox_ui.book_tone_text(unnamed)
+        self.assertNotIn("narrated by I", text)
+        self.assertIn('The unnamed first-person narrator ("I") speaks their own lines', text)
 
     def test_analysis_can_keep_every_earlier_voice_or_only_the_owners_picks(self):
         book = os.path.join(self.tmp.name, "mine.epub")

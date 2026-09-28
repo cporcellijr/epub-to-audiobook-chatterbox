@@ -264,6 +264,8 @@ def parse_reply(reply: str, expected_ids: List[int],
     for item in data.get("characters") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not normalize_name(item["name"]):
             continue
+        if _speaker_or_none(item["name"]) is None:  # "Unknown" listed as a character (seen live) is no one
+            continue
         aliases = [display_name(a) for a in item.get("aliases") or [] if isinstance(a, str) and normalize_name(a)]
         characters.append({
             "name": display_name(item["name"]),

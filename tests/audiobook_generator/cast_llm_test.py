@@ -110,6 +110,12 @@ class TestParseReply(unittest.TestCase):
             {"name": "Tom", "gender": "boy", "age": "teen"}, {"gender": "male"}, {"name": "  "}])), [1])
         self.assertEqual(characters, [{"name": "Tom", "gender": "unknown", "age": "unknown", "aliases": []}])
 
+    def test_unknown_listed_as_a_character_is_dropped(self):
+        # Seen live: the model listed "Unknown" among the characters, and it got a voice.
+        _, characters, _ = parse_reply(json.dumps(_reply({1: "Tom"}, [
+            {"name": "Unknown", "gender": "unknown", "age": "unknown"}, {"name": "Tom", "gender": "male"}])), [1])
+        self.assertEqual([c["name"] for c in characters], ["Tom"])
+
     def test_moods_are_parsed_and_invalid_or_missing_ones_become_normal(self):
         reply = json.dumps({"speakers": {"1": "Tom", "2": "Ada", "3": "Bea"},
                             "moods": {"1": "soft", "2": "not-a-mood", "9": "excited"}})
