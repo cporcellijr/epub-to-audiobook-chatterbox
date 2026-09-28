@@ -309,6 +309,7 @@ class TestAttributeChapterMoods(unittest.TestCase):
             attribute_chapter(chapter_segments(CHAPTER), Roster(), chat, {}, self.log)
         self.assertIn('"moods"', chat.prompts[0][1]["content"])
 
+    @patch.object(cast_llm_module, "ASK_LLM_FOR_MOODS", True)
     def test_llm_moods_flow_through_when_rules_are_silent(self):
         chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "Tom", 3: "Ada", 4: "Tom", 5: "Mrs. Marsh", 6: "Tom"},
                                    moods={1: "excited", 3: "soft", 4: "not-a-mood"}))
@@ -317,6 +318,7 @@ class TestAttributeChapterMoods(unittest.TestCase):
         # invalid value defaults to normal); lines 2 and 6 are tagged ("said Tom") and never asked.
         self.assertEqual(moods, {1: "excited", 2: "normal", 3: "soft", 4: "normal", 5: "normal", 6: "normal"})
 
+    @patch.object(cast_llm_module, "ASK_LLM_FOR_MOODS", True)
     def test_a_rule_cue_overrides_the_llms_mood(self):
         text = f'"Go now," she whispered.{M}"Fine."'
         chat = ScriptedChat(_reply({1: "Ada", 2: "Ada"}, moods={1: "excited", 2: "excited"}))
@@ -337,3 +339,15 @@ class TestAttributeChapterMoods(unittest.TestCase):
         chat = ScriptedChat(_reply({1: "Ada"}, moods={1: "excited"}))  # the rule cue overrides this for line 1
         _, moods = attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
         self.assertEqual(moods, {1: "soft", 2: "soft"})
+
+
+class TestMoodsStayRulesOnly(unittest.TestCase):
+
+    def test_moods_a_reply_volunteers_are_ignored_while_llm_moods_are_off(self):
+        import audiobook_generator.core.cast_llm as cast_llm_module
+        self.assertFalse(cast_llm_module.ASK_LLM_FOR_MOODS)
+        reply = {"speakers": {"1": "Ada"}, "moods": {"1": "excited"}, "characters": []}
+        _, moods = attribute_chapter(chapter_segments('"Then who did?"'), Roster(), ScriptedChat(reply), {},
+                                     logging.getLogger("test-cast"))
+        self.assertEqual(moods, {1: "normal"})
+

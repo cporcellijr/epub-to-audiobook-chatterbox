@@ -89,8 +89,9 @@ def llm_api_key() -> str:
 
 
 def llm_configured() -> bool:
-    """Cast mode is offered only when a chat endpoint is configured."""
-    return bool(llm_base_url())
+    """Cast mode is offered only when a chat endpoint and a model are both configured (the
+    analysis needs both)."""
+    return bool(llm_base_url() and llm_model())
 
 
 # ---- the chat endpoint ----
@@ -500,7 +501,8 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
             name = speakers.get(line_id)
             key = roster.add(name) if name else None
             result[line_id] = key
-        llm_moods.update(window_moods)
+        if ASK_LLM_FOR_MOODS:  # rules-only means rules only, even if a reply volunteers moods
+            llm_moods.update(window_moods)
         # Tag names resolve after the model's character list, so "Mother" can land on the
         # character the model gave that alias instead of becoming a character of its own.
         for line_id in window.anchored:

@@ -134,13 +134,14 @@ class TestAdaptiveDeliveryOn(unittest.TestCase):
     def test_soft_gain_reduces_volume_without_the_guard_engaging(self):
         provider = _provider(output_format="wav", **self._baseline_kwargs())
         responses = _ScriptedResponses(peak_amplitude=23197)  # about -3 dBFS raw
-        # A paragraph that is nothing but the quotation (the cue word "quietly" lives inside the
-        # quote itself), so there is no separate narration unit at 0 dB gain to dominate the peak.
+        # Every scripted unit is 300 ms, and the whispered quotation is the first unit: measure it
+        # alone, since the narration unit after it ("she whispered.") stays at 0 dB.
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "out.wav")
-            _speak(provider, '"I will do this quietly."', responses, path)
+            _speak(provider, '"I will do this," she whispered.', responses, path)
             exported = AudioSegment.from_file(path)
-        self.assertAlmostEqual(exported.max_dBFS, -9.0, delta=0.3)  # -3 dBFS raw, -6 dB gain
+        self.assertAlmostEqual(exported[:300].max_dBFS, -9.0, delta=0.3)  # -3 dBFS raw, -6 dB gain
+        self.assertAlmostEqual(exported.max_dBFS, -3.0, delta=0.3)  # the narration unit, untouched
 
     def test_mood_is_logged_like_voice_is_today(self):
         provider = _provider(**self._baseline_kwargs())

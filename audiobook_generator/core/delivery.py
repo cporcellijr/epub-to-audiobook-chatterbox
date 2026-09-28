@@ -94,12 +94,12 @@ def _ends_with_exclaim(quote_text: str) -> bool:
 
 
 def mood_of(before: str, quote_text: str, after: str) -> str:
-    """Rule-based mood for one dialogue line, from the narration right before it (only when that
-    narration is a lead-in speech tag, i.e. it ends in ',' or ':'), the narration right after it,
-    and the quotation's own text. A soft cue always wins, including over a quotation whose last
-    sentence ends in '!' (which is otherwise excited)."""
+    """Rule-based mood for one dialogue line. Verb and adverb cues come only from the speech tag
+    around it: the narration right before it (when that is a lead-in, i.e. ends in ',' or ':') and
+    the narration right after it, never the spoken words ("I whispered it to him" is not a whisper).
+    From the quotation itself only a closing '!' counts, as excited. A soft cue always wins."""
     lead_in = before if before.rstrip().endswith((",", ":")) else ""
-    texts = (lead_in, after, quote_text)
+    texts = (lead_in, after)
     if any(_has_soft_cue(t) for t in texts):
         return MOOD_SOFT
     if any(_has_excited_cue(t) for t in texts) or _ends_with_exclaim(quote_text):

@@ -713,6 +713,21 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
                            f"{engine} voices in the cast table, or switch the Engine.")
         if voice in (c.get("voice") for c in cast["characters"].values()):
             gr.Warning("The narrator's voice is also given to a character; they will sound the same.")
+        gaps = cast_coverage_gaps(library_book or upload, cast, selection, title_mode, newline_mode,
+                                  remove_endnotes, remove_reference_numbers,
+                                  search_and_replace_file.name if hasattr(search_and_replace_file, "name")
+                                  else search_and_replace_file)
+        if gaps:
+            raise gr.Error(f"The cast has no analysis for chapter{'s' if len(gaps) > 1 else ''} "
+                           f"{', '.join(map(str, gaps))} as the book reads now (a chapter was ticked after the "
+                           "analysis, or a text option changed). Press Analyse cast again.")
+    chosen = [voice] + ([dialogue_voice] if voice_mode != VOICE_MODE_SINGLE else [])
+    if voice_mode == VOICE_MODE_CAST:
+        chosen += [c.get("voice") for c in cast["characters"].values()]
+    gone = missing_voices(chosen, engine)
+    if gone:
+        raise gr.Error(f"{', '.join(gone)} {'is' if len(gone) == 1 else 'are'} not among the {engine} voices any "
+                       "more (deleted or renamed?). Pick another voice.")
     output_dir = (output_dir or "").strip()
     if not output_dir:
         raise gr.Error("Set an output folder.")
@@ -807,6 +822,42 @@ def engine_voices_with_gender(engine: str) -> List[Tuple[str, str]]:
         return [(voice, cast_store.kokoro_voice_gender(voice)) for _, voice in choices]
     genders = cast_store.load_voice_genders()
     return [(voice, cast_store.voice_gender("chatterbox", voice, genders)) for _, voice in openai_voice_choices()]
+
+
+def engine_voice_ids(engine: str) -> Optional[List[str]]:
+    """Every voice the engine can speak with right now, or None when that can't be known (no
+    Chatterbox voices folder mounted, Kokoro unreachable), in which case callers skip the check."""
+    if engine == "kokoro":
+        choices, _ = kokoro_voices_and_default()
+        real = [value for label, value in choices if label != value]  # the unreachable fallback has label == id
+        return real or None
+    voices_dir = os.environ.get("TTS_VOICES_DIR")
+    if not voices_dir or not os.path.isdir(voices_dir):
+        return None
+    return [name for name in os.listdir(voices_dir)
+            if name.lower().endswith(web_ui.VOICE_FILE_EXTENSIONS) and os.path.isfile(os.path.join(voices_dir, name))]
+
+
+def missing_voices(voices: List[Optional[str]], engine: str) -> List[str]:
+    """The given voices the engine no longer has (deleted or renamed since they were chosen)."""
+    known = engine_voice_ids(engine)
+    if known is None:
+        return []
+    return sorted({v for v in voices if v and v not in known})
+
+
+def cast_coverage_gaps(book: str, cast: dict, selection: List[int], title_mode: str, newline_mode: str,
+                       remove_endnotes: bool, remove_reference_numbers: bool, search_and_replace_file) -> List[int]:
+    """Ticked chapters the cast has no attributions for, as the book reads with these settings.
+
+    Attributions are keyed by each chapter's text, so ticking a chapter that wasn't analysed, or
+    changing an option that changes the text (paragraph detection, endnote removal, search &
+    replace), leaves a chapter uncovered; at generation every quote in it would get the dialogue
+    voice."""
+    chapters = book_chapters(book, title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
+                             search_and_replace_file)
+    analysed = cast.get("chapters", {})
+    return [n for n in selection if 0 < n <= len(chapters) and cast_store.text_hash(chapters[n - 1][1]) not in analysed]
 
 
 def engine_voice_choices(engine: str) -> list:
@@ -915,6 +966,8 @@ def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gende
         raise gr.Error("Pick a voice for the character.")
     if cast_store.voices_belong_to_engine({"characters": {"x": {"voice": voice}}}, engine):
         raise gr.Error(f"'{voice}' is not a {engine} voice.")
+    if missing_voices([voice], engine):
+        raise gr.Error(f"'{voice}' isn't one of the {engine} voices (was it deleted or renamed?).")
     character = cast["characters"][character_key]
     character["gender"] = gender if gender in cast_store.GENDERS else "unknown"
     character["voice"] = voice

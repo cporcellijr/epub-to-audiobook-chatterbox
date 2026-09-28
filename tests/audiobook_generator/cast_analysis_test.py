@@ -102,6 +102,7 @@ class TestAnalyseBook(unittest.TestCase):
         cast = analyse_book(self.settings, chat=ScriptedChat({"speakers": {"1": "Mother", "2": "Tom"}}))
         self.assertEqual([ch["number"] for ch in cast["chapters"].values()], [2])
 
+    @patch("audiobook_generator.core.cast_llm.ASK_LLM_FOR_MOODS", True)
     def test_moods_are_saved_per_chapter(self):
         chat = ScriptedChat(
             {"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}, "moods": {"1": "excited"}},

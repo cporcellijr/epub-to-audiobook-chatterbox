@@ -110,6 +110,16 @@ class TestMoodOf(unittest.TestCase):
         self.assertEqual(mood_of("", '"Go now."', "She SHOUTED."), MOOD_EXCITED)
 
 
+class TestCuesComeFromTheTag(unittest.TestCase):
+
+    def test_manner_words_inside_the_spoken_line_are_not_a_cue(self):
+        self.assertEqual(mood_of("", '"I whispered it to him yesterday."', "she said."), MOOD_NORMAL)
+        self.assertEqual(mood_of("", '"He shouted at me."', "she said."), MOOD_NORMAL)
+
+    def test_a_closing_exclamation_in_the_line_still_counts(self):
+        self.assertEqual(mood_of("", '"He shouted at me!"', "she said."), MOOD_EXCITED)
+
+
 class TestSegmentMoods(unittest.TestCase):
 
     def test_ordinary_lines_use_mood_of(self):

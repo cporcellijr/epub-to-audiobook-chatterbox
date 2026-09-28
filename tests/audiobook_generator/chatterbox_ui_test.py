@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import MagicMock, patch
 
 import gradio as gr
@@ -1150,7 +1151,11 @@ class TestVoiceModes(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.patches = [patch.object(chatterbox_ui, "QUEUE_UPLOADS", os.path.join(self.tmp.name, "uploads")),
                         patch.object(chatterbox_ui, "CASTS_DIR", os.path.join(self.tmp.name, "casts")),
-                        patch.dict(os.environ, {"EBOOK_LIBRARY_DIR": "/library"})]
+                        patch.dict(os.environ, {"EBOOK_LIBRARY_DIR": "/library"}),
+                        # The book here is a stand-in path and the voices invented; TestQueueTimeCastChecks
+                        # covers the coverage and voice-existence checks with a real EPUB and voice folder.
+                        patch.object(chatterbox_ui, "cast_coverage_gaps", return_value=[]),
+                        patch.object(chatterbox_ui, "engine_voice_ids", return_value=None)]
         for p in self.patches:
             p.start()
 
@@ -1270,7 +1275,9 @@ class TestVoiceModes(unittest.TestCase):
     def test_cast_mode_choice_needs_the_llm_configured(self):
         with patch.dict(os.environ, {"LLM_BASE_URL": ""}):
             self.assertEqual([v for _, v in chatterbox_ui.voice_mode_choices()], ["single", "dialogue"])
-        with patch.dict(os.environ, {"LLM_BASE_URL": "http://llm:11434/v1"}):
+        with patch.dict(os.environ, {"LLM_BASE_URL": "http://llm:11434/v1", "LLM_MODEL": ""}):
+            self.assertEqual([v for _, v in chatterbox_ui.voice_mode_choices()], ["single", "dialogue"])
+        with patch.dict(os.environ, {"LLM_BASE_URL": "http://llm:11434/v1", "LLM_MODEL": "m"}):
             self.assertEqual([v for _, v in chatterbox_ui.voice_mode_choices()], ["single", "dialogue", "cast"])
 
     def test_voice_mode_changed_shows_the_right_controls(self):
@@ -1379,6 +1386,8 @@ class TestCastPanel(unittest.TestCase):
             chatterbox_ui.apply_cast_edit("k", "anne", "female", "af_heart", "chatterbox")
         with self.assertRaises(gr.Error):
             chatterbox_ui.apply_cast_edit("k", None, "female", "Bea.wav", "chatterbox")
+        with self.assertRaises(gr.Error):  # the right shape, but no such voice file
+            chatterbox_ui.apply_cast_edit("k", "anne", "female", "Missing.wav", "chatterbox")
 
     def test_analysis_settings_copy_the_book_and_name_the_cast_file(self):
         book = os.path.join(self.tmp.name, "mine.epub")
@@ -1426,3 +1435,93 @@ class TestCastPanel(unittest.TestCase):
         self.assertEqual(chatterbox_ui._voice_column(book), "Elena")
         with patch.object(chatterbox_ui.JobQueue, "chapters_done", return_value=1):
             self.assertIn("analysing cast · 1 of 3", chatterbox_ui._status_label(cast_job))
+
+
+class TestQueueTimeCastChecks(unittest.TestCase):
+    """A cast must cover the ticked chapters as the book reads now, and every chosen voice must exist."""
+
+    CHAPTERS = [("One", '"Hello," said Ada. "Who is there?"'), ("Two", '"It is me," said Tom.'),
+                ("Three", '"Go away," said Ada.')]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.voices = os.path.join(self.tmp.name, "voices")
+        os.makedirs(self.voices)
+        for name in ("Elena.wav", "Tom.wav", "Ada.wav"):
+            open(os.path.join(self.voices, name), "w").close()
+        self.book = os.path.join(self.tmp.name, "library", "book.epub")
+        os.makedirs(os.path.dirname(self.book))
+        with zipfile.ZipFile(self.book, "w") as z:
+            z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+            z.writestr("META-INF/container.xml",
+                       '<?xml version="1.0"?><container version="1.0" '
+                       'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+                       '<rootfile full-path="c.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
+            items = "".join(f'<item id="c{i}" href="c{i}.xhtml" media-type="application/xhtml+xml"/>'
+                            for i in range(1, 4))
+            refs = "".join(f'<itemref idref="c{i}"/>' for i in range(1, 4))
+            z.writestr("c.opf", '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+                                '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title>'
+                                f'</metadata><manifest>{items}</manifest><spine>{refs}</spine></package>')
+            for i, (title, body) in enumerate(self.CHAPTERS, 1):
+                z.writestr(f"c{i}.xhtml", '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body>'
+                                          f"<h1>{title}</h1><p>{body}</p></body></html>")
+        self.patches = [patch.object(chatterbox_ui, "QUEUE_UPLOADS", os.path.join(self.tmp.name, "uploads")),
+                        patch.object(chatterbox_ui, "CASTS_DIR", os.path.join(self.tmp.name, "casts")),
+                        patch.dict(os.environ, {"EBOOK_LIBRARY_DIR": os.path.dirname(self.book),
+                                                "TTS_VOICES_DIR": self.voices})]
+        for p in self.patches:
+            p.start()
+        from audiobook_generator.core import cast as cast_store
+        self.cast_store = cast_store
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def _cast(self, analysed_chapters, voice="Ada.wav"):
+        """A finished cast holding attributions for the given chapter numbers (as the book reads now)."""
+        chapters = chatterbox_ui.book_chapters(self.book, "auto", "double", False, False, None)
+        cast = self.cast_store.new_cast("k", self.book, "T", "A", "chatterbox", "Elena.wav", analysed_chapters)
+        for n in analysed_chapters:
+            cast["chapters"][self.cast_store.text_hash(chapters[n - 1][1])] = {"number": n, "title": "", "lines": {}}
+        cast["characters"] = {"ada": {"name": "Ada", "aliases": [], "gender": "female", "age": "adult",
+                                      "lines": 2, "voice": voice}}
+        cast["status"] = self.cast_store.STATUS_DONE
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+
+    def _queue(self, ticked, voice="Elena.wav", dialogue_voice="Tom.wav", newline_mode="double"):
+        table = [[n, n in ticked, f"Chapter {n}", "", ""] for n in range(1, 4)]
+        return chatterbox_ui.queue_settings(self.book, None, table, os.path.join(chatterbox_ui.OUTPUT_ROOT, "out"),
+                                            voice, 1.0, 0.35, 0.9, True, False, False, "auto", newline_mode, False,
+                                            False, None, "INFO", "sentence", "chatterbox", "cast", dialogue_voice, "k")
+
+    def test_a_cast_covering_the_ticked_chapters_is_accepted(self):
+        self._cast([1, 2, 3])
+        self.assertEqual(self._queue([1, 3])["voice_mode"], "cast")
+
+    def test_a_ticked_chapter_the_cast_never_analysed_is_refused_by_number(self):
+        self._cast([1, 2])
+        with self.assertRaises(gr.Error) as ctx:
+            self._queue([1, 3])
+        self.assertIn("chapter 3", str(ctx.exception))
+
+    def test_a_voice_the_cast_uses_that_no_longer_exists_is_refused(self):
+        self._cast([1, 2, 3], voice="Deleted.wav")
+        with self.assertRaises(gr.Error) as ctx:
+            self._queue([1])
+        self.assertIn("Deleted.wav", str(ctx.exception))
+
+    def test_a_narrator_or_dialogue_voice_that_no_longer_exists_is_refused(self):
+        self._cast([1, 2, 3])
+        with self.assertRaises(gr.Error):
+            self._queue([1], voice="Gone.wav")
+        with self.assertRaises(gr.Error):
+            self._queue([1], dialogue_voice="Gone.wav")
+
+    def test_no_voices_folder_means_the_voice_check_is_skipped(self):
+        self._cast([1, 2, 3], voice="Anything.wav")
+        with patch.dict(os.environ, {"TTS_VOICES_DIR": ""}):
+            self.assertEqual(self._queue([1])["voice_mode"], "cast")
+
