@@ -311,7 +311,7 @@ compile during model load (about 17 s more start-up); run synthesis on one dedic
 server now synthesizes on a threadpool (F-10) and torch.compile's CUDA graphs are recorded per thread
 (check); listen to A/B samples of the same text before switching it on.
 
-**Built (2026-09-28), on branch `feature/f45-compiled-t3`, awaiting GPU validation.** The
+**Built and validated (2026-09-28); on in the owner's deployment (`TTS_COMPILE=on`).** The
 production version lives in `chatterbox/fast_t3.py` and is installed by `engine.py` behind
 `TTS_COMPILE=on|off` (default off; compose passes `${TTS_COMPILE:-off}`), for the Original model with
 `TTS_BF16` on and CUDA. It replaces `T3.inference` on the loaded model with the same sampling loop
@@ -321,3 +321,13 @@ and teardown on one dedicated worker thread (CUDA graphs are per thread), and is
 and reinstalled on reload. `docs/chatterbox-edition/experiments/f45/validate_build.py` checks speed
 (>= 2.0x), the teacher-forced match, recompiles, threads, memory over 240 requests, the fallback and
 start-up time, and writes A/B WAVs; the setting stays off until it passes on the real machine.
+
+GPU validation of the built version (`validate_build.py`, all 8 checks pass): start-up with warm-up
+20.7 s; 2.37x faster whole requests (1.72x to 4.08x real time); teacher-forced agreement 96.5-100%,
+always in stock's top 5, mean KL 0.0014-0.0018; no recompiles over 50 requests of varied length;
+requests from 8 threads replay the same graphs with flat latency (0.92-0.96 s); zero growth in CUDA
+tensors or allocated memory over 240 requests; a forced failure falls back to the stock loop with one
+warning; peak VRAM 3.2 GB. Two bugs in the first version of the script itself (thread idents reused
+by threads started one after another; a dead weakref proxy crashing the tensor count) were fixed
+before this run. The owner's blind A/B listen preferred the compiled takes on 2 of 3.
+
