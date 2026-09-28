@@ -3,6 +3,7 @@ import hashlib
 import io
 import logging
 import math
+import secrets
 import subprocess
 import time
 from typing import Callable, List, Optional, Tuple
@@ -42,6 +43,9 @@ MAX_UNIT_CHARS = 400  # a trailing short sentence joins the previous unit only i
 # packing threshold, so one request never risks that cap either way.
 MAX_REQUEST_CHARS = 450
 _PYDUB_EXPORT = {"aac": ("adts", "aac"), "opus": ("opus", "libopus")}
+_BAD_CLIP_SILENCE_MS = 3000
+_BAD_CLIP_SILENCE_DBFS = -50
+_BAD_CLIP_RETRIES = 2
 
 # F-02: after a restart the app can start before Chatterbox has finished loading its model
 # (observed ~12 s); the OpenAI SDK's own retries give up after ~7 s. RETRYABLE_STATUS_CODES are
@@ -66,6 +70,18 @@ def _is_speakable(unit: str) -> bool:
     """False for a unit with no letters or digits (F-18): scene breaks ("* * *", "...", "--")
     and other punctuation-only paragraphs should become silence, not a spoken request."""
     return any(char.isalnum() for char in unit)
+
+
+def _long_silence_ms(audio: AudioSegment) -> int:
+    """Longest near-silent run in one TTS response, before our own pauses are inserted."""
+    if len(audio) < _BAD_CLIP_SILENCE_MS:
+        return 0
+    longest = run = 0
+    for start in range(0, len(audio), 100):
+        frame = audio[start:start + 100]
+        run = run + len(frame) if frame.dBFS <= _BAD_CLIP_SILENCE_DBFS else 0
+        longest = max(longest, run)
+    return longest
 
 
 def _split_oversized_unit(unit: str) -> List[str]:
@@ -749,8 +765,22 @@ class OpenAITTSProvider(BaseTTSProvider):
             extra_body = self._delivery_extra_body(mood)
             if extra_body is not None:
                 request_kwargs["extra_body"] = extra_body
-            response = self._create_speech(**request_kwargs)
-            audio = AudioSegment.from_file(io.BytesIO(response.content), format="wav")
+            for attempt in range(_BAD_CLIP_RETRIES + 1):
+                if attempt:
+                    # The server's audiobook preset fixes the seed, so repeating an
+                    # unchanged request reproduces the same silent clip every time.
+                    request_kwargs["extra_body"] = {
+                        **request_kwargs.get("extra_body", {}), "seed": secrets.randbelow(2**31 - 1) + 1,
+                    }
+                response = self._create_speech(**request_kwargs)
+                audio = AudioSegment.from_file(io.BytesIO(response.content), format="wav")
+                silent_ms = _long_silence_ms(audio) if self._is_chatterbox_engine() else 0
+                if silent_ms < _BAD_CLIP_SILENCE_MS:
+                    break
+                logger.warning("Chatterbox returned %.1fs of near-silence for %s (attempt %d/%d)",
+                               silent_ms / 1000, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
+            else:
+                raise RuntimeError(f"Chatterbox returned repeated near-silent audio for {chunk_id}")
             if sentence_count > 1 and sentence_gap_ms > 0:
                 audio = _stretch_sentence_gaps(audio, sentence_count - 1, sentence_gap_ms)
             if adaptive:
