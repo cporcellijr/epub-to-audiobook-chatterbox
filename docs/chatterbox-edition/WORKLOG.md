@@ -751,3 +751,81 @@ rule, distinctness, the age fallback, clearing unpicked voices and carrying only
 real re-analysis. `chatterbox_ui_test.py` (9) covers measuring on add, Measure voices (including an
 unreachable server and one bad voice), the Voice lab text, forgetting on delete, matched suggestions,
 Suggest voices again, the Voice match line and the auto-pick setting.
+
+## 17. Excited lines no longer clip; delivery per character and a narrator from the book's tone (2026-09-28)
+
+### 17.1 Bug: a single excited word came out distorted
+
+Reported by the owner. Chatterbox returns clips already peaking near -0.4 dBFS (every clip in a
+36-clip probe did, whatever the preset). Adaptive delivery applied the excited preset's +1.5 dB
+first, which pushed peaks past full scale, where pydub's `apply_gain` clips the waveform flat. The
+peak guard ran after that, and turning a clip down can't undo clipping. A sentence only clips its
+brief peaks; a one-word shout is loud from end to end, so it audibly distorted. The unit test missed
+it because it used a square wave, which clipping leaves unchanged.
+
+Fix: `delivery.guarded_gain` applies a mood's gain only as far as the headroom allows, so the peak
+never passes -1 dBFS. The provider and the Voice lab's soft/normal/excited preview both use it.
+Measured on the same 18 excited Chatterbox clips: 10 had 9-85 samples flattened at the top the old
+way, none the new way; clips with headroom still get their +1.5 dB. The new test uses a sine wave and
+checks the output is the input scaled. Since nearly every clip already peaks near full scale,
+excited lines are now rarely louder than normal ones; the higher exaggeration carries the excitement.
+
+### 17.2 The book's tone and the narrator
+
+After the profiles, the cast job asks the LLM once about the book's narration
+(`cast_profiles.describe_book`), from up to 6,000 characters of dialogue-free paragraphs. It returns:
+- point of view, and the narrating character in a first-person book (matched to a cast key);
+- tone in a few words, pace (slow, measured, brisk) and intensity (restrained, moderate, dramatic);
+- the narrator voice that suits the book: gender, pitch, quality, delivery.
+
+It is saved as `cast["book_tone"]`; a failure leaves none and never fails the analysis.
+`cast.suggest_narrator` picks the measured voice that fits, taking a first-person narrator's gender
+from the viewpoint character and never offering a voice the owner picked for a character.
+`cast.narrator_delivery` nudges the owner's saved sliders: ±0.1 exaggeration for restrained or
+dramatic narration, ±0.05 CFG for slow or brisk prose. Both are unmeasured by ear, kept small.
+
+### 17.3 Delivery per character
+
+With adaptive delivery in cast mode, each character's lines use the book's baseline shifted by up to
+±0.12 exaggeration (`cast.exaggeration_offsets`), before the line's mood preset applies. A delivery
+from the profile is centred on the cast's line-weighted average. The first live run showed why: the
+model called 5 of 6 characters of a dramatic book "expressive", and uncentred that made nearly all
+its dialogue louder instead of making characters differ. On that cast, centred, only the calm doctor
+reads flatter (-0.12); a character with no profile reads as the book. A delivery the owner sets in
+the editor applies as set. Units carry a voice, not a character, so the provider looks the offset up
+by voice; the narrator's voice never has one.
+
+### 17.4 Seamless by default
+
+The owner's goal: automatic, with manual changes as advanced settings. In cast mode with
+**Auto-pick suggested voices** on (the default), the first time a finished cast is shown on a page,
+the Make tab's Voice and the Voice lab sliders are set to the suggested narrator and its delivery.
+Add to queue already takes both from there, and a change the owner makes afterwards wins. Characters'
+voices are suggested around that narrator. The cast editor (gender, voice, the new Delivery setting,
+Sample, Save), **Suggest voices again** (which now also re-picks the narrator) and the auto-pick
+switch moved into a collapsed **Adjust the cast (advanced)**. The table and the clicked character's
+profile stay visible. Sample now speaks the character's own first line, in the editor's voice and
+delivery.
+
+### 17.5 Measured
+
+Full analysis of a scratch copy of the second real cast on qwen2.5:14b. The tone came back as third
+person, a three-word mood, brisk, dramatic, asking for a male narrator (medium,
+husky, expressive). The narrator suggestion was Adrian at exaggeration 0.75, CFG 0.60, temperature
+0.50, up from the saved 0.65 and 0.55. That replaces the owner's usual female narrator (Elena), a
+real change the owner should hear. Characters were re-fitted around it; all 6 profiles were usable.
+
+### 17.6 Tests
+
+566 app tests pass (551 before; 15 new). They cover:
+- `delivery_test.py` (2): the gain fix.
+- `delivery_provider_test.py` (2): character offsets reach the request, and none without adaptive
+  delivery.
+- `cast_test.py` (5): owner-then-profile delivery, centring, lookup by voice, narrator sliders and
+  narrator choice.
+- `cast_profiles_test.py` (4): tone parsing, narration passages, describing the book with a retry,
+  and a failure.
+- `chatterbox_ui_test.py` (2): auto-applying the narrator once, and Sample with delivery.
+
+Not tested in a browser: the collapsed section and the automatic Voice and slider updates. The live
+page carries the new controls, and the same handlers ran over the live cast.
