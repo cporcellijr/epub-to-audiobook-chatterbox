@@ -50,6 +50,15 @@ class GeneralConfig:
         self.voice_mode = getattr(args, 'voice_mode', None)
         self.dialogue_voice = getattr(args, 'dialogue_voice', None)
         self.cast_file = getattr(args, 'cast_file', None)
+        # Adaptive delivery (Chatterbox only): whispered/shouted-style dialogue (by rule, or the
+        # cast's saved moods in cast mode) is read softer/more excited around this book's baseline
+        # sliders. The three delivery_* sliders are None = use Chatterbox's saved generation
+        # defaults (today's behaviour); when any is set, every request sends the resolved baseline
+        # via extra_body even if adaptive_delivery itself is off.
+        self.adaptive_delivery = getattr(args, 'adaptive_delivery', None)
+        self.delivery_exaggeration = getattr(args, 'delivery_exaggeration', None)
+        self.delivery_cfg_weight = getattr(args, 'delivery_cfg_weight', None)
+        self.delivery_temperature = getattr(args, 'delivery_temperature', None)
 
         # TTS provider: Azure & Edge TTS specific arguments
         self.break_duration = getattr(args, 'break_duration', None)

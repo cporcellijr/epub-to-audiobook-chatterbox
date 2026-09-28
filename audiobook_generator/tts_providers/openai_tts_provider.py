@@ -19,6 +19,7 @@ from openai import APIConnectionError, APIStatusError, OpenAI
 
 from audiobook_generator.core.audio_tags import AudioTags
 from audiobook_generator.core import cast as cast_store
+from audiobook_generator.core import delivery
 from audiobook_generator.core.dialogue import DIALOGUE, PARAGRAPH_MARK, Segment, chapter_segments
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.utils.utils import split_text, split_long_sentence, set_audio_tags, merge_audio_segments
@@ -28,7 +29,7 @@ from audiobook_generator.tts_providers.base_tts_provider import BaseTTSProvider
 logger = logging.getLogger(__name__)
 
 __all__ = ["PARAGRAPH_MARK", "OpenAITTSProvider", "paced_units", "paragraph_mode_units", "voiced_units",
-           "voiced_paragraph_units"]
+           "voiced_paragraph_units", "adaptive_units", "adaptive_paragraph_units"]
 
 # Voice modes (config.voice_mode): one voice for everything (today's behaviour), a narrator plus one
 # voice for every quoted line, or a cast where each attributed speaker has their own voice.
@@ -231,6 +232,34 @@ def voiced_paragraph_units(text: str, language: str, voice_of: VoiceOf) -> List[
     return units
 
 
+MoodOf = Callable[[Segment], str]
+
+
+def adaptive_units(text: str, language: str, voice_of: VoiceOf, mood_of: MoodOf) -> List[Tuple[int, str, bool, str, str]]:
+    """(paragraph number, text, continues_previous, voice, mood) sentence-mode units for adaptive
+    delivery: built inside each narration/dialogue segment exactly like voiced_units, with every
+    unit of a segment also tagged with that segment's mood (core.delivery)."""
+    units: List[Tuple[int, str, bool, str, str]] = []
+    for number, segments in enumerate(chapter_segments(text)):
+        for piece in segments:
+            voice, mood = voice_of(piece), mood_of(piece)
+            units.extend((number, unit, continues, voice, mood) for unit, continues in _sentence_units(piece.text, language))
+    return units
+
+
+def adaptive_paragraph_units(text: str, language: str, voice_of: VoiceOf,
+                             mood_of: MoodOf) -> List[Tuple[int, str, int, bool, str, str]]:
+    """Paragraph-mode counterpart of adaptive_units: each segment is packed like a paragraph of
+    its own, tagged with both its voice and its mood."""
+    units: List[Tuple[int, str, int, bool, str, str]] = []
+    for number, segments in enumerate(chapter_segments(text)):
+        for piece in segments:
+            voice, mood = voice_of(piece), mood_of(piece)
+            units.extend((number, unit, count, continues, voice, mood)
+                         for unit, count, continues in _paragraph_units(piece.text, language))
+    return units
+
+
 _GAP_FRAME_MS = 10
 # A frame under this fraction of the clip's peak RMS counts as silence. Empirically checked
 # against 5 short real Chatterbox (Original model) clips: 0.15 missed one true sentence gap
@@ -406,6 +435,7 @@ class OpenAITTSProvider(BaseTTSProvider):
         config.output_format = config.output_format or "mp3"
         config.paced_unit_mode = config.paced_unit_mode or "sentence"
         config.voice_mode = config.voice_mode or VOICE_MODE_SINGLE  # jobs from before multi-voice existed
+        config.adaptive_delivery = bool(config.adaptive_delivery)  # jobs from before adaptive delivery existed
 
         self.price = get_price(config.model_name)
         super().__init__(config)
@@ -441,6 +471,69 @@ class OpenAITTSProvider(BaseTTSProvider):
                 return narrator
             return cast_store.character_voice(self.cast, lines.get(piece.line_id)) or dialogue_voice
         return voice_of
+
+    def _mood_of(self, text: str) -> MoodOf:
+        """The per-segment mood rule for one chapter (adaptive delivery): narration is always
+        "normal"; a dialogue line's mood is the cast's saved mood when this is cast mode and the
+        chapter was analysed, but a rule cue detected fresh from the current text always overrides
+        it (rules win over the LLM's guess, whether that guess came from this pass or an earlier
+        analysis) -- the same precedence core.cast_llm.attribute_chapter applies at analysis time.
+        """
+        paragraphs = chapter_segments(text)
+        rule_moods = delivery.segment_moods(paragraphs)
+        cast_moods: dict = {}
+        if self.cast is not None:
+            chapter = cast_store.chapter_moods(self.cast, hashlib.sha1(text.encode("utf-8")).hexdigest())
+            if chapter:
+                cast_moods = chapter
+
+        def mood_of(piece: Segment) -> str:
+            if piece.kind != DIALOGUE:
+                return delivery.MOOD_NORMAL
+            rule_mood = rule_moods.get(piece.line_id, delivery.MOOD_NORMAL)
+            if rule_mood != delivery.MOOD_NORMAL:
+                return rule_mood
+            return cast_moods.get(piece.line_id, delivery.MOOD_NORMAL)
+        return mood_of
+
+    def _is_chatterbox_engine(self) -> bool:
+        """True when this provider is pointed at Chatterbox (not Kokoro or the real OpenAI API):
+        adaptive delivery and the baseline sliders only mean anything to Chatterbox's own endpoint
+        extensions, and chatterbox_ui.build_config is the only caller that sets this model name."""
+        return self.config.model_name == "chatterbox"
+
+    def _adaptive_active(self) -> bool:
+        return bool(self.config.adaptive_delivery) and self._is_chatterbox_engine()
+
+    def _has_custom_baseline(self) -> bool:
+        return any(value is not None for value in
+                  (self.config.delivery_exaggeration, self.config.delivery_cfg_weight, self.config.delivery_temperature))
+
+    def _delivery_baseline(self) -> delivery.Baseline:
+        """The book's baseline sliders: this config's own delivery_* overrides, filled in from
+        Chatterbox's saved generation defaults (or the approved fallback) for whichever of the
+        three were left unset."""
+        exaggeration = self.config.delivery_exaggeration
+        cfg_weight = self.config.delivery_cfg_weight
+        temperature = self.config.delivery_temperature
+        if exaggeration is None or cfg_weight is None or temperature is None:
+            saved = delivery.saved_chatterbox_defaults()
+            exaggeration = saved.exaggeration if exaggeration is None else exaggeration
+            cfg_weight = saved.cfg_weight if cfg_weight is None else cfg_weight
+            temperature = saved.temperature if temperature is None else temperature
+        return delivery.Baseline(exaggeration, cfg_weight, temperature)
+
+    def _delivery_extra_body(self, mood: str) -> Optional[dict]:
+        """The Chatterbox-only extra_body sliders for one unit, or None when neither adaptive
+        delivery nor a per-book baseline applies (today's plain request, unchanged).
+
+        Adaptive delivery sends the mood's own preset; a baseline set with adaptive delivery off
+        sends the plain baseline (preset() at "normal" reproduces it unchanged, with 0 dB gain)."""
+        if not self._is_chatterbox_engine() or not (self.config.adaptive_delivery or self._has_custom_baseline()):
+            return None
+        effective_mood = mood if self.config.adaptive_delivery else delivery.MOOD_NORMAL
+        exaggeration, cfg_weight, temperature, _ = delivery.preset(effective_mood, self._delivery_baseline())
+        return {"exaggeration": exaggeration, "cfg_weight": cfg_weight, "temperature": temperature}
 
     def __str__(self) -> str:
         return super().__str__()
@@ -545,14 +638,21 @@ class OpenAITTSProvider(BaseTTSProvider):
 
         Single voice mode sends exactly the units of paced_units() with the one configured voice;
         the other voice modes build units inside the narration/dialogue segments (voiced_units)
-        and send each with its own voice.
+        and send each with its own voice. Adaptive delivery (Chatterbox only) always builds units
+        inside segments (single voice mode included, with the narrator voice for every segment) so
+        each unit can carry its segment's mood.
         """
         language = self.config.language or "en"
-        if self.config.voice_mode == VOICE_MODE_SINGLE:
-            units = [(paragraph, unit, 1, continues, self.config.voice_name)
+        if self._adaptive_active():
+            voice_of = self._voice_of(text) if self.config.voice_mode != VOICE_MODE_SINGLE else (
+                lambda piece: self.config.voice_name)
+            units = [(paragraph, unit, 1, continues, voice, mood) for paragraph, unit, continues, voice, mood
+                     in adaptive_units(text, language, voice_of, self._mood_of(text))]
+        elif self.config.voice_mode == VOICE_MODE_SINGLE:
+            units = [(paragraph, unit, 1, continues, self.config.voice_name, delivery.MOOD_NORMAL)
                      for paragraph, unit, continues in paced_units(text, language)]
         else:
-            units = [(paragraph, unit, 1, continues, voice)
+            units = [(paragraph, unit, 1, continues, voice, delivery.MOOD_NORMAL)
                      for paragraph, unit, continues, voice in voiced_units(text, language, self._voice_of(text))]
         self._speak_units(units, output_file, audio_tags)
 
@@ -568,34 +668,50 @@ class OpenAITTSProvider(BaseTTSProvider):
         mode each narration or dialogue segment is packed as a paragraph of its own.
         """
         language = self.config.language or "en"
-        if self.config.voice_mode == VOICE_MODE_SINGLE:
-            units = [(paragraph, unit, count, continues, self.config.voice_name)
+        if self._adaptive_active():
+            voice_of = self._voice_of(text) if self.config.voice_mode != VOICE_MODE_SINGLE else (
+                lambda piece: self.config.voice_name)
+            units = adaptive_paragraph_units(text, language, voice_of, self._mood_of(text))
+        elif self.config.voice_mode == VOICE_MODE_SINGLE:
+            units = [(paragraph, unit, count, continues, self.config.voice_name, delivery.MOOD_NORMAL)
                      for paragraph, unit, count, continues in paragraph_mode_units(text, language)]
         else:
-            units = voiced_paragraph_units(text, language, self._voice_of(text))
+            units = [(paragraph, unit, count, continues, voice, delivery.MOOD_NORMAL) for paragraph, unit, count,
+                     continues, voice in voiced_paragraph_units(text, language, self._voice_of(text))]
         self._speak_units(units, output_file, audio_tags)
 
-    def _speak_units(self, units: List[Tuple[int, str, int, bool, str]], output_file: str,
+    def _speak_units(self, units: List[Tuple[int, str, int, bool, str, str]], output_file: str,
                      audio_tags: AudioTags) -> None:
-        """Request each (paragraph, text, sentence_count, continues_previous, voice) unit at speed
-        1.0, insert the configured pauses between them and export the chapter once."""
+        """Request each (paragraph, text, sentence_count, continues_previous, voice, mood) unit at
+        speed 1.0, insert the configured pauses between them and export the chapter once.
+
+        Adaptive delivery (Chatterbox only) sends the unit's mood preset via extra_body and applies
+        that preset's gain plus the peak guard to the decoded audio before it is joined with the
+        pauses; a per-book baseline with adaptive delivery off still sends that baseline via
+        extra_body (mood is ignored: every unit's `mood` is "normal" already, so this is the plain
+        baseline unchanged), with no gain change. Neither applies: today's plain request.
+        """
         speed = float(self.config.speed or 1.0)
         sentence_gap_ms = int(self.config.sentence_pause_ms or 0)
         paragraph_gap_ms = int(self.config.paragraph_pause_ms or 0)
         if not units:
             raise ValueError("No speakable text in this chapter")
+        adaptive = self._adaptive_active()
+        baseline = self._delivery_baseline() if adaptive else None
 
         pieces: List[bytes] = []
         audio_format = None
         previous_paragraph = None
-        for number, (paragraph, unit, sentence_count, continues_previous, voice) in enumerate(units, 1):
+        for number, (paragraph, unit, sentence_count, continues_previous, voice, mood) in enumerate(units, 1):
             chunk_id = f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{number}_of_{len(units)}"
             detail = f", sentences={sentence_count}" if self.config.paced_unit_mode == "paragraph" else ""
             if self.config.voice_mode != VOICE_MODE_SINGLE:
                 detail += f", voice={voice}"
+            if adaptive:
+                detail += f", mood={mood}"
             logger.info(f"Processing {chunk_id}, length={len(unit)}{detail}")
             logger.debug(f"Processing {chunk_id}, length={len(unit)}, text=[{unit}]")
-            response = self._create_speech(
+            request_kwargs = dict(
                 model=self.config.model_name,
                 voice=voice,
                 speed=1.0,
@@ -603,9 +719,16 @@ class OpenAITTSProvider(BaseTTSProvider):
                 input=unit,
                 response_format="wav",
             )
+            extra_body = self._delivery_extra_body(mood)
+            if extra_body is not None:
+                request_kwargs["extra_body"] = extra_body
+            response = self._create_speech(**request_kwargs)
             audio = AudioSegment.from_file(io.BytesIO(response.content), format="wav")
             if sentence_count > 1 and sentence_gap_ms > 0:
                 audio = _stretch_sentence_gaps(audio, sentence_count - 1, sentence_gap_ms)
+            if adaptive:
+                gain_db = delivery.preset(mood, baseline)[3]
+                audio = delivery.peak_guard(audio.apply_gain(gain_db))
             if audio_format is None:
                 audio_format = (audio.frame_rate, audio.channels, audio.sample_width)
             else:
