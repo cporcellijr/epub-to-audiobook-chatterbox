@@ -40,6 +40,13 @@ class TestDoubleQuotes(unittest.TestCase):
 
 
 class TestMultiParagraphQuotes(unittest.TestCase):
+    def test_mistyped_curly_closer_does_not_continue_into_the_next_speaker(self):
+        text = f'“I saved somebody yesterday. “{M}“That is right!” said Ada.'
+        self.assertEqual(_flat(text), [
+            ("d", 1, "“I saved somebody yesterday. “", False),
+            ("d", 2, "“That is right!”", False),
+            ("n", 0, "said Ada.", False),
+        ])
 
     def test_continuation_paragraph_is_marked_and_still_gets_its_own_id(self):
         text = (f"“First part of a long speech that goes on.{M}"

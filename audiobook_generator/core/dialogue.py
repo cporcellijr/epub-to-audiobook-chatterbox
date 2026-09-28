@@ -138,7 +138,10 @@ def _split_quoted_paragraph(paragraph: str, style: str) -> Tuple[List[Tuple[str,
                 if piece:
                     parts.append((NARRATION, piece))
                 start, inside = i, True
-        elif _closes_here(paragraph, i, closes, single):
+        elif (_closes_here(paragraph, i, closes, single)
+              or (not single and char in "“„«" and i == len(paragraph) - 1)):
+            # Some EPUBs end a quotation with an opening curly mark by mistake. At the
+            # paragraph's end it cannot open another quotation, so close this one.
             # A single-quote mark straight after a letter (James' hat) is a possessive when the
             # speech still has a closing mark further on; typeset speech closes after punctuation.
             if single and paragraph[i - 1].isalpha() and any(

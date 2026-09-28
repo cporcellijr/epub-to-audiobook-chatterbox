@@ -14,6 +14,10 @@ class TestNamedTags(unittest.TestCase):
     def test_verb_then_name_after_the_quotation(self):
         self.assertEqual(tags('"You left the gate open," said Ada.'), {1: "Ada"})
 
+    def test_name_after_quote_following_a_mistyped_curly_closer(self):
+        text = f'“I saved somebody yesterday. “{M}“That is right!” said Ada.'
+        self.assertEqual(tags(text), {2: "Ada"})
+
     def test_name_then_verb_after_the_quotation(self):
         self.assertEqual(tags('"I did not," Tom said quietly.'), {1: "Tom"})
 
