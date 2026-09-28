@@ -237,6 +237,13 @@ class TestBuildConfig(unittest.TestCase):
         self.assertFalse(config.preview)
         self.assertEqual((config.sentence_pause_ms, config.paragraph_pause_ms, config.output_m4b), (350, 900, True))
         self.assertEqual(config.language, "en")
+        self.assertEqual(config.paced_unit_mode, "sentence")
+
+    def test_paragraph_narration_units_pass_through(self):
+        config = chatterbox_ui.build_config(
+            "/tmp/book.epub", "audiobook_output/Book", "Elena.wav", 1.0, [3], 0.35, 0.9, True, False, False,
+            "auto", "double", False, False, None, "INFO", "paragraph")
+        self.assertEqual(config.paced_unit_mode, "paragraph")
 
 
 TABLE = [[1, False, "Title page", "Title", "under 1 min"], [2, True, "One", "It was", "26 min"],
@@ -273,6 +280,14 @@ class TestQueueSettings(unittest.TestCase):
                           settings["output_m4b"]), ("Elena.wav", 0.35, 0.9, True))
         config = chatterbox_ui.build_config(**settings)  # queued settings rebuild a full config
         self.assertEqual((config.chapter_selection, config.paragraph_pause_ms), ([2, 3], 900))
+
+    def test_narration_units_are_queued_and_old_jobs_default_to_sentences(self):
+        with patch("os.path.isfile", side_effect=lambda p: p == "/library/book.epub"):
+            settings = chatterbox_ui.queue_settings("/library/book.epub", None, TABLE, *SETTINGS, "paragraph")
+        self.assertEqual(settings["paced_unit_mode"], "paragraph")
+        self.assertEqual(chatterbox_ui.build_config(**settings).paced_unit_mode, "paragraph")
+        del settings["paced_unit_mode"]  # a job queued before the option existed
+        self.assertEqual(chatterbox_ui.build_config(**settings).paced_unit_mode, "sentence")
 
     def test_dataframe_table_is_read(self):
         import pandas as pd

@@ -259,8 +259,11 @@ def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bo
 def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_selection: list,
                  sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
                  output_text: bool, title_mode: str, newline_mode: str, remove_endnotes: bool,
-                 remove_reference_numbers: bool, search_and_replace_file, log_level: str) -> GeneralConfig:
-    """GeneralConfig for the OpenAI provider pointed at Chatterbox (pauses in seconds)."""
+                 remove_reference_numbers: bool, search_and_replace_file, log_level: str,
+                 paced_unit_mode: str = "sentence") -> GeneralConfig:
+    """GeneralConfig for the OpenAI provider pointed at Chatterbox (pauses in seconds).
+
+    paced_unit_mode defaults to "sentence" so books queued before the option existed still build."""
     config = GeneralConfig(None)
     config.input_file = input_file.name if hasattr(input_file, "name") else input_file
     config.output_folder = output_dir
@@ -289,6 +292,7 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     config.sentence_pause_ms = int(round(float(sentence_pause) * 1000))
     config.paragraph_pause_ms = int(round(float(paragraph_pause) * 1000))
     config.output_m4b = bool(output_m4b)
+    config.paced_unit_mode = paced_unit_mode or "sentence"
     return config
 
 
@@ -376,7 +380,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
                    sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
                    output_text: bool, title_mode: str, newline_mode: str, remove_endnotes: bool,
                    remove_reference_numbers: bool, search_and_replace_file, log_level: str,
-                   active_jobs: Optional[List[dict]] = None) -> dict:
+                   paced_unit_mode: str = "sentence", active_jobs: Optional[List[dict]] = None) -> dict:
     """Validate the form and turn it into build_config keyword arguments for a queued book."""
     if library_book:
         if not os.path.isfile(library_book):
@@ -417,7 +421,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         "newline_mode": newline_mode, "remove_endnotes": bool(remove_endnotes),
         "remove_reference_numbers": bool(remove_reference_numbers),
         "search_and_replace_file": queued_replace_file,
-        "log_level": log_level,
+        "log_level": log_level, "paced_unit_mode": paced_unit_mode or "sentence",
     }
 
 
@@ -720,6 +724,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                     remove_endnotes = gr.Checkbox(False, label="Remove endnote numbers")
                     remove_reference_numbers = gr.Checkbox(False, label="Remove [1]-style references")
                     output_text = gr.Checkbox(False, label="Also save each chapter's text")
+                paced_unit_mode = gr.Dropdown(
+                    [("One sentence per request (default)", "sentence"),
+                     ("Whole paragraphs (about 8% faster, experimental)", "paragraph")],
+                    value="sentence", label="Narration units",
+                    info="Paragraphs send fewer, longer requests; the pauses inside a paragraph are placed "
+                         "at the gaps Chatterbox leaves between sentences.")
                 search_and_replace_file = gr.File(label="Search & replace file (optional, e.g. fix pronunciations)",
                                                   file_types=[".txt"], file_count="single")
             enqueue_button = gr.Button("➕ Add to queue", variant="primary")
@@ -777,7 +787,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
 
         settings = [output_dir, voice, speed, sentence_pause, paragraph_pause, output_m4b, skip_existing,
                     output_text, title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
-                    search_and_replace_file, log_level]
+                    search_and_replace_file, log_level, paced_unit_mode]
         # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
         # this re-runs the auto-selection. Ticks, speed, pauses and "Tick all" only touch the table.
         timing = [speed, sentence_pause, paragraph_pause]
