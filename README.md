@@ -72,6 +72,13 @@ Needs Docker with an NVIDIA GPU (Chatterbox's Original model uses about 4.5 GB o
    builds only redo the layers that changed.
 4. Open http://localhost:7860 (Chatterbox's own UI and API are on port 8004).
 
+Faster generation (opt-in): `TTS_COMPILE=on` in `.env` makes Chatterbox run the Original model's
+per-token step through `torch.compile` with CUDA graphs (`chatterbox/fast_t3.py`), measured about
+2.3x faster whole requests with the same model output. It compiles while the model loads (about 17 s
+more start-up) and falls back to the stock loop whenever it doesn't apply. It ships off; run
+`docs/chatterbox-edition/experiments/f45/validate_build.py` on your GPU first (see that folder's
+README) and turn it on only when every check passes.
+
 Updating Chatterbox from upstream: `git subtree pull --prefix=chatterbox
 https://github.com/devnen/Chatterbox-TTS-Server.git main --squash`, then check the local patches still
 apply. `chatterbox/patches/apply_speed_patches.py` stops the image build if its target code changed.

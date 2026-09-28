@@ -310,3 +310,14 @@ process, for the Original model only, behind an on/off setting that falls back t
 compile during model load (about 17 s more start-up); run synthesis on one dedicated thread, since the
 server now synthesizes on a threadpool (F-10) and torch.compile's CUDA graphs are recorded per thread
 (check); listen to A/B samples of the same text before switching it on.
+
+**Built (2026-09-28), on branch `feature/f45-compiled-t3`, awaiting GPU validation.** The
+production version lives in `chatterbox/fast_t3.py` and is installed by `engine.py` behind
+`TTS_COMPILE=on|off` (default off; compose passes `${TTS_COMPILE:-off}`), for the Original model with
+`TTS_BF16` on and CUDA. It replaces `T3.inference` on the loaded model with the same sampling loop
+over a compiled static-cache step, keeps the stock loop as the fallback for `cfg_weight=0`, over-long
+prompts, other models and any raised error (one WARNING, then DEBUG), runs warm-up, every generation
+and teardown on one dedicated worker thread (CUDA graphs are per thread), and is torn down on unload
+and reinstalled on reload. `docs/chatterbox-edition/experiments/f45/validate_build.py` checks speed
+(>= 2.0x), the teacher-forced match, recompiles, threads, memory over 240 requests, the fallback and
+start-up time, and writes A/B WAVs; the setting stays off until it passes on the real machine.

@@ -503,6 +503,11 @@ The following table describes the main sections and some key parameters you migh
   - `on` / `1` / `true` — force-enable. Assumes the hardware supports bf16.
   - `auto` — enable only if `torch.cuda.is_bf16_supported()` reports `True` at runtime.
   - Typical speedup on bf16-capable GPUs (RTX 30/40/50, A100, H100, Strix Halo) is around 40% on T3 token generation. Output is numerically slightly different from float32 but typically inaudible.
+- `TTS_COMPILE` — runs the per-token transformer step of the Original English model from a static KV cache through `torch.compile(mode="reduce-overhead")` (CUDA graphs); see `fast_t3.py`.
+  - `off` (default) — the stock token loop.
+  - `on` / `1` / `true` — compile while the model loads (about 17 s more start-up, ~0.5 GB more VRAM for the cache). Measured about 2.3x faster whole requests on an RTX 4070 with the same next-token distribution as the stock loop.
+  - Requires `TTS_BF16` on and a CUDA device; the Turbo and multilingual models, `cfg_weight=0`, prompts that would overflow the 2,048-position cache, and any failure of the compiled step fall back to the stock loop (logged once at WARNING, then at DEBUG per request).
+  - `/api/model-info` reports `compiled_t3: true` while it is installed.
 
 #### 5.3.10 `audio_processing` (Conceptual)
 While not explicitly a top-level section in the provided `config.py`'s `DEFAULT_CONFIG`, flags for enabling audio post-processing features (like silence trimming) are typically boolean values. They might be under `debug` or a dedicated `audio_processing` section if you choose to group them. Example:

@@ -41,6 +41,7 @@ v2.0 ships the complete Chatterbox family on every major GPU stack behind one Op
 - **Streaming `/tts` endpoint** — opt-in `stream: true` parameter returns a `StreamingResponse` that flushes WAV bytes per chunk with 20 ms crossfades. Default behavior unchanged.
 - **Voice conditioning cache** — repeated requests against the same reference voice skip re-encoding. Real latency win for batch / OpenAI-endpoint workflows.
 - **Opt-in BF16 inference** — `TTS_BF16=on` (or `=auto`) converts T3 to bfloat16 and runs under autocast for ~40% throughput on bf16-capable GPUs. Default `off` to preserve existing behavior on upgrade.
+- **Opt-in compiled token loop** — `TTS_COMPILE=on` runs the Original model's per-token step from a static KV cache through `torch.compile` (CUDA graphs) for about 2.3x faster requests; needs `TTS_BF16` on and CUDA, falls back to the stock loop otherwise. Default `off`.
 - **HTTPS / SSL** — optional `ssl_certfile` and `ssl_keyfile` in `config.yaml` for direct HTTPS without a reverse proxy.
 - **Security: CWE-22 path traversal fixed** on `/tts` and `/v1/audio/speech` voice file parameters. Traversal attempts return HTTP 400.
 - **New endpoints** — `/api/unload` (release GPU memory without restart) and `/v1/audio/voices` (OpenAI-compatible voice listing).
@@ -816,6 +817,7 @@ All three are hot-swappable from the Web UI engine dropdown without a server res
 The server defaults are tuned for safety and broad compatibility. The following knobs trade safety for speed when you understand your hardware:
 
 - **BF16 inference** — set environment variable `TTS_BF16=on` (or `=auto` for "enable only if the GPU reports `is_bf16_supported()`") to convert T3 to bfloat16 and run `generate()` under autocast. Roughly 40% throughput on bf16-capable GPUs (RTX 30/40/50, A100, H100, Strix Halo). Default is `off` to preserve existing behavior on upgrade. Output is numerically slightly different from float32 but typically inaudible.
+- **Compiled token loop** — set `TTS_COMPILE=on` (with `TTS_BF16` on, CUDA, Original model) to run the per-token transformer step from a 2,048-position static KV cache through `torch.compile(mode="reduce-overhead")`. Compiles during model load (about 17 s); measured about 2.3x faster whole requests on an RTX 4070 with the same next-token distribution as the stock loop (`fast_t3.py`). Requests the fast path cannot take (`cfg_weight=0`, over-long prompts, other models) and any failure of the compiled step fall back to the stock loop. Default is `off`.
 - **Voice conditioning cache** — repeated requests against the same reference voice skip re-encoding. Cache is keyed by `(path, mtime, exaggeration)` and is automatically cleared on `reload_model()` / `/api/unload`. No config needed.
 - **Chunk size** — `chunk_size` parameter on `/tts` (50–500, default 120). Larger chunks = fewer requests but more VRAM per call. The chunker respects sentence boundaries either way.
 - **Streaming** — `stream: true` on `/tts` for long-form input (audiobooks, multi-paragraph content). See the API section above for the chunk-level caveat.
