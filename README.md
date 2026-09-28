@@ -51,7 +51,12 @@ The repo holds the whole stack:
 Needs Docker with an NVIDIA GPU (Chatterbox's Original model uses about 4.5 GB of VRAM).
 
 1. Copy [`.env.example`](.env.example) to `.env` and set the paths. For a first run, copy
-   `chatterbox/config.yaml` and `chatterbox/voices/` into the folder you set as `CHATTERBOX_DATA`.
+   `chatterbox/config.audiobook.yaml` **as** `config.yaml`, plus `chatterbox/voices/`, into the
+   folder you set as `CHATTERBOX_DATA`. (`chatterbox/config.yaml` itself is the untouched
+   upstream template — Turbo model, seed 0 — not what this fork is tuned for.) If Chatterbox's
+   logs say its config path is a directory, the copy didn't happen before `docker compose up`:
+   Docker created an empty directory for the missing bind-mount file; copy the file into place,
+   remove that empty directory, and restart.
 2. Create the Docker network once (`docker network create tts`), or point `DOCKER_NETWORK` at an existing one.
 3. Build and start both containers:
    ```
@@ -64,6 +69,14 @@ Needs Docker with an NVIDIA GPU (Chatterbox's Original model uses about 4.5 GB o
 Updating Chatterbox from upstream: `git subtree pull --prefix=chatterbox
 https://github.com/devnen/Chatterbox-TTS-Server.git main --squash`, then check the local patches still
 apply. `chatterbox/patches/apply_speed_patches.py` stops the image build if its target code changed.
+
+Chatterbox's own web page (port 8004) has its own Save button for delivery settings
+(temperature, exaggeration, CFG weight, seed, speed, language): it posts back the six values
+the page loaded when it was opened, so leaving that tab open and clicking its Save can silently
+revert whatever this app's Voice lab saved afterwards. Use the app's Voice lab for delivery
+settings; if you do use the Chatterbox page directly, reload it first. Separately,
+`chatterbox/start.py` / `start.sh` / `start.bat` are upstream's own launchers and aren't used by
+this build — the Docker image's `CMD` runs `server.py` directly.
 
 Settings the app reads (the compose file sets them):
 

@@ -1,0 +1,38 @@
+server:
+  host: 0.0.0.0
+  port: 8004
+  use_ngrok: false
+  use_auth: false
+  auth_username: user
+  auth_password: password
+  log_file_path: logs/tts_server.log
+  log_file_max_size_mb: 10
+  log_file_backup_count: 5
+model:
+  repo_id: chatterbox
+tts_engine:
+  device: auto
+  predefined_voices_path: voices
+  reference_audio_path: reference_audio
+  default_voice_id: Elena.wav
+paths:
+  model_cache: model_cache
+  output: outputs
+generation_defaults:
+  temperature: 0.61
+  exaggeration: 0.73
+  cfg_weight: 0.5
+  seed: 888
+  speed_factor: 1.0
+  language: en
+audio_output:
+  format: wav
+  sample_rate: 24000
+  max_reference_duration_sec: 30
+  save_to_disk: false
+ui:
+  title: Chatterbox TTS Server
+  show_language_select: true
+  max_predefined_voices_in_dropdown: 50
+debug:
+  save_intermediate_audio: false

@@ -45,3 +45,8 @@ piper_models/*
 test.py
 
 logs/
+
+# Runtime files written by the web UI (not part of the app's source)
+queue.json
+library_index.json
+queue_uploads/

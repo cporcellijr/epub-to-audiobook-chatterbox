@@ -1,3 +1,6 @@
+# Upstream example for other TTS providers (Azure / OpenAI), running the web UI. Kept
+# for reference. This fork's own deployment is docker-compose.chatterbox.yml.
+#
 # Be sure to replace <your_subscription_key> and <your_region> with your actual
 # Azure Text-to-Speech API credentials. Also, replace your_book.epub with the
 # name of your EPUB file, and audiobook_output with the name of the directory

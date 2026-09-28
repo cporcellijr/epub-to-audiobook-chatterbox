@@ -19,9 +19,15 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - TTS_BF16=auto
+      # Whole-folder mount below (not a single-file one) so config saves can rename
+      # instead of copying onto a mount point (F-52); host file path is unchanged.
+      - CHATTERBOX_CONFIG_PATH=/app/data/config.yaml
     volumes:
-      # Chatterbox's own settings file and voice clips live outside the repo.
-      - ${CHATTERBOX_DATA:?set CHATTERBOX_DATA in .env}/config.yaml:/app/config.yaml
+      # Chatterbox's own settings file and voice clips live outside the repo. The whole
+      # folder is mounted (not just config.yaml) so config.py's save can os.replace()
+      # within it; a single-file bind mount can't be renamed onto (F-52), and a missing
+      # host file used to make Docker create a directory in its place (F-24).
+      - ${CHATTERBOX_DATA:?set CHATTERBOX_DATA in .env}:/app/data
       - ${CHATTERBOX_DATA}/voices:/app/voices
       - ${CHATTERBOX_DATA}/reference_audio:/app/reference_audio
       - ${CHATTERBOX_DATA}/outputs:/app/outputs
@@ -31,6 +37,15 @@ services:
       - ${CHATTERBOX_PORT:-8004}:8004
     networks:
       - tts
+    healthcheck:
+      # Model load takes ~12s once cached, but a first run also downloads the model
+      # (several GB), hence the generous start_period. Reads MODEL_LOADED via the
+      # same JSON /api/model-info returns to the UI (engine.get_model_info()).
+      test: ["CMD", "python3", "-c", "import json,urllib.request,sys; d=json.load(urllib.request.urlopen('http://localhost:8004/api/model-info', timeout=5)); sys.exit(0 if d.get('loaded') else 1)"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 5m
     deploy:
       resources:
         reservations:
@@ -46,7 +61,8 @@ services:
     container_name: epub-to-audiobook
     restart: unless-stopped
     depends_on:
-      - chatterbox
+      chatterbox:
+        condition: service_healthy
     command: ["--host", "0.0.0.0", "--port", "7860"]
     environment:
       - TZ=${TZ:-UTC}

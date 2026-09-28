@@ -523,7 +523,17 @@ def _ffmpeg_atempo(audio_np: np.ndarray, sample_rate: int, speed_factor: float) 
             check=True,
         )
     except (OSError, subprocess.SubprocessError) as e:
-        logger.warning(f"ffmpeg atempo failed for speed factor {speed_factor}: {e}", exc_info=True)
+        stderr_text = getattr(e, "stderr", None)
+        if stderr_text:
+            if isinstance(stderr_text, bytes):
+                stderr_text = stderr_text.decode("utf-8", errors="replace")
+            logger.warning(
+                f"ffmpeg atempo failed for speed factor {speed_factor}: {e} | "
+                f"ffmpeg stderr: {stderr_text.strip()}",
+                exc_info=True,
+            )
+        else:
+            logger.warning(f"ffmpeg atempo failed for speed factor {speed_factor}: {e}", exc_info=True)
         return None
     stretched = np.frombuffer(proc.stdout, dtype=np.float32)
     return stretched.copy() if stretched.size else None

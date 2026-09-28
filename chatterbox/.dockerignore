@@ -1,0 +1,23 @@
+# Keeps `COPY . .` in the Dockerfile from pulling local/runtime state into the image
+# (this directory is also a checkout on the host, not just a build context).
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# VCS metadata (irrelevant inside the image; this dir is a git subtree of the parent repo)
+.git*
+
+# Runtime-written directories: rebuilt fresh by the Dockerfile's own `mkdir -p`, and
+# would otherwise leak a local run's downloaded models/logs into the image layer.
+outputs/
+logs/
+model_cache/
+hf_cache/
+
+# Docs and demo notebook not needed at runtime.
+Chatterbox_TTS_Colab_Demo.ipynb
+README_Colab.md
+README_CUDA128.md
+documentation.md
