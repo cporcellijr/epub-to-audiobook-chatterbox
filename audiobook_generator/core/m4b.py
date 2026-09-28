@@ -1,5 +1,6 @@
 """Merge finished chapter files into one .m4b audiobook with chapter markers, cover and tags."""
 import logging
+import math
 import os
 import re
 import shutil
@@ -48,6 +49,19 @@ def _check_ffmpeg_available() -> None:
 
 
 def _duration_seconds(path: str) -> float:
+    if path.lower().endswith(".aac"):
+        # ADTS AAC has no duration header, so ffprobe's format duration for it is only a
+        # bitrate estimate, measured off by up to ~8% per chapter. Summing the packets is
+        # exact.
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "packet=duration_time",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, check=True,
+        )
+        packets = [float(value) for value in result.stdout.split() if value.strip(",") not in ("", "N/A")]
+        if not packets:
+            raise ValueError(f"no audio packets in {path}")
+        return sum(packets)
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
         capture_output=True, text=True, check=True,
@@ -76,27 +90,37 @@ def build_m4b(chapters: List[Tuple[str, str]], output_path: str, title: str, aut
     folder = os.path.dirname(output_path) or "."
     temp_output = os.path.join(folder, f".{os.path.basename(output_path)}.part")
 
+    durations = []
+    for chapter_title, path in chapters:
+        try:
+            # Rounded up to the microsecond the concat demuxer works in, so a chapter can
+            # never be declared shorter than its audio.
+            durations.append(math.ceil(_duration_seconds(path) * 1_000_000) / 1_000_000)
+        except (subprocess.CalledProcessError, OSError, ValueError) as e:
+            raise BadChapterFileError(path, chapter_title, e) from e
+
     with tempfile.TemporaryDirectory() as tmp:
         concat_list = os.path.join(tmp, "chapters.txt")
         metadata = os.path.join(tmp, "metadata.txt")
         with open(concat_list, "w", encoding="utf-8") as f:
             f.write("ffconcat version 1.0\n")
-            for _, path in chapters:
+            for (_, path), duration in zip(chapters, durations):
                 f.write(f"file '{_escape_concat_path(os.path.abspath(path))}'\n")
+                # Without this the concat demuxer starts the next chapter's timestamps at
+                # ffprobe's estimate of this one's length. For ADTS AAC that is a bitrate
+                # guess, so the stream copy overlapped chapters (ffmpeg then squashes the
+                # overlapping packets to zero length) or left gaps between them.
+                f.write(f"duration {duration:.6f}\n")
 
         lines = [";FFMETADATA1", f"title={_escape_metadata(title)}", f"album={_escape_metadata(title)}",
                  f"artist={_escape_metadata(author)}", f"album_artist={_escape_metadata(author)}",
                  "genre=Audiobook"]
-        start_ms = 0
-        for chapter_title, path in chapters:
-            try:
-                duration = _duration_seconds(path)
-            except (subprocess.CalledProcessError, OSError, ValueError) as e:
-                raise BadChapterFileError(path, chapter_title, e) from e
-            end_ms = start_ms + int(round(duration * 1000))
-            lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={start_ms}", f"END={end_ms}",
+        elapsed = 0.0
+        for (chapter_title, _), duration in zip(chapters, durations):
+            start_ms = int(round(elapsed * 1000))
+            elapsed += duration
+            lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={start_ms}", f"END={int(round(elapsed * 1000))}",
                       f"title={_escape_metadata(chapter_title)}"]
-            start_ms = end_ms
         with open(metadata, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 

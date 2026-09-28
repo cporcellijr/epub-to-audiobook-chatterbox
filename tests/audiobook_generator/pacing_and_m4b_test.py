@@ -476,6 +476,29 @@ class TestBuildM4b(unittest.TestCase):
             self.assertAlmostEqual(float(info["chapters"][1]["start_time"]), 2.0, delta=0.1)
             self.assertEqual(info["streams"][0]["codec_name"], "aac")
 
+    def test_aac_chapter_joins_follow_the_real_audio_not_a_bitrate_estimate(self):
+        # ADTS AAC has no duration header, so ffprobe estimates its length from the bitrate
+        # of the first frames. A chapter that opens loud and ends quiet was declared far
+        # shorter than it is: its chapter marker came early, and the stream copy overlapped
+        # the next chapter, which ffmpeg "fixes" by squashing the overlapping packets to zero
+        # length ("Non-monotonic DTS").
+        with tempfile.TemporaryDirectory() as tmp:
+            one, two = os.path.join(tmp, "1.aac"), os.path.join(tmp, "2.aac")
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                            "-i", "aevalsrc=exprs='0.5*sin(2*PI*300*t)*lt(t,1)':s=24000:d=8",
+                            "-ac", "1", "-c:a", "aac", "-f", "adts", one], check=True)
+            _aac(two, 3)
+            output = os.path.join(tmp, "Book.m4b")
+            build_m4b([("One", one), ("Two", two)], output, "Book", "Author")
+            info = _ffprobe(output)
+            packets = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                                      "packet=duration_time", "-of", "csv=p=0", output],
+                                     capture_output=True, text=True, check=True).stdout.split()
+        durations = [float(value.strip(",")) for value in packets]
+        self.assertAlmostEqual(float(info["chapters"][1]["start_time"]), 8.0, delta=0.15)
+        self.assertEqual([d for d in durations if d < 0.01], [])
+        self.assertAlmostEqual(sum(durations), 11.0, delta=0.2)
+
     def test_bad_chapter_file_names_the_chapter_that_is_unreadable(self):
         # F-33: an empty/corrupt chapter file used to fail the M4B with a bare
         # ffprobe/ffmpeg error that never said which chapter was at fault.
