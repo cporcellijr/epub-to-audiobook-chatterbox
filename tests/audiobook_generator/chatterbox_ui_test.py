@@ -1,3 +1,4 @@
+import io
 import json
 import multiprocessing
 import os
@@ -7,9 +8,16 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import gradio as gr
+from pydub import AudioSegment
 
 from audiobook_generator.ui import chatterbox_ui, web_ui
 from audiobook_generator.ui.job_queue import CAST, DONE, QUEUED, RUNNING
+
+
+def _silent_mp3_bytes(ms: int = 200) -> bytes:
+    buffer = io.BytesIO()
+    AudioSegment.silent(duration=ms, frame_rate=24000).export(buffer, format="mp3")
+    return buffer.getvalue()
 
 
 def _fake_response(body: bytes = b"") -> MagicMock:
@@ -178,6 +186,50 @@ class TestPreviewCleanup(unittest.TestCase):
         finally:
             if os.path.isfile(path):
                 os.remove(path)
+
+
+class TestDeliveryBaselineAndPreview(unittest.TestCase):
+
+    def tearDown(self):
+        chatterbox_ui._delete_if_exists(chatterbox_ui._current_preview_path)
+        chatterbox_ui._current_preview_path = None
+
+    def test_delivery_baseline_text_formats_the_sliders(self):
+        text = chatterbox_ui.delivery_baseline_text(0.73, 0.5, 0.61)
+        self.assertIn("exaggeration 0.73", text)
+        self.assertIn("CFG 0.5", text)
+        self.assertIn("temperature 0.61", text)
+        self.assertIn("Voice lab", text)
+
+    def test_engine_changed_shows_delivery_controls_only_for_chatterbox(self):
+        _, _, _, adaptive, baseline_info = chatterbox_ui.engine_changed("chatterbox")
+        self.assertTrue(adaptive["visible"])
+        self.assertTrue(baseline_info["visible"])
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": "http://kokoro:8880/v1"}), \
+                patch("urllib.request.urlopen", return_value=_fake_response(json.dumps({"voices": []}).encode())):
+            _, _, _, adaptive, baseline_info = chatterbox_ui.engine_changed("kokoro")
+        self.assertFalse(adaptive["visible"])
+        self.assertFalse(baseline_info["visible"])
+
+    def test_preview_delivery_range_sends_the_three_mood_presets_in_order(self):
+        clip = _silent_mp3_bytes(200)
+        with patch.dict(os.environ, {"CHATTERBOX_URL": "http://cb:8004"}), \
+                patch("urllib.request.urlopen", return_value=_fake_response(clip)) as urlopen:
+            path = chatterbox_ui.preview_delivery_range("Elena.wav", "Hello.", 0.73, 0.5, 0.61, 1.0)
+        try:
+            payloads = [json.loads(call.args[0].data) for call in urlopen.call_args_list]
+            self.assertEqual(len(payloads), 3)
+            self.assertEqual([(p["exaggeration"], p["cfg_weight"], p["temperature"]) for p in payloads],
+                             [(0.35, 0.35, 0.5), (0.73, 0.5, 0.61), (1.0, 0.4, 0.7)])
+            self.assertTrue(all(p["predefined_voice_id"] == "Elena.wav" and p["text"] == "Hello." for p in payloads))
+            combined = AudioSegment.from_file(path)
+            self.assertGreater(len(combined), 1500)  # 3 clips + 2 gaps of ~1 s: much longer than one clip alone
+        finally:
+            os.remove(path)
+
+    def test_preview_delivery_range_needs_a_voice(self):
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.preview_delivery_range("", "Hi", 0.73, 0.5, 0.61, 1.0)
 
 
 class TestAddVoice(unittest.TestCase):
@@ -1128,6 +1180,44 @@ class TestVoiceModes(unittest.TestCase):
         config = chatterbox_ui.build_config(**settings)
         self.assertEqual((config.voice_mode, config.dialogue_voice, config.cast_file), ("single", None, None))
 
+    def test_delivery_defaults_to_off_and_none(self):
+        settings = self._queue()
+        self.assertEqual((settings["adaptive_delivery"], settings["delivery_exaggeration"],
+                          settings["delivery_cfg_weight"], settings["delivery_temperature"]),
+                         (False, None, None, None))
+        config = chatterbox_ui.build_config(**settings)
+        self.assertEqual((config.adaptive_delivery, config.delivery_exaggeration, config.delivery_cfg_weight,
+                          config.delivery_temperature), (False, None, None, None))
+
+    def test_delivery_settings_travel_with_the_job(self):
+        settings = self._queue("dialogue", "Tom.wav", None, True, 0.8, 0.45, 0.5)
+        self.assertEqual((settings["adaptive_delivery"], settings["delivery_exaggeration"],
+                          settings["delivery_cfg_weight"], settings["delivery_temperature"]),
+                         (True, 0.8, 0.45, 0.5))
+        config = chatterbox_ui.build_config(**settings)
+        self.assertEqual((config.adaptive_delivery, config.delivery_exaggeration, config.delivery_cfg_weight,
+                          config.delivery_temperature), (True, 0.8, 0.45, 0.5))
+
+    def test_kokoro_engine_zeroes_out_delivery_in_queue_settings_and_build_config(self):
+        with patch.dict(os.environ, {"KOKORO_BASE_URL": "http://kokoro:8880/v1"}):
+            with patch("os.path.isfile", side_effect=lambda p: p == "/library/book.epub" or os.path.exists(p)):
+                settings = chatterbox_ui.queue_settings("/library/book.epub", None, TABLE, *SETTINGS, "sentence",
+                                                        "kokoro", "single", None, None, True, 0.8, 0.45, 0.5)
+            self.assertEqual((settings["adaptive_delivery"], settings["delivery_exaggeration"],
+                              settings["delivery_cfg_weight"], settings["delivery_temperature"]),
+                             (False, None, None, None))
+            config = chatterbox_ui.build_config(**settings)
+        self.assertEqual((config.adaptive_delivery, config.delivery_exaggeration, config.delivery_cfg_weight,
+                          config.delivery_temperature), (False, None, None, None))
+
+    def test_old_jobs_without_delivery_keys_build_with_delivery_off(self):
+        settings = self._queue()
+        for key in ("adaptive_delivery", "delivery_exaggeration", "delivery_cfg_weight", "delivery_temperature"):
+            del settings[key]  # a job queued before adaptive delivery existed
+        config = chatterbox_ui.build_config(**settings)
+        self.assertEqual((config.adaptive_delivery, config.delivery_exaggeration, config.delivery_cfg_weight,
+                          config.delivery_temperature), (False, None, None, None))
+
     def test_default_is_single_voice_and_carries_no_cast(self):
         settings = self._queue()
         self.assertEqual((settings["voice_mode"], settings["dialogue_voice"], settings["cast_file"]), ("single", None, None))
@@ -1258,6 +1348,26 @@ class TestCastPanel(unittest.TestCase):
         again = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", seen)
         self.assertEqual(again[0], gr.update())
         self.assertEqual(again[3], seen)
+
+    def test_summary_shows_mood_counts_when_present(self):
+        cast = self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav"},
+        })
+        cast["chapters"]["h1"] = {"number": 1, "title": "One", "lines": {"1": "anne"},
+                                  "moods": {"1": "soft", "2": "excited", "3": "excited"}}
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        _, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertIn("1 soft, 2 excited", status)
+
+    def test_summary_omits_mood_counts_when_every_line_is_normal(self):
+        cast = self._save("k", self.cast_store.STATUS_DONE, {
+            "anne": {"name": "Anne", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav"},
+        })
+        cast["chapters"]["h1"] = {"number": 1, "title": "One", "lines": {"1": "anne"}, "moods": {"1": "normal"}}
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        _, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertNotIn("soft", status)
+        self.assertNotIn("excited", status)
 
     def test_editing_a_character_saves_and_refreshes(self):
         self._save("k", self.cast_store.STATUS_DONE, {

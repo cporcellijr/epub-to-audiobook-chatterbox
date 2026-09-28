@@ -22,6 +22,7 @@ Environment:
     LLM_UNLOAD_CHATTERBOX  "off" keeps Chatterbox's model loaded during a cast analysis (default on)
 """
 import glob
+import io
 import json
 import multiprocessing
 import os
@@ -37,10 +38,12 @@ from typing import List, Optional, Tuple
 import gradio as gr
 import yaml
 from gradio_log import Log
+from pydub import AudioSegment
 
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
+from audiobook_generator.core import delivery
 from audiobook_generator.core.cast_llm import llm_configured
 from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.core.chatterbox_control import chatterbox_url
@@ -205,6 +208,13 @@ def load_saved_settings() -> tuple:
     return settings["exaggeration"], settings["cfg_weight"], settings["temperature"]
 
 
+def delivery_baseline_text(exaggeration: float, cfg_weight: float, temperature: float) -> str:
+    """The Make tab's one-line summary of the baseline adaptive delivery (or a set per-book
+    baseline with it off) will use for this book, following the Voice lab sliders live."""
+    return (f"Delivery for this book: exaggeration {float(exaggeration):g} · CFG {float(cfg_weight):g} · "
+            f"temperature {float(temperature):g}, from the Voice lab.")
+
+
 def save_settings(exaggeration: float, cfg_weight: float, temperature: float) -> str:
     """Store the sliders as Chatterbox's defaults, which every book request uses."""
     payload = {"generation_defaults": {
@@ -271,6 +281,47 @@ def preview_voice(voice: str, phrase: str, exaggeration: float, cfg_weight: floa
     handle, path = tempfile.mkstemp(prefix="voice_preview_", suffix=".mp3")
     with os.fdopen(handle, "wb") as f:
         f.write(audio)
+    _delete_if_exists(_current_preview_path)
+    _current_preview_path = path
+    return path
+
+
+def preview_delivery_range(voice: str, phrase: str, exaggeration: float, cfg_weight: float,
+                           temperature: float, speed: float) -> str:
+    """Voice lab: the phrase spoken soft, then normal, then excited, around the current sliders
+    (each mood's gain and peak guard applied, same as a book would get), as one clip with ~1 s of
+    silence between the takes. Reuses preview_voice's temp-file handling."""
+    global _current_preview_path
+    if not voice:
+        raise gr.Error("Pick a voice first.")
+    text = (phrase or "").strip() or PREVIEW_PHRASE
+    baseline = delivery.Baseline(float(exaggeration), float(cfg_weight), float(temperature))
+    combined: Optional[AudioSegment] = None
+    for mood in delivery.MOODS:
+        mood_exaggeration, mood_cfg_weight, mood_temperature, gain_db = delivery.preset(mood, baseline)
+        payload = {
+            "text": text,
+            "voice_mode": "predefined",
+            "predefined_voice_id": voice,
+            "output_format": "mp3",
+            "split_text": True,
+            "chunk_size": 500,
+            "exaggeration": mood_exaggeration,
+            "cfg_weight": mood_cfg_weight,
+            "temperature": mood_temperature,
+            "speed_factor": float(speed),
+        }
+        try:
+            audio_bytes = _post_json("/tts", payload, timeout=600)
+        except urllib.error.HTTPError as e:
+            raise gr.Error(f"Chatterbox could not make the {mood} sample: {_http_error_detail(e)}")
+        except Exception as e:
+            raise gr.Error(f"Could not reach Chatterbox: {e}")
+        clip = delivery.peak_guard(AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3").apply_gain(gain_db))
+        combined = clip if combined is None else combined + AudioSegment.silent(duration=1000) + clip
+    handle, path = tempfile.mkstemp(prefix="voice_preview_", suffix=".mp3")
+    with os.fdopen(handle, "wb") as f:
+        combined.export(f, format="mp3")
     _delete_if_exists(_current_preview_path)
     _current_preview_path = path
     return path
@@ -469,13 +520,16 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
                  remove_reference_numbers: bool, search_and_replace_file, log_level: str,
                  paced_unit_mode: str = "sentence", engine: str = "chatterbox",
                  voice_mode: str = VOICE_MODE_SINGLE, dialogue_voice: Optional[str] = None,
-                 cast_file: Optional[str] = None) -> GeneralConfig:
+                 cast_file: Optional[str] = None, adaptive_delivery: bool = False,
+                 delivery_exaggeration: Optional[float] = None, delivery_cfg_weight: Optional[float] = None,
+                 delivery_temperature: Optional[float] = None) -> GeneralConfig:
     """GeneralConfig for the OpenAI provider pointed at Chatterbox or Kokoro (pauses in seconds).
 
-    paced_unit_mode, engine and the voice-mode arguments all default so books queued before any
-    of them existed still build (as Chatterbox, sentence units, one voice). Kokoro always narrates
-    in sentence units regardless of paced_unit_mode: paragraph mode's gap detector was tuned on
-    Chatterbox audio and saves nothing on a server this fast (see the Narration units info text).
+    paced_unit_mode, engine, the voice-mode arguments and the delivery arguments all default so
+    books queued before any of them existed still build (as Chatterbox, sentence units, one voice,
+    adaptive delivery off). Kokoro always narrates in sentence units regardless of paced_unit_mode:
+    paragraph mode's gap detector was tuned on Chatterbox audio and saves nothing on a server this
+    fast (see the Narration units info text); delivery is ignored entirely for Kokoro.
 
     Raises ValueError if engine is "kokoro" but KOKORO_BASE_URL isn't configured; queue_settings
     already refuses that earlier with a friendlier gr.Error at enqueue time, so this only guards a
@@ -520,10 +574,16 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
         config.model_name = "kokoro"
         config.openai_base_url = base_url
         config.paced_unit_mode = "sentence"
+        config.adaptive_delivery = False
+        config.delivery_exaggeration = config.delivery_cfg_weight = config.delivery_temperature = None
     else:
         config.model_name = "chatterbox"
         config.openai_base_url = None
         config.paced_unit_mode = paced_unit_mode or "sentence"
+        config.adaptive_delivery = bool(adaptive_delivery)
+        config.delivery_exaggeration = delivery_exaggeration
+        config.delivery_cfg_weight = delivery_cfg_weight
+        config.delivery_temperature = delivery_temperature
     return config
 
 
@@ -613,7 +673,10 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
                    remove_reference_numbers: bool, search_and_replace_file, log_level: str,
                    paced_unit_mode: str = "sentence", engine: str = "chatterbox",
                    voice_mode: str = VOICE_MODE_SINGLE, dialogue_voice: Optional[str] = None,
-                   cast_key: Optional[str] = None, active_jobs: Optional[List[dict]] = None) -> dict:
+                   cast_key: Optional[str] = None, adaptive_delivery: bool = False,
+                   delivery_exaggeration: Optional[float] = None, delivery_cfg_weight: Optional[float] = None,
+                   delivery_temperature: Optional[float] = None,
+                   active_jobs: Optional[List[dict]] = None) -> dict:
     """Validate the form and turn it into build_config keyword arguments for a queued book.
 
     In cast mode the book's saved cast (see cast_store) must be finished and its voices must
@@ -684,6 +747,10 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         "log_level": log_level, "paced_unit_mode": paced_unit_mode or "sentence",
         "engine": engine,
         "voice_mode": voice_mode, "dialogue_voice": dialogue_voice or None, "cast_file": queued_cast_file,
+        "adaptive_delivery": bool(adaptive_delivery) and engine != "kokoro",
+        "delivery_exaggeration": None if engine == "kokoro" else delivery_exaggeration,
+        "delivery_cfg_weight": None if engine == "kokoro" else delivery_cfg_weight,
+        "delivery_temperature": None if engine == "kokoro" else delivery_temperature,
     }
 
 
@@ -778,6 +845,9 @@ def _cast_summary(cast: dict) -> str:
     parts = [f"**Cast ready**: {len(cast['characters'])} characters, {known} of {lines} lines attributed"]
     if unknown:
         parts.append(f"{unknown} unknown (spoken by the dialogue voice)")
+    moods = cast_store.mood_counts(cast)
+    if moods.get("soft") or moods.get("excited"):
+        parts.append(f"{moods.get('soft', 0)} soft, {moods.get('excited', 0)} excited")
     if stats.get("invalid_after_retry"):
         parts.append(f"{stats['invalid_after_retry']} window(s) the LLM never answered usably")
     return " · ".join(parts) + ". Click a row to change its gender or voice, then **Add to queue**."
@@ -1163,14 +1233,16 @@ def refresh_voices() -> tuple:
 def engine_changed(engine: str) -> tuple:
     """Switching the Make tab's engine swaps the Voice, Dialogue voice and cast-editor voice
     dropdowns to that engine's own choices and default (Chatterbox's file list, or Kokoro's
-    English voices from its live API)."""
+    English voices from its live API), and shows the adaptive delivery checkbox and its baseline
+    line only while Chatterbox is selected (delivery is ignored entirely for Kokoro)."""
     if engine == "kokoro":
         choices, default = kokoro_voices_and_default()
     else:
         choices = openai_voice_choices()
         default = default_openai_voice(choices)
-    return gr.update(choices=choices, value=default), gr.update(choices=choices, value=default), \
-        gr.update(choices=choices, value=None)
+    is_chatterbox = engine != "kokoro"
+    return (gr.update(choices=choices, value=default), gr.update(choices=choices, value=default),
+            gr.update(choices=choices, value=None), gr.update(visible=is_chatterbox), gr.update(visible=is_chatterbox))
 
 
 def _sync_if_chatterbox(value: str, engine: str) -> dict:
@@ -1191,6 +1263,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
     choices = openai_voice_choices()
     default_voice = default_openai_voice(choices)
     kokoro_configured = bool(kokoro_base_url())
+    saved = read_saved_settings()  # also seeds the Make tab's initial delivery baseline line
 
     def refresh_queue() -> tuple:
         rows, ids, status = queue_view(queue)
@@ -1313,6 +1386,13 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 dialogue_voice = gr.Dropdown(choices, value=default_voice, label="Dialogue voice", scale=1,
                                              allow_custom_value=True, visible=False,
                                              info="Quoted lines (in cast mode: lines whose speaker is unknown).")
+            with gr.Row(equal_height=True):
+                adaptive_delivery = gr.Checkbox(
+                    True, label="Adaptive delivery", visible=True,
+                    info="Dialogue tagged whispered/shouted (and, in Cast mode, the LLM's own read) is spoken "
+                         "softer or more excited around this book's baseline, instead of one flat delivery.")
+                delivery_baseline_info = gr.Markdown(
+                    delivery_baseline_text(saved["exaggeration"], saved["cfg_weight"], saved["temperature"]))
             with gr.Column(visible=False) as cast_panel:
                 with gr.Row(equal_height=True):
                     analyse_button = gr.Button("🎭 Analyse cast", scale=0, min_width=160)
@@ -1394,7 +1474,6 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             with gr.Row(equal_height=True):
                 lab_voice = gr.Dropdown(choices, value=default_voice, label="Voice", allow_custom_value=True)
                 phrase = gr.Textbox(PREVIEW_PHRASE, lines=2, label="Phrase")
-            saved = read_saved_settings()
             with gr.Row(equal_height=True):
                 exaggeration = gr.Slider(0.25, 2.0, value=saved["exaggeration"], step=0.05, label="Exaggeration",
                                          info="Emotion and emphasis")
@@ -1404,6 +1483,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                         info="Higher = more varied")
             with gr.Row():
                 play_button = gr.Button("▶ Play", variant="primary")
+                play_delivery_button = gr.Button("▶ Play soft / normal / excited")
                 save_button = gr.Button("Save for books")
                 reset_button = gr.Button("Reset to saved")
             preview_audio = gr.Audio(label="Preview", autoplay=True, interactive=False)
@@ -1436,10 +1516,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 delete_voice_button = gr.Button("Delete voice", variant="stop")
             delete_voice_status = gr.Markdown()
 
+        # adaptive_delivery, exaggeration, cfg_weight, temperature (the Voice lab sliders) are last:
+        # enqueue captures the Voice lab's current values as this book's delivery baseline.
         settings = [output_dir, voice, speed, sentence_pause, paragraph_pause, output_m4b, skip_existing,
                     output_text, title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
                     search_and_replace_file, log_level, paced_unit_mode, engine, voice_mode, dialogue_voice,
-                    cast_key_state]
+                    cast_key_state, adaptive_delivery, exaggeration, cfg_weight, temperature]
         # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
         # this re-runs the auto-selection. Ticks, speed, pauses, engine and "Tick all" only touch the table.
         timing = [speed, sentence_pause, paragraph_pause, engine]
@@ -1499,7 +1581,8 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         chapter_table.change(chapter_summary, inputs=[chapter_table, chapter_stats_state, *timing],
                              outputs=chapters_info)
 
-        engine.change(engine_changed, inputs=engine, outputs=[voice, dialogue_voice, cast_voice])
+        engine.change(engine_changed, inputs=engine,
+                     outputs=[voice, dialogue_voice, cast_voice, adaptive_delivery, delivery_baseline_info])
         voice.input(_sync_if_chatterbox, inputs=[voice, engine], outputs=lab_voice)
         lab_voice.input(_sync_if_chatterbox, inputs=[lab_voice, engine], outputs=voice)
         lab_voice.change(voice_gender_of, inputs=lab_voice, outputs=lab_gender)
@@ -1509,6 +1592,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             .then(sample_voice, inputs=[engine, voice, speed], outputs=sample_audio)
         play_button.click(preview_voice, inputs=[lab_voice, phrase, exaggeration, cfg_weight, temperature, speed],
                           outputs=preview_audio)
+        play_delivery_button.click(preview_delivery_range,
+                                   inputs=[lab_voice, phrase, exaggeration, cfg_weight, temperature, speed],
+                                   outputs=preview_audio)
+        for delivery_control in (exaggeration, cfg_weight, temperature):
+            delivery_control.change(delivery_baseline_text, inputs=[exaggeration, cfg_weight, temperature],
+                                    outputs=delivery_baseline_info)
         save_button.click(save_settings, inputs=[exaggeration, cfg_weight, temperature], outputs=lab_status)
         reset_button.click(load_saved_settings, inputs=None, outputs=[exaggeration, cfg_weight, temperature])
         sample.change(voice_name_from_sample, inputs=sample, outputs=new_voice_name)
@@ -1529,6 +1618,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         ui.load(voice_gender_of, inputs=lab_voice, outputs=lab_gender)
         ui.load(refresh_library, inputs=None, outputs=library_book)
         ui.load(load_saved_settings, inputs=None, outputs=[exaggeration, cfg_weight, temperature])
+        ui.load(delivery_baseline_text, inputs=[exaggeration, cfg_weight, temperature], outputs=delivery_baseline_info)
         ui.load(refresh_queue, inputs=None, outputs=queue_outputs)
     return ui
 
