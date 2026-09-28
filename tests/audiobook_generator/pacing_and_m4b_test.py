@@ -216,6 +216,30 @@ class TestGapDetection(unittest.TestCase):
         stretched = _stretch_sentence_gaps(self._three_sentence_clip(), gap_count=2, target_ms=200)
         self.assertAlmostEqual(len(stretched), 500 * 3 + 200 * 2, delta=30)
 
+    def test_stretch_keeps_the_quiet_end_of_the_word_before_the_gap(self):
+        # A word ending that trails off (150 ms at about -30 dBFS: under the gap threshold, but
+        # audible) then 200 ms of true silence. Only the silence is resized; the tail stays whole.
+        tail = _tone(150).apply_gain(-30 - _tone(150).dBFS)
+        clip = _tone(500) + tail + _silence(200) + _tone(500)
+        stretched = _stretch_sentence_gaps(clip, gap_count=1, target_ms=350)
+        self.assertAlmostEqual(len(stretched), 500 + 150 + 350 + 500, delta=20)
+        self.assertAlmostEqual(stretched[510:640].dBFS, tail[10:140].dBFS, delta=1.0)
+
+    def test_sound_between_two_silent_patches_is_kept(self):
+        # A word's tail, a brief silence, a consonant release, then the real 200 ms gap: only the
+        # longest unbroken silence is resized, so the release survives.
+        quiet = lambda ms: _tone(ms).apply_gain(-30 - _tone(ms).dBFS)
+        clip = _tone(500) + quiet(100) + _silence(30) + quiet(40) + _silence(200) + _tone(500)
+        stretched = _stretch_sentence_gaps(clip, gap_count=1, target_ms=350)
+        self.assertAlmostEqual(len(stretched), 500 + 100 + 30 + 40 + 350 + 500, delta=20)
+        self.assertGreater(stretched[635:665].dBFS, -40)  # the release is still there
+
+    def test_a_gap_with_no_true_silence_gets_the_pause_inserted_and_loses_nothing(self):
+        murmur = _tone(200).apply_gain(-30 - _tone(200).dBFS)  # quiet but never silent
+        clip = _tone(500) + murmur + _tone(500)
+        stretched = _stretch_sentence_gaps(clip, gap_count=1, target_ms=300)
+        self.assertAlmostEqual(len(stretched), 500 + 200 + 300 + 500, delta=20)
+
     def test_stretch_picks_the_longest_gaps_first_and_leaves_the_rest(self):
         # Only 1 gap requested (as for a 2-sentence unit): the longer 300 ms gap must be the one
         # replaced; the shorter 80 ms gap is left alone.

@@ -267,6 +267,11 @@ _GAP_FRAME_MS = 10
 # 8 expected gaps, including in a comma-heavy sentence where the real gap was still correctly
 # picked over both comma pauses. Not re-validated against longer or different-voice audio.
 _GAP_SILENCE_RATIO = 0.20
+# Inside a gap found that way, only frames at or below this level are true silence. The rest of the
+# run is the quiet end of the word before it or the breathy start of the next one: measured on real
+# Chatterbox audio, each gap began with 130-150 ms of it at -22 to -39 dBFS, which replacing the
+# whole run erased (clipped word endings).
+_TRUE_SILENCE_DBFS = -50.0
 
 
 def _silence_runs(audio: AudioSegment) -> List[Tuple[int, int]]:
@@ -311,8 +316,30 @@ def _stretch_sentence_gaps(audio: AudioSegment, gap_count: int, target_ms: int) 
     silence = AudioSegment.silent(duration=target_ms, frame_rate=audio.frame_rate)
     silence = silence.set_channels(audio.channels).set_sample_width(audio.sample_width)
     for start, end in chosen:
-        audio = audio[:start] + silence + audio[end:]
+        core_start, core_end = _silent_core(audio, start, end)
+        audio = audio[:core_start] + silence + audio[core_end:]
     return audio
+
+
+def _silent_core(audio: AudioSegment, start: int, end: int) -> Tuple[int, int]:
+    """The part of a gap run to replace with the pause: its longest unbroken stretch of truly
+    silent frames, so nothing audible is removed (the tail of the word before it, a consonant's
+    release, a breath, the onset of the next word all stay). With no truly silent frame, an empty
+    span at the run's quietest frame (the pause is inserted there and nothing is removed)."""
+    frames = [audio[t:t + _GAP_FRAME_MS] for t in range(start, end, _GAP_FRAME_MS)]
+    best, run_start = None, None
+    for i, frame in enumerate(frames + [None]):
+        if frame is not None and frame.dBFS <= _TRUE_SILENCE_DBFS:
+            run_start = i if run_start is None else run_start
+        elif run_start is not None:
+            if best is None or i - run_start > best[1] - best[0]:
+                best = (run_start, i)
+            run_start = None
+    if best:
+        return start + best[0] * _GAP_FRAME_MS, min(end, start + best[1] * _GAP_FRAME_MS)
+    quietest = min(range(len(frames)), key=lambda i: frames[i].rms)
+    point = start + quietest * _GAP_FRAME_MS + _GAP_FRAME_MS // 2
+    return point, point
 
 
 def get_openai_supported_output_formats():
