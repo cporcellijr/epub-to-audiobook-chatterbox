@@ -1,0 +1,165 @@
+"""Adaptive delivery: presets around a book's baseline, the peak guard, the rule-based mood cues
+and reading Chatterbox's saved generation defaults."""
+import os
+import struct
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import yaml
+from pydub import AudioSegment
+
+from audiobook_generator.core import delivery
+from audiobook_generator.core.delivery import (
+    APPROVED_BASELINE, MOOD_EXCITED, MOOD_NORMAL, MOOD_SOFT, Baseline, mood_of, peak_guard, preset,
+    saved_chatterbox_defaults, segment_moods,
+)
+from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
+
+
+def _tone(peak_amplitude: int, frame_rate: int = 24000, duration_ms: int = 200) -> AudioSegment:
+    """A square wave whose peak absolute sample is exactly peak_amplitude, for a known max_dBFS."""
+    sample_count = int(frame_rate * duration_ms / 1000)
+    samples = [peak_amplitude if i % 2 == 0 else -peak_amplitude for i in range(sample_count)]
+    raw = struct.pack("<%dh" % sample_count, *samples)
+    return AudioSegment(data=raw, sample_width=2, frame_rate=frame_rate, channels=1)
+
+
+class TestPreset(unittest.TestCase):
+
+    def test_approved_baseline_reproduces_the_approved_numbers_exactly(self):
+        self.assertEqual(preset(MOOD_SOFT, APPROVED_BASELINE), (0.35, 0.35, 0.5, -6.0))
+        self.assertEqual(preset(MOOD_NORMAL, APPROVED_BASELINE), (0.73, 0.5, 0.61, 0.0))
+        self.assertEqual(preset(MOOD_EXCITED, APPROVED_BASELINE), (1.0, 0.4, 0.7, 1.5))
+
+    def test_relative_presets_at_another_baseline_including_the_floors(self):
+        baseline = Baseline(0.5, 0.6, 0.4)
+        # soft exaggeration (0.5*0.48=0.24) and soft temperature (0.4-0.11=0.29) both hit their floor.
+        self.assertEqual(preset(MOOD_SOFT, baseline), (0.25, 0.45, 0.3, -6.0))
+        self.assertEqual(preset(MOOD_NORMAL, baseline), (0.5, 0.6, 0.4, 0.0))
+        self.assertEqual(preset(MOOD_EXCITED, baseline), (0.77, 0.5, 0.49, 1.5))
+
+    def test_excited_exaggeration_and_temperature_ceilings(self):
+        baseline = Baseline(0.9, 0.5, 0.85)
+        exaggeration, _, temperature, _ = preset(MOOD_EXCITED, baseline)
+        self.assertEqual(exaggeration, 1.0)   # 0.9 + 0.27 = 1.17, capped at 1.0
+        self.assertEqual(temperature, 0.9)    # 0.85 + 0.09 = 0.94, capped at 0.9
+
+    def test_unrecognised_mood_behaves_like_normal(self):
+        self.assertEqual(preset("shouting-into-a-pillow", APPROVED_BASELINE), preset(MOOD_NORMAL, APPROVED_BASELINE))
+
+
+class TestPeakGuard(unittest.TestCase):
+
+    def test_a_clip_over_the_guard_is_turned_down_to_exactly_minus_one_dbfs(self):
+        loud = _tone(32767)  # 0 dBFS
+        guarded = peak_guard(loud)
+        self.assertAlmostEqual(guarded.max_dBFS, delivery.PEAK_GUARD_DBFS, delta=0.1)
+
+    def test_a_clip_already_under_the_guard_is_unchanged(self):
+        quiet = _tone(16423)  # about -6 dBFS
+        self.assertIs(peak_guard(quiet), quiet)
+
+    def test_silence_is_unchanged(self):
+        silence = AudioSegment.silent(duration=200)
+        self.assertIs(peak_guard(silence), silence)
+
+
+class TestMoodOf(unittest.TestCase):
+
+    def test_no_cues_is_normal(self):
+        self.assertEqual(mood_of("", '"Fine."', "she said."), MOOD_NORMAL)
+
+    def test_soft_verb_after(self):
+        self.assertEqual(mood_of("", '"Go now."', "she whispered."), MOOD_SOFT)
+
+    def test_soft_verb_before_only_counts_as_a_lead_in_ending_in_comma_or_colon(self):
+        self.assertEqual(mood_of("She whispered,", '"Go now."', ""), MOOD_SOFT)
+        self.assertEqual(mood_of("She said, and then whispered:", '"Go now."', ""), MOOD_SOFT)
+        # No trailing ',' or ':': not a lead-in, so the cue is not counted.
+        self.assertEqual(mood_of("She whispered softly", '"Go now."', ""), MOOD_NORMAL)
+
+    def test_soft_adverb_phrases(self):
+        for after in ("she said softly.", "she said quietly.", "she said gently.",
+                      "she said under his breath.", "she said under her breath.", "she said under their breath.",
+                      "she said in a whisper.", "she said in a low voice."):
+            self.assertEqual(mood_of("", '"Go now."', after), MOOD_SOFT, after)
+
+    def test_excited_verbs(self):
+        for after in ("she shouted.", "she yelled.", "she screamed.", "she shrieked.", "she roared.",
+                      "she bellowed.", "she cried.", "she cried out.", "she exclaimed."):
+            self.assertEqual(mood_of("", '"Get out."', after), MOOD_EXCITED, after)
+
+    def test_excited_adverbs(self):
+        for after in ("he said loudly.", "he said angrily.", "he said furiously."):
+            self.assertEqual(mood_of("", '"Get out."', after), MOOD_EXCITED, after)
+
+    def test_exclamation_mark_alone_is_excited(self):
+        self.assertEqual(mood_of("", '"Get out!"', ""), MOOD_EXCITED)
+        self.assertEqual(mood_of("", "“Get out!”", ""), MOOD_EXCITED)  # curly quotes
+
+    def test_soft_wins_over_an_exclamation_mark(self):
+        self.assertEqual(mood_of("", '"Get out!"', "she whispered."), MOOD_SOFT)
+
+    def test_soft_wins_over_an_excited_cue(self):
+        self.assertEqual(mood_of("", '"Get out."', "she whispered, though he had shouted a moment before."),
+                         MOOD_SOFT)
+
+    def test_case_insensitive(self):
+        self.assertEqual(mood_of("", '"Go now."', "She WHISPERED."), MOOD_SOFT)
+        self.assertEqual(mood_of("", '"Go now."', "She SHOUTED."), MOOD_EXCITED)
+
+
+class TestSegmentMoods(unittest.TestCase):
+
+    def test_ordinary_lines_use_mood_of(self):
+        text = f'"Fine," she said.{M}"Get out!" he shouted.{M}"Shh," she whispered.'
+        moods = segment_moods(chapter_segments(text))
+        self.assertEqual(moods, {1: MOOD_NORMAL, 2: MOOD_EXCITED, 3: MOOD_SOFT})
+
+    def test_narration_never_appears(self):
+        moods = segment_moods(chapter_segments(f"Nothing happens here.{M}Nor here."))
+        self.assertEqual(moods, {})
+
+    def test_a_continued_line_inherits_the_previous_lines_final_mood_ignoring_its_own_cues(self):
+        # Paragraph 1's own lead-in ("whispered,") makes line 1 soft; paragraph 2's own narration
+        # ("he shouted") would make line 2 excited on its own, but it continues line 1's quotation
+        # and must inherit "soft" instead.
+        text = f'She whispered, "First part.{M}"Second part," he shouted.'
+        moods = segment_moods(chapter_segments(text))
+        self.assertEqual(moods, {1: MOOD_SOFT, 2: MOOD_SOFT})
+
+
+class TestSavedChatterboxDefaults(unittest.TestCase):
+
+    def test_no_config_path_returns_the_approved_baseline(self):
+        with patch.dict(os.environ, {"CHATTERBOX_CONFIG": ""}):
+            self.assertEqual(saved_chatterbox_defaults(), APPROVED_BASELINE)
+
+    def test_reads_generation_defaults_from_the_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.yaml")
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.safe_dump({"generation_defaults": {"exaggeration": 0.6, "cfg_weight": 0.45, "temperature": 0.7}}, f)
+            with patch.dict(os.environ, {"CHATTERBOX_CONFIG": path}):
+                self.assertEqual(saved_chatterbox_defaults(), Baseline(0.6, 0.45, 0.7))
+
+    def test_a_field_missing_from_the_file_falls_back_to_the_approved_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.yaml")
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.safe_dump({"generation_defaults": {"exaggeration": 0.9}}, f)
+            with patch.dict(os.environ, {"CHATTERBOX_CONFIG": path}):
+                self.assertEqual(saved_chatterbox_defaults(),
+                                 Baseline(0.9, APPROVED_BASELINE.cfg_weight, APPROVED_BASELINE.temperature))
+
+    def test_missing_file_retries_once_then_falls_back(self):
+        sleeps = []
+        with patch.dict(os.environ, {"CHATTERBOX_CONFIG": "/nowhere/config.yaml"}):
+            result = saved_chatterbox_defaults(sleep=sleeps.append)
+        self.assertEqual(result, APPROVED_BASELINE)
+        self.assertEqual(len(sleeps), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
