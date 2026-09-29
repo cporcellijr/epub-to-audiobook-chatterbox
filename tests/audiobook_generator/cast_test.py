@@ -382,6 +382,18 @@ class TestFirstPerson(unittest.TestCase):
         cast["characters"]["friend"]["voice_picked"] = True  # the owner's own voice for her wins
         self.assertIsNone(cast_store.chapter_narrator(cast, "a"))
 
+    def test_another_characters_first_person_story_is_narrated_in_their_own_voice(self):
+        cast = self._cast()
+        cast["characters"]["friend"]["voice"] = "Mid.wav"
+        cast["chapters"] = {"mine": {"number": 1, "narrator": "me"}, "hers": {"number": 2, "narrator": "friend"},
+                            "third": {"number": 3, "narrator": None}, "old": {"number": 4}}
+        self.assertIsNone(cast_store.chapter_narrator_voice(cast, "mine"))  # the book's own "I": its narrator voice
+        self.assertEqual(cast_store.chapter_narrator_voice(cast, "hers"), "Mid.wav")
+        self.assertIsNone(cast_store.chapter_narrator_voice(cast, "third"))
+        self.assertIsNone(cast_store.chapter_narrator_voice(cast, "old"))
+        cast["characters"]["friend"]["voice"] = None  # no voice yet: the book's narrator
+        self.assertIsNone(cast_store.chapter_narrator_voice(cast, "hers"))
+
     def test_the_narrator_gets_no_suggested_voice_and_gives_one_back(self):
         cast = self._cast()
         self.assertEqual(cast_store.suggest_voices(cast, FEMALE, "Narrator.wav"), {"friend": "Deep.wav"})

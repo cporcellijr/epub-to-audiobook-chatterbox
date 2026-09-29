@@ -42,7 +42,8 @@ ASK_LLM_FOR_MOODS = False
 # A pronoun names no one: "he" as a speaker is an unknown speaker ("I" stays a speaker: in a
 # first-person book the model uses it for the narrator, whom the attribution then keeps apart).
 _PRONOUNS = frozenset({"he", "she", "they", "him", "her", "them", "you", "we", "us", "it", "his", "hers",
-                       "their", "theirs", "your", "yours", "our", "ours", "one", "someone", "somebody"})
+                       "their", "theirs", "your", "yours", "our", "ours", "one", "someone", "somebody",
+                       "himself", "herself", "themselves", "yourself", "myself", "itself"})
 UNKNOWN_SPEAKER_WORDS = frozenset({"", "unknown", "narrator", "none", "n/a", "?", "nobody", "unclear"}) | _PRONOUNS
 # Never an alias: what anyone may be called (seen live: "he", "honey" and "child" as aliases of one
 # character), which would hand that character every line the model answers with the word. Family
@@ -61,6 +62,8 @@ _FAMILY_WORDS = frozenset({
     "papa", "pop", "pops", "grandma", "grandpa", "granny", "gran", "grandmother", "grandfather", "nana",
     "grandad", "granddad", "step", "stepmom", "stepmother", "stepdad", "stepfather", "son", "daughter",
     "sis", "bro", "brother", "sister", "aunt", "auntie", "uncle", "cousin", "wife", "husband", "hubby",
+    "little", "big", "baby", "older", "younger", "elder", "twin", "in-law", "in-laws", "son-in-law",
+    "daughter-in-law", "mother-in-law", "father-in-law", "brother-in-law", "sister-in-law",
 })
 
 

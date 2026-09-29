@@ -541,25 +541,32 @@ def _voted_narrator(chapters: List[ChapterText]) -> Optional[str]:
 def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Optional[dict],
                       chat: Optional[Chat] = None, log: logging.Logger = logger) -> Dict[int, dict]:
     """{chapter number: {"point_of_view", "narrator"}} for the analysed chapters: a first-person
-    chapter's narrator is the character its story's "I said" lines were attributed to (the
-    attribution sees who is talked to, which narration alone doesn't show). A story with no such
-    lines takes the book tone's narrator when it is the book's only first-person story, else the
-    LLM is asked about that story alone (skipped without `chat`)."""
+    chapter's narrator is the character its "I said" lines were attributed to (the attribution sees
+    who is talked to, which narration alone doesn't show), or a neighbour's in the same run of
+    first-person chapters when it has too few. A run with no such lines at all takes the book
+    tone's narrator when it is the book's only first-person run, else the LLM is asked about that
+    run alone (skipped without `chat`)."""
     views = [chapter_point_of_view(chapter) for chapter in chapters]
     stories = _stories(chapters, views)
     narrators: Dict[int, dict] = {c.number: {"point_of_view": view, "narrator": None}
                                   for c, view in zip(chapters, views)}
     for story in stories:
         members = [chapters[i] for i in story]
+        # Each chapter votes on its own: two first-person stories can sit side by side in a
+        # collection (seen live), each with its own "I". A chapter with too few "I said" lines
+        # takes the chapter before it (else after), then the run's pooled vote.
+        own = [_voted_narrator([chapter]) for chapter in members]
         key = _voted_narrator(members)
-        if key is None and len(stories) == 1 and (book_tone or {}).get("point_of_view") == "first":
-            key = book_tone.get("pov_key")
-        elif key is None and chat is not None:
-            tone = _ask_tone(cast.get("characters", {}), members, chat, log,
-                             label=f"chapters {members[0].number}-{members[-1].number}")
-            key = tone.get("pov_key") if tone and tone.get("point_of_view") == "first" else None
-        for chapter in members:
-            narrators[chapter.number] = {"point_of_view": "first", "narrator": key}
+        if not any(own) and key is None:
+            if len(stories) == 1 and (book_tone or {}).get("point_of_view") == "first":
+                key = book_tone.get("pov_key")
+            elif chat is not None:
+                tone = _ask_tone(cast.get("characters", {}), members, chat, log,
+                                 label=f"chapters {members[0].number}-{members[-1].number}")
+                key = tone.get("pov_key") if tone and tone.get("point_of_view") == "first" else None
+        for i, chapter in enumerate(members):
+            found = own[i] or next((k for k in reversed(own[:i]) if k), None) or next((k for k in own[i:] if k), key)
+            narrators[chapter.number] = {"point_of_view": "first", "narrator": found}
     return narrators
 
 

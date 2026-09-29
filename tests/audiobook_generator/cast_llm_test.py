@@ -210,7 +210,11 @@ class TestRoster(unittest.TestCase):
         roster.new_chapter()
         self.assertNotEqual(roster.add("Mom"), terri)  # the next story's mother is someone else
         self.assertEqual(roster.add("Mrs McCallister"), terri)  # a real name still merges across chapters
+        # Seen live too: "Himself" as an alias, and "little brother" / "Son-in-law" kept across stories.
+        nate = roster.add("Nate", "male", aliases=["Himself", "Son-in-law", "little brother"])
+        self.assertEqual((roster.characters[nate]["aliases"], roster.add("Son-in-law")), ([], nate))
         roster.new_chapter()
+        self.assertNotEqual(roster.add("little brother"), nate)
         ruth = roster.add("Ruth", "female", aliases=["Ma"])
         self.assertEqual(roster.add("Ma"), ruth)
         # A saved cast's family-word aliases are not restored as names either.

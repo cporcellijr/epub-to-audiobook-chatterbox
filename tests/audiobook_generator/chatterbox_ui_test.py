@@ -1710,6 +1710,15 @@ class TestCastPanel(unittest.TestCase):
         self.assertNotIn("narrated by I", text)
         self.assertIn('The unnamed first-person narrator ("I") speaks their own lines', text)
 
+    def test_the_panel_names_each_first_person_storys_teller_and_voice(self):
+        cast = {"characters": {"nate": {"name": "Nate", "voice": "Cal.wav"}, "irene": {"name": "Irene", "voice": None}},
+                "chapters": {"a": {"number": 3, "narrator": "nate"}, "b": {"number": 4, "narrator": "irene"},
+                             "c": {"number": 5, "narrator": None}}}
+        self.assertEqual(chatterbox_ui.story_tellers_text(cast),
+                         "**First-person stories, each narrated by its teller's voice:** Nate (chapter 3, Cal); "
+                         "Irene (chapter 4, the narrator voice)")
+        self.assertEqual(chatterbox_ui.story_tellers_text({"characters": {}, "chapters": {}}), "")
+
     def test_analysis_can_keep_every_earlier_voice_or_only_the_owners_picks(self):
         book = os.path.join(self.tmp.name, "mine.epub")
         with open(book, "wb") as f:

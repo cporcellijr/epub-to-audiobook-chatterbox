@@ -300,6 +300,15 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertEqual(cast["book_tone"]["point_of_view"], "first")  # most of the narration is Oliver's
         self.assertEqual(cast["chapters"]["h1"]["narrator"], None)
 
+    def test_side_by_side_first_person_stories_keep_their_own_narrators(self):
+        # Seen live: a collection's first two stories are both in the first person, told by different people.
+        untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
+        chapters = [_story(1, _FIRST_PERSON, self.FIRST), _story(2, _FIRST_PERSON, {1: "oliver", 2: "bettie", 3: "bettie"}),
+                    _story(3, untagged, {1: "tom", 2: "tom", 3: "tom"})]
+        found = chapter_narrators(self._cast(1, 2, 3), chapters, None)
+        # A chapter with too few "I said" lines of its own follows the one before it.
+        self.assertEqual([found[n]["narrator"] for n in (1, 2, 3)], ["oliver", "bettie", "bettie"])
+
     def test_a_story_without_i_said_lines_asks_the_llm_about_that_story_alone(self):
         untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
         chapters = [_story(1, _FIRST_PERSON, self.FIRST), _story(2, _THIRD_PERSON, self.THIRD),

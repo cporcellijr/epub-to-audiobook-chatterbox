@@ -620,6 +620,8 @@ class OpenAITTSProvider(BaseTTSProvider):
         # Attributions are keyed by the chapter text's hash (the same hash the chapter manifest
         # uses), so they survive renumbering and a different chapter selection.
         chapter_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        # A collection's first-person story is narrated by its own teller's voice.
+        narrator = cast_store.chapter_narrator_voice(self.cast, chapter_hash) or narrator
         lines = cast_store.chapter_lines(self.cast, chapter_hash)
         if lines is None:
             logger.warning("OpenAI: this chapter is not in the cast (text changed or chapter not analysed); "

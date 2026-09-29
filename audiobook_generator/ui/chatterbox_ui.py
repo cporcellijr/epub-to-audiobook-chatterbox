@@ -1145,7 +1145,29 @@ def _cast_summary(cast: dict, auto_pick: bool = False) -> str:
         parts.append(f"profiles stopped early ({cast['profile_error']})")
     text = " · ".join(parts) + (". Click a character to see who they are." if auto_pick else
                                 ". Click a character to see who they are, then **Add this book to queue**.")
-    return text + "\n\n" + book_tone_text(cast) if cast.get("book_tone") else text
+    text = text + "\n\n" + book_tone_text(cast) if cast.get("book_tone") else text
+    tellers = story_tellers_text(cast)
+    return text + "  \n" + tellers if tellers else text
+
+
+def story_tellers_text(cast: dict) -> str:
+    """The first-person stories another character tells, each narrated in the teller's own voice
+    (cast.chapter_narrator_voice); "" when there are none."""
+    told: Dict[str, List[int]] = {}
+    for entry in (cast.get("chapters") or {}).values():
+        key = entry.get("narrator")
+        if key and key != cast_store.pov_character(cast) and key in cast.get("characters", {}):
+            told.setdefault(key, []).append(entry.get("number", 0))
+    if not told:
+        return ""
+    parts = []
+    for key, numbers in sorted(told.items(), key=lambda kv: min(kv[1])):
+        character = cast["characters"][key]
+        voice = character.get("voice")
+        chapters = ", ".join(str(n) for n in sorted(numbers))
+        parts.append(f"{character.get('name', key)} (chapter{'s' if len(numbers) > 1 else ''} {chapters}, "
+                     f"{os.path.splitext(voice)[0] if voice else 'the narrator voice'})")
+    return "**First-person stories, each narrated by its teller's voice:** " + "; ".join(parts)
 
 
 def _unnamed_narrator(name: str) -> bool:
