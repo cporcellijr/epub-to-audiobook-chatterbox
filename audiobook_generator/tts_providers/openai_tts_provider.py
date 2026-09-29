@@ -619,15 +619,17 @@ class OpenAITTSProvider(BaseTTSProvider):
             return lambda piece: dialogue_voice if piece.kind == DIALOGUE else narrator
         # Attributions are keyed by the chapter text's hash (the same hash the chapter manifest
         # uses), so they survive renumbering and a different chapter selection.
-        lines = cast_store.chapter_lines(self.cast, hashlib.sha1(text.encode("utf-8")).hexdigest())
+        chapter_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        lines = cast_store.chapter_lines(self.cast, chapter_hash)
         if lines is None:
             logger.warning("OpenAI: this chapter is not in the cast (text changed or chapter not analysed); "
                            "every quoted line gets the dialogue voice")
             lines = {}
 
-        # In a first-person book the "I" character's own lines are the narrator's too, as one
-        # performer would read them (unless the owner gave that character a voice of their own).
-        narrating = cast_store.narrating_character(self.cast)
+        # In a first-person chapter the "I" character's own lines are the narrator's too, as one
+        # performer would read them (unless the owner gave that character a voice of their own). An
+        # anthology can change narrator, or point of view, from story to story.
+        narrating = cast_store.chapter_narrator(self.cast, chapter_hash)
 
         def voice_of(piece: Segment) -> str:
             if piece.kind != DIALOGUE:
@@ -639,11 +641,18 @@ class OpenAITTSProvider(BaseTTSProvider):
         return voice_of
 
     def _speaker_of(self, text: str) -> SpeakerOf:
-        """The cast key behind each dialogue unit, kept even when voices are shared."""
+        """The cast key behind each dialogue unit, kept even when voices are shared; None for the
+        chapter's first-person narrator, whose lines take the narrator's own delivery."""
         if self.cast is None:
             return lambda piece: None
-        lines = cast_store.chapter_lines(self.cast, hashlib.sha1(text.encode("utf-8")).hexdigest()) or {}
-        return lambda piece: lines.get(piece.line_id) if piece.kind == DIALOGUE else None
+        chapter_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        lines = cast_store.chapter_lines(self.cast, chapter_hash) or {}
+        narrating = cast_store.chapter_narrator(self.cast, chapter_hash)
+
+        def speaker_of(piece: Segment) -> Optional[str]:
+            speaker = lines.get(piece.line_id) if piece.kind == DIALOGUE else None
+            return None if speaker and speaker == narrating else speaker
+        return speaker_of
 
     def _mood_of(self, text: str) -> MoodOf:
         """The per-segment mood rule for one chapter (adaptive delivery): narration is always

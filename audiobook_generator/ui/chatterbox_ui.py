@@ -1125,7 +1125,7 @@ def resuggest_cast_voices(cast_key: Optional[str], engine: str, narrator_voice: 
     return (gr.update(value=rows, visible=True), keys, message, *_narrator_updates(suggestion))
 
 
-def _cast_summary(cast: dict) -> str:
+def _cast_summary(cast: dict, auto_pick: bool = False) -> str:
     stats = cast.get("stats", {})
     lines, unknown = int(stats.get("lines", 0)), int(stats.get("unknown_lines", 0))
     known = lines - unknown
@@ -1143,7 +1143,8 @@ def _cast_summary(cast: dict) -> str:
         parts.append(f"{stats['profiles']} character profile{'' if stats['profiles'] == 1 else 's'}")
     if cast.get("profile_error"):
         parts.append(f"profiles stopped early ({cast['profile_error']})")
-    text = " · ".join(parts) + ". Click a character to see who they are, then **Add this book to queue**."
+    text = " · ".join(parts) + (". Click a character to see who they are." if auto_pick else
+                                ". Click a character to see who they are, then **Add this book to queue**.")
     return text + "\n\n" + book_tone_text(cast) if cast.get("book_tone") else text
 
 
@@ -1213,7 +1214,7 @@ def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional
     cast = _fill_missing_voices(cast, path, engine, suggestion["voice"] if suggestion else narrator_voice)
     rows, keys = cast_rows(cast, engine)
     stamp[1] = os.path.getmtime(path)  # the fills may just have saved
-    return gr.update(value=rows, visible=True), keys, _cast_summary(cast), stamp
+    return gr.update(value=rows, visible=True), keys, _cast_summary(cast, auto_pick), stamp
 
 
 def cast_panel_update(cast_key: Optional[str], engine: str, narrator_voice: Optional[str], seen: Optional[list],
@@ -1365,6 +1366,85 @@ def analysis_settings(library_book, input_file, chapter_table, engine: str, voic
     }
 
 
+def book_options_for_later(library_book, chapter_table, stats: list, output_dir: str, voice: str, speed: float,
+                           sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
+                           output_text: bool, engine: str, paced_unit_mode: str, dialogue_voice: Optional[str],
+                           adaptive_delivery: bool, exaggeration: float, cfg_weight: float, temperature: float,
+                           active_jobs: Optional[List[dict]] = None) -> dict:
+    """With Auto-pick on, the Make tab's book options go with the cast analysis so the book joins
+    the queue once its cast is ready (queue_book_after_cast). What can already be checked is
+    checked now, while the owner is at the page."""
+    if not dialogue_voice:
+        raise gr.Error("Pick a dialogue voice (it speaks quoted lines, and any speaker the cast doesn't know).")
+    output_dir = (output_dir or "").strip()
+    if not output_dir:
+        raise gr.Error("Set an output folder.")
+    if not _within_root(output_dir, OUTPUT_ROOT):
+        raise gr.Error(f"Output folder must be inside '{OUTPUT_ROOT}'.")
+    _refuse_if_output_dir_unavailable(output_dir, bool(skip_existing), active_jobs or [])
+    return {
+        "from_library": bool(library_book), "output_dir": output_dir, "voice": voice, "speed": float(speed),
+        "sentence_pause": float(sentence_pause), "paragraph_pause": float(paragraph_pause),
+        "output_m4b": bool(output_m4b), "skip_existing": bool(skip_existing), "output_text": bool(output_text),
+        "paced_unit_mode": paced_unit_mode or "sentence", "dialogue_voice": dialogue_voice,
+        "adaptive_delivery": bool(adaptive_delivery), "exaggeration": exaggeration, "cfg_weight": cfg_weight,
+        "temperature": temperature, "estimate_seconds": generation_estimate(chapter_table, stats, engine or "chatterbox"),
+    }
+
+
+def queue_book_after_cast(queue: JobQueue, job: dict) -> Optional[str]:
+    """JobQueue.on_done: a cast analysis started with Auto-pick on puts its book in the queue as
+    soon as the cast is ready, with the narrator and delivery the book's tone asks for (as the page
+    would set them) and every other option as the Make tab stood at Analyse. The book waits for
+    Start queued books like any other. Returns the analysis job's note."""
+    later = job["settings"].get("then_queue")
+    if job_kind(job) != CAST or not later:
+        return None
+    s = job["settings"]
+    engine = s.get("engine") or "chatterbox"
+    try:
+        path, cast = _finished_cast(s.get("cast_key"))
+        suggestion = _fill_narrator_suggestion(cast, path, engine, later["voice"])
+        voice = suggestion["voice"] if suggestion else later["voice"]
+        _fill_missing_voices(cast, path, engine, voice)
+        source = suggestion or later
+        book_settings = queue_settings(
+            s["input_file"] if later["from_library"] else None, s["input_file"],
+            [[n, True] for n in s["chapter_selection"]], later["output_dir"], voice, later["speed"],
+            later["sentence_pause"], later["paragraph_pause"], later["output_m4b"], later["skip_existing"],
+            later["output_text"], s["title_mode"], s["newline_mode"], s["remove_endnotes"],
+            s["remove_reference_numbers"], s.get("search_and_replace_file"), s.get("log_level") or "INFO",
+            later["paced_unit_mode"], engine, VOICE_MODE_CAST, later["dialogue_voice"], s["cast_key"],
+            later["adaptive_delivery"], source["exaggeration"], source["cfg_weight"], source["temperature"],
+            active_jobs=queue.jobs())
+    except gr.Error as e:
+        message = getattr(e, "message", None) or str(e)
+        logger.warning(f"Queue: '{job['title']}' is ready but its book was not queued: {message}")
+        return f"book not queued: {message}"
+    title = os.path.basename(book_settings["output_dir"].rstrip("/\\")) or "Book"
+    queue.add(title, book_settings, len(book_settings["chapter_selection"]), later["estimate_seconds"], voice)
+    logger.info(f"Queue: cast ready, added '{title}' (waits for Start queued books)")
+    return "book added to the queue"
+
+
+def _book_on_its_way(job: dict) -> bool:
+    """A waiting book, or an analysis that will add its book to the queue when it finishes."""
+    if job_kind(job) == BOOK:
+        return job["status"] == QUEUED
+    return job["status"] in (QUEUED, RUNNING) and bool(job["settings"].get("then_queue"))
+
+
+def start_available(queue: JobQueue) -> bool:
+    """Start queued books shows while books are held, including ones whose analysis is still
+    running: pressing it early lets each book start once every analysis is done."""
+    return queue.preparing and any(_book_on_its_way(job) for job in queue.jobs())
+
+
+def enqueue_button_update(voice_mode: str, auto_pick: bool) -> dict:
+    """Add to queue is hidden in Cast mode with Auto-pick on: the book joins the queue by itself."""
+    return gr.update(visible=not (voice_mode == VOICE_MODE_CAST and auto_pick))
+
+
 def analysis_estimate(table, stats: list) -> float:
     """Seconds the LLM pass is guessed to take for the ticked chapters (ANALYSIS_SECONDS_PER_LINE)."""
     stats = stats or []
@@ -1407,8 +1487,8 @@ def _status_label(job: dict) -> str:
         return f"▶ {verb} · {JobQueue.chapters_done(job)} of {job['chapters']} chapters done"
     if job["status"] == QUEUED:
         return f"waiting{note}"
-    if job["status"] == DONE:
-        return f"✓ done {job['finished']}"
+    if job["status"] == DONE:  # a cast analysis says whether its book joined the queue
+        return f"✓ done {job['finished']}" + (note if job_kind(job) == CAST else "")
     if job["status"] == FAILED:
         return f"✗ failed{note}"
     return f"■ stopped{note}"
@@ -1448,7 +1528,8 @@ def queue_view(queue: JobQueue) -> tuple:
             left += job["estimate_seconds"] * (1 - JobQueue.chapters_done(job) / max(1, job["chapters"]))
     to_go = sum(1 for job in jobs if job["status"] in (QUEUED, RUNNING))
     if not jobs and not queue.preparing:
-        status = "The queue is empty. Pick a book, choose its voice, then **Add this book to queue**."
+        status = ("The queue is empty. Pick a book, then **Analyse selected chapters** (Cast mode) or "
+                  "**Add this book to queue**.")
     elif queue.paused:
         status = f"⏸ **Queue paused** · {to_go} job(s) waiting. Press **Resume queue** to continue."
     elif queue.preparing:
@@ -1457,6 +1538,10 @@ def queue_view(queue: JobQueue) -> tuple:
             status = (f"🎭 **Preparing casts** · {waiting_books} book(s) waiting. "
                       "Analyse and add any other books, then press **Start queued books**. "
                       "A book already generating will finish first.")
+        elif any(job_kind(job) == CAST and job["status"] in (QUEUED, RUNNING) and job["settings"].get("then_queue")
+                 for job in jobs):
+            status = ("🎭 **Preparing casts** · each book joins the queue when its analysis finishes. Pick more "
+                      "books, or press **Start queued books** once you're done picking.")
         else:
             status = ("🎭 **Preparing cast** · choose voices when analysis finishes, "
                       "then press **Add this book to queue**.")
@@ -1683,9 +1768,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
 
     def refresh_queue() -> tuple:
         rows, ids, status = queue_view(queue)
-        can_start = queue.preparing and any(job_kind(job) == BOOK and job["status"] == QUEUED
-                                            for job in queue.jobs())
-        return gr.update(value=rows), ids, status, gr.update(visible=can_start)
+        return gr.update(value=rows), ids, status, gr.update(visible=start_available(queue))
 
     def enqueue(library_book, input_file, chapter_table, stats, *settings) -> tuple:
         job_settings = queue_settings(library_book, input_file, chapter_table, *settings, active_jobs=queue.jobs())
@@ -1699,10 +1782,13 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                  ("." if position <= 1 else f" (#{position} in line).")))
         return refresh_queue()
 
-    def queue_analysis(library_book, input_file, chapter_table, stats, engine, voice, title_mode, newline_mode,
+    def queue_analysis(library_book, input_file, chapter_table, stats, output_dir, voice, speed, sentence_pause,
+                       paragraph_pause, output_m4b, skip_existing, output_text, title_mode, newline_mode,
                        remove_endnotes, remove_reference_numbers, search_and_replace_file, log_level,
-                       auto_pick_voices) -> tuple:
-        """Analyse this cast before generating queued books; a running book finishes first."""
+                       paced_unit_mode, engine, voice_mode, dialogue_voice, cast_key, adaptive_delivery,
+                       exaggeration, cfg_weight, temperature, auto_pick_voices) -> tuple:
+        """Analyse this cast before generating queued books; a running book finishes first. With
+        Auto-pick on, the book follows its analysis into the queue (queue_book_after_cast)."""
         job_settings = analysis_settings(library_book, input_file, chapter_table, engine, voice, title_mode,
                                          newline_mode, remove_endnotes, remove_reference_numbers,
                                          search_and_replace_file, log_level, auto_pick_voices)
@@ -1710,14 +1796,31 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             if (job_kind(job) == CAST and job["status"] in (QUEUED, RUNNING)
                     and job["settings"].get("cast_key") == job_settings["cast_key"]):
                 raise gr.Error("This book's cast analysis is already in the queue.")
+        if auto_pick_voices:
+            job_settings["then_queue"] = book_options_for_later(
+                library_book, chapter_table, stats, output_dir, voice, speed, sentence_pause, paragraph_pause,
+                output_m4b, skip_existing, output_text, engine, paced_unit_mode, dialogue_voice,
+                adaptive_delivery, exaggeration, cfg_weight, temperature, active_jobs=queue.jobs())
         book = job_settings["input_file"]
         title = f"Cast: {library_index.book_title(book, library_index.load_index()) or os.path.basename(book)}"
-        queue.set_preparing(True)
+        # Books already started keep going (this analysis runs after the current one, and its book
+        # joins them); otherwise a new batch begins and its books wait for Start queued books.
+        started = not queue.preparing and any(job_kind(job) == BOOK and job["status"] in (QUEUED, RUNNING)
+                                              for job in queue.jobs())
+        if not started:
+            queue.set_preparing(True)
         queue.set_paused(False)
         queue.add(title, job_settings, len(job_settings["chapter_selection"]),
                   analysis_estimate(chapter_table, stats), voice, kind=CAST)
         queue.tick()
-        gr.Info("Cast analysis queued. Audiobook jobs will wait until you start them.")
+        if started:
+            gr.Info("Cast analysis queued after the current book; " +
+                    ("this book then joins the books already started." if auto_pick_voices else
+                     "add the book to the queue when it's ready."))
+        else:
+            gr.Info("Cast analysis queued; the book joins the queue when its cast is ready. Audiobook jobs wait "
+                    "until you start them." if auto_pick_voices else
+                    "Cast analysis queued. Audiobook jobs will wait until you start them.")
         return (*refresh_queue(), job_settings["cast_key"],
                 "⏳ Cast analysis queued. This panel updates as it runs.")
 
@@ -1807,12 +1910,14 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                             interactive=False, visible=False)
                     speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed",
                                       info="1.0 recommended (other speeds are stretched after generation).")
+            # Cast is the default whenever an LLM is configured (without one it isn't offered).
+            initial_mode = VOICE_MODE_CAST if llm_configured() else VOICE_MODE_SINGLE
             with gr.Row(equal_height=True):
-                voice_mode = gr.Radio(voice_mode_choices(), value=VOICE_MODE_SINGLE, label="Voice mode", scale=2,
+                voice_mode = gr.Radio(voice_mode_choices(), value=initial_mode, label="Voice mode", scale=2,
                                       info="Single voice reads everything as before. The other modes give quoted "
                                            "lines their own voice; Cast asks the local LLM who speaks each line.")
                 dialogue_voice = gr.Dropdown(choices, value=default_voice, label="Dialogue voice", scale=1,
-                                             allow_custom_value=True, visible=False,
+                                             allow_custom_value=True, visible=initial_mode != VOICE_MODE_SINGLE,
                                              info="Quoted lines (in cast mode: lines whose speaker is unknown).")
             with gr.Row(equal_height=True):
                 adaptive_delivery = gr.Checkbox(
@@ -1857,10 +1962,11 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                          "on a server this fast.")
                 search_and_replace_file = gr.File(label="Search & replace file (optional, e.g. fix pronunciations)",
                                                   file_types=[".txt"], file_count="single")
-            with gr.Column(visible=False) as cast_panel:
-                gr.Markdown("**Cast workflow:** Choose chapters above → analyse cast → add this book to queue. "
-                            "The narrator, every character's voice and their delivery are picked for you. Repeat "
-                            "for another book, then start the queued books.")
+            with gr.Column(visible=initial_mode == VOICE_MODE_CAST) as cast_panel:
+                gr.Markdown("**Cast workflow:** Choose chapters above → analyse cast. The narrator, every "
+                            "character's voice and their delivery are picked for you, and the book joins the "
+                            "queue once its cast is ready. Repeat for another book, then start the queued books. "
+                            "To review a cast before queuing, untick Auto-pick under *Adjust the cast*.")
                 with gr.Row(equal_height=True):
                     analyse_button = gr.Button("🎭 Analyse selected chapters", scale=0, min_width=210)
                     cast_status = gr.Markdown("Choose chapters above, then press **Analyse selected chapters**.")
@@ -1875,8 +1981,8 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                     with gr.Row(equal_height=True):
                         auto_pick_voices = gr.Checkbox(
                             True, label="Auto-pick suggested voices", scale=0, min_width=230,
-                            info="Picks the narrator and delivery from the book's tone when a cast is shown, and "
-                                 "re-analysing keeps only voices you saved here.")
+                            info="Picks the narrator and delivery from the book's tone, queues the book as soon "
+                                 "as its cast is ready, and re-analysing keeps only voices you saved here.")
                         resuggest_button = gr.Button("🎯 Suggest voices again", scale=0, min_width=190)
                     resuggest_confirmed = gr.Checkbox(False, visible=False)
                     with gr.Row(equal_height=True):
@@ -1891,12 +1997,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 cast_keys_state = gr.State([])
                 cast_selected = gr.State(None)
                 cast_seen = gr.State(None)
-            enqueue_button = gr.Button("➕ Add this book to queue", variant="primary")
+            enqueue_button = gr.Button("➕ Add this book to queue", variant="primary",
+                                       visible=initial_mode != VOICE_MODE_CAST)  # Auto-pick starts on
             with gr.Accordion("Queue", open=True):
                 queue_status = gr.Markdown()
-                can_start = queue.preparing and any(job_kind(job) == BOOK and job["status"] == QUEUED
-                                                    for job in queue.jobs())
-                start_books_button = gr.Button("▶ Start queued books", variant="primary", visible=can_start)
+                start_books_button = gr.Button("▶ Start queued books", variant="primary",
+                                               visible=start_available(queue))
                 queue_table = gr.Dataframe(headers=QUEUE_COLUMNS, interactive=False, wrap=True, label="Books",
                                            column_widths=["5%", "33%", "14%", "9%", "27%", "12%"])
                 queue_ids = gr.State([])
@@ -2002,11 +2108,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         cast_key_state.change(cast_panel_update, inputs=cast_view_inputs, outputs=cast_view_outputs)
         voice_mode.change(voice_mode_changed, inputs=voice_mode, outputs=[dialogue_voice, cast_panel]) \
             .then(refresh_cast, inputs=[voice_mode, *cast_view_inputs], outputs=cast_view_outputs)
+        for control in (voice_mode, auto_pick_voices):
+            control.change(enqueue_button_update, inputs=[voice_mode, auto_pick_voices], outputs=enqueue_button)
         queue_timer.tick(refresh_cast, inputs=[voice_mode, *cast_view_inputs], outputs=cast_view_outputs)
         analyse_button.click(queue_analysis,
-                             inputs=[library_book, input_file, chapter_table, chapter_stats_state, engine, voice,
-                                     title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
-                                     search_and_replace_file, log_level, auto_pick_voices],
+                             inputs=[library_book, input_file, chapter_table, chapter_stats_state, *settings,
+                                     auto_pick_voices],
                              outputs=[*queue_outputs, cast_key_state, cast_status])
         # A browser-only confirm sets the hidden checkbox, then the handler reads it: state values
         # don't pass through a js step reliably, and a cancel must change nothing.
@@ -2107,6 +2214,7 @@ def host_ui(config) -> None:
     # its first log line (F-19). Spawn starts each job in a fresh interpreter instead.
     queue = JobQueue(QUEUE_FILE, build_config, lambda: str(web_ui.webui_log_file.absolute()),
                      process_factory=multiprocessing.get_context("spawn").Process, uploads_dir=QUEUE_UPLOADS)
+    queue.on_done = lambda job: queue_book_after_cast(queue, job)
     sweep_orphaned_uploads(queue)
     ui = build_ui(queue)
     queue.start_worker()

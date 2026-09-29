@@ -64,7 +64,11 @@ class JobQueue:
                  process_factory: Callable[..., object] = multiprocessing.Process, uploads_dir: str = "",
                  engine_ready: Callable[[dict], bool] = None):
         """engine_ready(settings) says whether a book may start now (default: not while Chatterbox
-        reports its model unloaded after a cast analysis; see core.chatterbox_control)."""
+        reports its model unloaded after a cast analysis; see core.chatterbox_control).
+
+        on_done(job), when set, is called with a copy of each job that finishes successfully (the
+        web UI queues a book after its cast analysis); a string it returns becomes the job's note."""
+        self.on_done: Optional[Callable[[dict], Optional[str]]] = None
         self.path = path
         self.uploads_dir = os.path.abspath(uploads_dir) if uploads_dir else ""
         self._build_config = build_config
@@ -265,8 +269,7 @@ class JobQueue:
             self._data["preparing"] = bool(preparing)
             self._save()
 
-    @staticmethod
-    def _finish_from_exitcode(job: dict, exitcode: int) -> None:
+    def _finish_from_exitcode(self, job: dict, exitcode: int) -> None:
         """DONE/FAILED bookkeeping for a job whose process has actually exited: shared by tick()
         and by a stop_current() that raced a book which had already finished (F-28)."""
         job["status"] = DONE if exitcode == 0 else FAILED
@@ -274,6 +277,14 @@ class JobQueue:
         if job["status"] == FAILED:
             job["note"] = ("failed; see the log" if job_kind(job) == CAST
                            else "failed; see the log (Retry keeps finished chapters)")
+        elif self.on_done:
+            try:
+                note = self.on_done(dict(job))
+            except Exception as e:
+                logger.exception(f"Queue: after '{job['title']}': {e}")
+                note = "done; see the log"
+            if note:
+                job["note"] = note
 
     def stop_current(self) -> bool:
         """Stop the running book and pause the queue (Resume starts the next one)."""
@@ -316,8 +327,12 @@ class JobQueue:
                 self._save()
             if self.paused:
                 return
-            job = next((j for j in self._data["jobs"] if j["status"] == QUEUED
-                        and (not self.preparing or job_kind(j) == CAST)), None)
+            # Cast analyses go ahead of every waiting book, so all the picked books are analysed (and
+            # join the queue) before the long generating starts, however early Start was pressed.
+            waiting = [j for j in self._data["jobs"] if j["status"] == QUEUED]
+            job = next((j for j in waiting if job_kind(j) == CAST), None)
+            if job is None and not self.preparing:
+                job = next(iter(waiting), None)
             if job is None:
                 return
             if job_kind(job) == CAST:

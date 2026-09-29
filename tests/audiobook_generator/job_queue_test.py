@@ -327,6 +327,25 @@ class TestCastJobs(unittest.TestCase):
         self.queue.tick()
         self.assertEqual([j["status"] for j in self.queue.jobs()], [DONE, RUNNING])
 
+    def test_on_done_follows_a_finished_job_and_its_note_is_kept(self):
+        seen = []
+        self.queue.on_done = lambda job: seen.append(job["title"]) or "book added to the queue"
+        self.queue.add("Cast: Book", self._cast_settings(), 2, 30, "Elena.wav", kind=CAST)
+        self.queue.add("Cast: Failed", self._cast_settings(), 2, 30, "Elena.wav", kind=CAST)
+        self.queue.tick()
+        FakeProcess.instances[0].finish(0)
+        self.queue.tick()
+        FakeProcess.instances[1].finish(1)
+        self.queue.tick()
+        self.assertEqual(seen, ["Cast: Book"])  # never for a failed job
+        self.assertEqual(self.queue.jobs()[0]["note"], "book added to the queue")
+        self.queue.on_done = lambda job: 1 / 0  # a broken follow-up never breaks the queue
+        self.queue.add("Cast: Again", self._cast_settings(), 2, 30, "Elena.wav", kind=CAST)
+        self.queue.tick()
+        FakeProcess.instances[2].finish(0)
+        self.queue.tick()
+        self.assertEqual((self.queue.jobs()[2]["status"], self.queue.jobs()[2]["note"]), (DONE, "done; see the log"))
+
     def test_prepare_runs_casts_ahead_of_held_books_until_start(self):
         self.queue.set_preparing(True)
         self.queue.add("Book 1", _settings(os.path.join(self.tmp.name, "B1")), 3, 600, "Elena.wav")
@@ -347,6 +366,20 @@ class TestCastJobs(unittest.TestCase):
         self.queue.tick()
         self.assertIs(FakeProcess.instances[2].target, run_job)
         self.assertEqual(self.queue.jobs()[0]["status"], RUNNING)
+
+    def test_after_start_every_analysis_still_runs_before_the_next_book(self):
+        # Start pressed while analyses are still lined up: a book added ahead of a later analysis
+        # (its own cast finished first) must not start before that analysis.
+        self.queue.add("Cast 1", self._cast_settings(), 2, 30, "Elena.wav", kind=CAST)
+        self.queue.add("Book 1", _settings(os.path.join(self.tmp.name, "B1")), 3, 600, "Elena.wav")
+        self.queue.add("Cast 2", dict(self._cast_settings(), cast_key="k2"), 2, 30, "Elena.wav", kind=CAST)
+        self.queue.tick()
+        FakeProcess.instances[0].finish()
+        self.queue.tick()
+        self.assertEqual(FakeProcess.instances[1].args[0]["cast_key"], "k2")
+        FakeProcess.instances[1].finish()
+        self.queue.tick()
+        self.assertIs(FakeProcess.instances[2].target, run_job)
 
     def _restarted_queue(self):
         return JobQueue(self.path, lambda **s: s, lambda: "/app/log.txt", process_factory=FakeProcess,

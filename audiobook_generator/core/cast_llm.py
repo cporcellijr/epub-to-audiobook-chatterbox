@@ -39,7 +39,42 @@ LLM_TEMPERATURE = 0.0
 # measured not to cost accuracy.
 ASK_LLM_FOR_MOODS = False
 
-UNKNOWN_SPEAKER_WORDS = frozenset({"", "unknown", "narrator", "none", "n/a", "?", "nobody", "unclear"})
+# A pronoun names no one: "he" as a speaker is an unknown speaker ("I" stays a speaker: in a
+# first-person book the model uses it for the narrator, whom the attribution then keeps apart).
+_PRONOUNS = frozenset({"he", "she", "they", "him", "her", "them", "you", "we", "us", "it", "his", "hers",
+                       "their", "theirs", "your", "yours", "our", "ours", "one", "someone", "somebody"})
+UNKNOWN_SPEAKER_WORDS = frozenset({"", "unknown", "narrator", "none", "n/a", "?", "nobody", "unclear"}) | _PRONOUNS
+# Never an alias: what anyone may be called (seen live: "he", "honey" and "child" as aliases of one
+# character), which would hand that character every line the model answers with the word. Family
+# words (Mom, Dad) stay: within a story they name one person.
+_NOT_ALIASES = _PRONOUNS | frozenset({
+    "the", "a", "an", "honey", "hon", "baby", "babe", "sweetie", "sweetheart", "darling", "dear", "love",
+    "sugar", "child", "kid", "kids", "boy", "girl", "man", "woman", "guy", "lady", "gentleman", "stranger",
+    "friend", "buddy", "dude", "everyone", "everybody", "sir", "ma'am", "maam", "miss",
+})
+_POSSESSIVES = frozenset({"his", "her", "their", "my", "your", "our", "its"})
+
+
+# What a family calls its members: a name only within one story (Roster keeps it per chapter).
+_FAMILY_WORDS = frozenset({
+    "mom", "mum", "mother", "ma", "mama", "mamma", "mommy", "mummy", "momma", "dad", "daddy", "father", "pa",
+    "papa", "pop", "pops", "grandma", "grandpa", "granny", "gran", "grandmother", "grandfather", "nana",
+    "grandad", "granddad", "step", "stepmom", "stepmother", "stepdad", "stepfather", "son", "daughter",
+    "sis", "bro", "brother", "sister", "aunt", "auntie", "uncle", "cousin", "wife", "husband", "hubby",
+})
+
+
+def family_word(alias: str) -> bool:
+    """True for "Mom", "Step Mom", "Grandpa": what a family calls someone, not their name."""
+    words = normalize_name(alias).split() or (alias or "").lower().split()
+    return bool(words) and all(w in _FAMILY_WORDS for w in words)
+
+
+def usable_alias(alias: str) -> bool:
+    """False for a word anyone may be called (a pronoun, a pet name, "the woman") and for a
+    description by someone else's relation to them ("his mom"): only names become aliases."""
+    words = normalize_name(alias).split()
+    return bool(words) and words[0] not in _POSSESSIVES and not all(w in _NOT_ALIASES for w in words)
 
 PROMPTS = {
     "system": (
@@ -339,16 +374,26 @@ class Roster:
     Merging is deliberately conservative: a bare surname ("Mrs. Marsh" next to "Ada Marsh") is
     never merged by code, since a family shares it, and neither are two people of different known
     genders; a wrong merge gives a main character the wrong voice, while a split just shows two
-    rows the owner can give the same voice. The prompt asks the model for aliases, which do merge."""
+    rows the owner can give the same voice. The prompt asks the model for aliases, which do merge.
+
+    A family word ("Mom", "Dad", "Grandpa") names one person only within a chapter: in a collection
+    every story has its own mother (seen live: every "Mom" of six stories merged into one), so such
+    an alias lasts until new_chapter() and is never saved with the character."""
 
     def __init__(self, characters: Optional[Dict[str, dict]] = None):
         self.characters: Dict[str, dict] = {}
         self.aliases: Dict[str, str] = {}  # normalized alias -> key
+        self.chapter_aliases: Dict[str, str] = {}  # family words, this chapter only
         for key, character in (characters or {}).items():
             self.characters[key] = dict(character)
             self.aliases[key] = key
             for alias in character.get("aliases", []):
-                self.aliases[normalize_name(alias)] = key
+                if not family_word(alias):
+                    self.aliases[normalize_name(alias)] = key
+
+    def new_chapter(self) -> None:
+        """Forget the family-word aliases of the chapter before."""
+        self.chapter_aliases = {}
 
     def names_for_prompt(self) -> List[str]:
         return [c["name"] for _, c in sorted(self.characters.items(), key=lambda kv: -kv[1].get("lines", 0))]
@@ -380,6 +425,8 @@ class Roster:
         norm = normalize_name(name)
         if not norm:
             return None
+        if norm in self.chapter_aliases:  # this chapter's "Mom" before anyone else's
+            return self.chapter_aliases[norm]
         if norm in self.aliases:
             return self.aliases[norm]
         candidates = [k for k in self._candidates(norm)
@@ -417,6 +464,13 @@ class Roster:
         norm = normalize_name(alias)
         if not norm or self.aliases.get(norm) not in (None, key):
             return  # an alias already owned by another character stays theirs
+        own_name = norm == normalize_name(self.characters[key]["name"])
+        if not usable_alias(alias) and not own_name:
+            return  # "he", "honey", "his mom": not a name
+        if family_word(alias) and not own_name:
+            if self.chapter_aliases.get(norm) in (None, key):
+                self.chapter_aliases[norm] = key
+            return
         self.aliases[norm] = key
         character = self.characters[key]
         listed = {normalize_name(character["name"])} | {normalize_name(a) for a in character["aliases"]}
@@ -461,6 +515,7 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
     unusable), invalid_after_retry (windows whose retry was unusable too), lines, tagged_lines,
     unknown_lines, seconds.
     """
+    roster.new_chapter()  # "Mom" in this chapter may be someone else's mother
     result: Dict[int, Optional[str]] = {}
     llm_moods: Dict[int, str] = {}
     for field in ("windows", "invalid_json", "invalid_after_retry", "lines", "tagged_lines", "unknown_lines"):

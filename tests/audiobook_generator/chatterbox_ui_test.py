@@ -1593,6 +1593,77 @@ class TestCastPanel(unittest.TestCase):
         off = chatterbox_ui.cast_panel_update("k", "chatterbox", "Elena.wav", None, False)
         self.assertEqual(list(off[4:]), [gr.update()] * 4)
 
+    def _analysis_job(self, **later):
+        options = {"from_library": True, "output_dir": os.path.join(chatterbox_ui.OUTPUT_ROOT, "Book"),
+                   "voice": "Elena.wav", "speed": 1.0, "sentence_pause": 0.35, "paragraph_pause": 0.9,
+                   "output_m4b": True, "skip_existing": False, "output_text": False, "paced_unit_mode": "sentence",
+                   "dialogue_voice": "Cal.wav", "adaptive_delivery": True, "exaggeration": 0.5, "cfg_weight": 0.5,
+                   "temperature": 0.8, "estimate_seconds": 600}
+        options.update(later)
+        return {"kind": "cast", "title": "Cast: T", "settings": {
+            "input_file": "/library/book.epub", "chapter_selection": [1], "title_mode": "auto",
+            "newline_mode": "double", "remove_endnotes": False, "remove_reference_numbers": False,
+            "search_and_replace_file": None, "engine": "chatterbox", "log_level": "INFO", "cast_key": "k",
+            "then_queue": options}}
+
+    def _after_cast(self, job, active_jobs=()):
+        queue = MagicMock()
+        queue.jobs.return_value = list(active_jobs)
+        with patch.object(chatterbox_ui, "read_saved_settings",
+                          return_value={"exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61}), \
+                patch.object(chatterbox_ui, "cast_coverage_gaps", return_value=[]), \
+                patch("os.path.isfile", side_effect=lambda p: p == "/library/book.epub" or os.path.exists(p)):
+            return chatterbox_ui.queue_book_after_cast(queue, job), queue
+
+    def test_auto_pick_queues_the_book_once_its_cast_is_ready_with_the_tones_narrator(self):
+        self._toned_cast()
+        note, queue = self._after_cast(self._analysis_job())
+        self.assertEqual(note, "book added to the queue")
+        title, settings, chapters, estimate, voice = queue.add.call_args.args
+        self.assertEqual((title, chapters, estimate, voice), ("Book", 1, 600, "Bea.wav"))
+        self.assertEqual((settings["voice_mode"], settings["voice"], settings["dialogue_voice"],
+                          settings["chapter_selection"], settings["input_file"]),
+                         ("cast", "Bea.wav", "Cal.wav", [1], "/library/book.epub"))
+        self.assertEqual((settings["delivery_exaggeration"], settings["delivery_cfg_weight"],
+                          settings["delivery_temperature"]), (0.83, 0.55, 0.61))
+        snapshot = self.cast_store.load_cast(settings["cast_file"])
+        self.assertEqual(snapshot["characters"]["anne"]["voice"], "Ada.wav")
+        chatterbox_ui.build_config(**settings)  # a book the queue can start
+
+    def test_without_auto_pick_or_with_a_clash_the_book_is_not_queued(self):
+        self._toned_cast()
+        job = self._analysis_job()
+        del job["settings"]["then_queue"]
+        note, queue = self._after_cast(job)
+        self.assertIsNone(note)
+        queue.add.assert_not_called()
+        taken = {"status": "queued", "title": "Other", "settings": {"output_dir": os.path.join(chatterbox_ui.OUTPUT_ROOT, "Book")}}
+        note, queue = self._after_cast(self._analysis_job(), [taken])
+        self.assertTrue(note.startswith("book not queued: "))
+        queue.add.assert_not_called()
+
+    def test_start_shows_while_an_auto_pick_analysis_will_bring_its_book(self):
+        queue = MagicMock()
+        queue.preparing = True
+        pending = {"kind": "cast", "status": "running", "settings": {"then_queue": {"voice": "Elena.wav"}}}
+        queue.jobs.return_value = [pending]
+        self.assertTrue(chatterbox_ui.start_available(queue))
+        queue.jobs.return_value = [dict(pending, settings={})]  # Auto-pick off: nothing to start yet
+        self.assertFalse(chatterbox_ui.start_available(queue))
+        queue.jobs.return_value = [{"kind": "book", "status": "queued", "settings": {}}]
+        self.assertTrue(chatterbox_ui.start_available(queue))
+        queue.preparing = False
+        self.assertFalse(chatterbox_ui.start_available(queue))
+
+    def test_add_to_queue_is_hidden_in_cast_mode_with_auto_pick(self):
+        self.assertFalse(chatterbox_ui.enqueue_button_update("cast", True)["visible"])
+        self.assertTrue(chatterbox_ui.enqueue_button_update("cast", False)["visible"])
+        self.assertTrue(chatterbox_ui.enqueue_button_update("single", True)["visible"])
+        job = {"id": "a", "kind": "cast", "title": "Cast: T", "voice": "Elena.wav", "chapters": 1,
+               "estimate_seconds": 1, "status": "done", "finished": "2026-09-29 10:00",
+               "note": "book added to the queue", "settings": {}}
+        self.assertIn("book added to the queue", chatterbox_ui._status_label(job))
+
     def test_sample_speaks_the_characters_first_line_with_their_delivery(self):
         self._toned_cast()
         with patch.object(chatterbox_ui, "preview_voice", return_value="/tmp/x.mp3") as preview:

@@ -105,6 +105,26 @@ def has_speech_tag(before: str, after: str) -> bool:
     return bool(_tag_after(after) or _tag_before(before) or _has_pronoun_tag(before, after))
 
 
+# First-person tags: '"...," I said.' / '"...," said I.' / 'I told her, "..."'
+_AFTER_I = re.compile(rf"^\s*[,;]?\s*(?:{_VERB}{_ADVERB}\s+I\b|I{_ADVERB}\s+{_VERB}\b)")
+_BEFORE_I = re.compile(rf"(?:^|[.!?]\s+|\s)I{_ADVERB}\s+{_VERB}\b[^\"“”.!?]{{0,20}}[,:]\s*$")
+
+
+def first_person_tagged(paragraphs: List[List[Segment]]) -> List[int]:
+    """Ids of the dialogue lines a first-person tag ("I said") gives to the narrator: whoever the
+    attribution names for them is the "I" of a first-person chapter."""
+    found = []
+    for segments in paragraphs:
+        for i, piece in enumerate(segments):
+            if piece.kind != DIALOGUE or piece.continues:
+                continue
+            before = segments[i - 1].text if i > 0 and segments[i - 1].kind == NARRATION else ""
+            after = segments[i + 1].text if i + 1 < len(segments) and segments[i + 1].kind == NARRATION else ""
+            if _AFTER_I.match(after) or _BEFORE_I.search(before):
+                found.append(piece.line_id)
+    return found
+
+
 def tagged_speakers(paragraphs: List[List[Segment]]) -> Dict[int, str]:
     """{line id: name} for every dialogue line whose speaker a speech tag names, plus the untagged
     quotations of a paragraph whose named tags all name the same person. Lines that continue a

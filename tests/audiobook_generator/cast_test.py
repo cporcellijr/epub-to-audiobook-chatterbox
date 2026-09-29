@@ -371,6 +371,17 @@ class TestFirstPerson(unittest.TestCase):
         cast["book_tone"]["point_of_view"] = "third"
         self.assertIsNone(cast_store.pov_character(cast))
 
+    def test_a_chapter_can_have_its_own_narrator_or_none(self):
+        cast = self._cast()
+        cast["chapters"] = {"old": {"number": 1, "lines": {}},
+                            "a": {"number": 2, "lines": {}, "point_of_view": "first", "narrator": "friend"},
+                            "b": {"number": 3, "lines": {}, "point_of_view": "third", "narrator": None}}
+        self.assertEqual(cast_store.chapter_narrator(cast, "old"), "me")  # analysed before chapters had one
+        self.assertEqual(cast_store.chapter_narrator(cast, "a"), "friend")
+        self.assertIsNone(cast_store.chapter_narrator(cast, "b"))
+        cast["characters"]["friend"]["voice_picked"] = True  # the owner's own voice for her wins
+        self.assertIsNone(cast_store.chapter_narrator(cast, "a"))
+
     def test_the_narrator_gets_no_suggested_voice_and_gives_one_back(self):
         cast = self._cast()
         self.assertEqual(cast_store.suggest_voices(cast, FEMALE, "Narrator.wav"), {"friend": "Deep.wav"})

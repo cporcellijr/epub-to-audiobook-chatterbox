@@ -452,15 +452,13 @@ def parse_tone(reply: str) -> dict:
     }
 
 
-def describe_book(cast: dict, chapters: List[ChapterText], chat: Chat, log: logging.Logger = logger) -> None:
-    """Ask the LLM once (and once more if the reply is unusable) how the book is narrated, from up to
-    TONE_MAX_CHARS of its dialogue-free paragraphs, and keep the answer in cast["book_tone"]. A
-    first-person narrator's name is matched to a cast character (cast["book_tone"]["pov_key"]).
-    Like the profiles, this never fails the analysis: any error leaves no book tone and is logged."""
+def _ask_tone(characters: Dict[str, dict], chapters: List[ChapterText], chat: Chat, log: logging.Logger,
+              label: str = "book") -> Optional[dict]:
+    """The LLM's description of how these chapters are narrated (asked once more if the reply is
+    unusable), its first-person narrator matched to a cast character as "pov_key"; None on failure."""
     passages = select_passages(narration_passages(chapters), TONE_MAX_CHARS, TONE_LEAD_PASSAGES)
     if not passages:
-        return
-    characters = cast.get("characters", {})
+        return None
     listed = [f"{characters[k].get('name', k)} ({characters[k].get('gender', 'unknown')})"
               for k in profile_candidates(characters, min_lines=1, limit=OTHERS_IN_PROMPT)]
     messages = [{"role": "system", "content": TONE_PROMPTS["system"]},
@@ -473,14 +471,139 @@ def describe_book(cast: dict, chapters: List[ChapterText], chat: Chat, log: logg
                 tone = parse_tone(chat(messages))
                 break
             except ProfileError as e:
-                log.warning(f"Cast: book tone reply unusable ({e})" + ("; asking again" if attempt == 1 else "; skipped"))
+                log.warning(f"Cast: {label} tone reply unusable ({e})" + ("; asking again" if attempt == 1 else "; skipped"))
         else:
-            return
+            return None
     except Exception as e:
-        log.warning(f"Cast: book tone not described: {e}")
-        return
+        log.warning(f"Cast: {label} tone not described: {e}")
+        return None
     if tone["pov_character"]:
         from audiobook_generator.core.cast_llm import Roster
         tone["pov_key"] = Roster(characters).resolve(tone["pov_character"])
-    cast["book_tone"] = tone
-    log.info(f"Cast: book tone: {tone}")
+    return tone
+
+
+# ---- who says "I", chapter by chapter ----
+
+# First-person words per 1,000 words of a chapter's narration (text outside quotation marks): the
+# first-person chapters of a real book measured 80-120; third-person narration uses "I" only in the
+# odd unquoted thought. A chapter with too little narration to tell follows its neighbours.
+FIRST_PERSON_PER_1000 = 20
+POV_MIN_NARRATION_WORDS = 150
+_FIRST_PERSON = re.compile(r"\b(?:I|me|my|mine|myself)\b|\bI[’'](?:m|d|ve|ll)\b")
+
+
+def chapter_point_of_view(chapter: ChapterText) -> Optional[str]:
+    """"first" or "third" from how often the chapter's narration says I/me/my; None when there is
+    too little narration to tell."""
+    narration = " ".join(s.text for paragraph in chapter.paragraphs for s in paragraph if s.kind == NARRATION)
+    words = len(narration.split())
+    if words < POV_MIN_NARRATION_WORDS:
+        return None
+    return "first" if len(_FIRST_PERSON.findall(narration)) * 1000 / words >= FIRST_PERSON_PER_1000 else "third"
+
+
+def _narration_words(chapter: ChapterText) -> int:
+    return sum(len(s.text.split()) for paragraph in chapter.paragraphs for s in paragraph if s.kind == NARRATION)
+
+
+def _stories(chapters: List[ChapterText], views: List[Optional[str]]) -> List[List[int]]:
+    """Runs of consecutive first-person chapters (indexes), each taken as one story with one "I". A
+    chapter too short to tell joins the run around it."""
+    filled = list(views)
+    for i, view in enumerate(filled):  # an undecided chapter follows the one before it (else after)
+        if view is None:
+            filled[i] = filled[i - 1] if i else next((v for v in views if v), None)
+    runs, current = [], []
+    for i, view in enumerate(filled):
+        if view == "first":
+            current.append(i)
+        elif current:
+            runs.append(current)
+            current = []
+    return runs + ([current] if current else [])
+
+
+def _voted_narrator(chapters: List[ChapterText]) -> Optional[str]:
+    """The character the attribution gave these chapters' "I said" lines to, when clear: at least
+    two such lines and more than half of them."""
+    from collections import Counter
+    from audiobook_generator.core.speech_tags import first_person_tagged
+    votes = Counter(chapter.lines.get(line_id) for chapter in chapters
+                    for line_id in first_person_tagged(chapter.paragraphs))
+    votes.pop(None, None)
+    if not votes:
+        return None
+    key, count = votes.most_common(1)[0]
+    return key if count >= 2 and count * 2 > sum(votes.values()) else None
+
+
+def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Optional[dict],
+                      chat: Optional[Chat] = None, log: logging.Logger = logger) -> Dict[int, dict]:
+    """{chapter number: {"point_of_view", "narrator"}} for the analysed chapters: a first-person
+    chapter's narrator is the character its story's "I said" lines were attributed to (the
+    attribution sees who is talked to, which narration alone doesn't show). A story with no such
+    lines takes the book tone's narrator when it is the book's only first-person story, else the
+    LLM is asked about that story alone (skipped without `chat`)."""
+    views = [chapter_point_of_view(chapter) for chapter in chapters]
+    stories = _stories(chapters, views)
+    narrators: Dict[int, dict] = {c.number: {"point_of_view": view, "narrator": None}
+                                  for c, view in zip(chapters, views)}
+    for story in stories:
+        members = [chapters[i] for i in story]
+        key = _voted_narrator(members)
+        if key is None and len(stories) == 1 and (book_tone or {}).get("point_of_view") == "first":
+            key = book_tone.get("pov_key")
+        elif key is None and chat is not None:
+            tone = _ask_tone(cast.get("characters", {}), members, chat, log,
+                             label=f"chapters {members[0].number}-{members[-1].number}")
+            key = tone.get("pov_key") if tone and tone.get("point_of_view") == "first" else None
+        for chapter in members:
+            narrators[chapter.number] = {"point_of_view": "first", "narrator": key}
+    return narrators
+
+
+def apply_chapter_narrators(cast: dict, chapters: List[ChapterText], narrators: Dict[int, dict]) -> None:
+    """Keep each chapter's point of view and narrator with its attributions (cast["chapters"]), and
+    let them settle the book's own: first person when most of the narration is, told by whoever
+    narrates most of it. The book's narrator decides the narrator voice's gender and fit."""
+    for entry in cast.get("chapters", {}).values():
+        if entry.get("number") in narrators:
+            entry.update(narrators[entry["number"]])
+    words = {c.number: _narration_words(c) for c in chapters}
+    first = sum(words[n] for n, found in narrators.items() if found["point_of_view"] == "first")
+    third = sum(words[n] for n, found in narrators.items() if found["point_of_view"] == "third")
+    if not first and not third:
+        return  # too little narration to tell: the LLM's reading stands
+    tone = cast.setdefault("book_tone", {})
+    if first < third:
+        tone.update(point_of_view="third", pov_character="")
+        tone.pop("pov_key", None)
+        return
+    told = {}
+    for number, found in narrators.items():
+        if found["narrator"]:
+            told[found["narrator"]] = told.get(found["narrator"], 0) + words[number]
+    tone["point_of_view"] = "first"
+    if told:
+        key = max(told, key=told.get)
+        tone["pov_key"] = key
+        tone["pov_character"] = cast.get("characters", {}).get(key, {}).get("name", key)
+
+
+def describe_book(cast: dict, chapters: List[ChapterText], chat: Chat, log: logging.Logger = logger) -> None:
+    """Ask the LLM how the book is narrated, from up to TONE_MAX_CHARS of its dialogue-free
+    paragraphs, and keep the answer in cast["book_tone"]; then settle, chapter by chapter, whether
+    it is told in the first person and by whom (chapter_narrators), which overrides the LLM's guess
+    at the book's "I": narration alone often never names them. Like the profiles, this never fails
+    the analysis: an LLM error leaves the tone out and is logged."""
+    tone = _ask_tone(cast.get("characters", {}), chapters, chat, log)
+    if tone:
+        cast["book_tone"] = tone
+    narrators = chapter_narrators(cast, chapters, tone, chat, log)
+    apply_chapter_narrators(cast, chapters, narrators)
+    if cast.get("book_tone"):
+        log.info(f"Cast: book tone: {cast['book_tone']}")
+    told = sorted({(found["narrator"] or "?") for found in narrators.values() if found["point_of_view"] == "first"})
+    if told:
+        log.info(f"Cast: first-person narrators by chapter: {told}")

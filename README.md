@@ -70,11 +70,17 @@ The repo holds the whole stack:
   speaker the LLM couldn't tell get the dialogue voice. The analysis also reads the book's tone
   (point of view, mood, pace, intensity): when the cast is shown, the narrator voice and the book's
   delivery sliders are set from it, and with adaptive delivery each character's lines are read a
-  little more even or more expressive than the book, as their profile suggests. All of this is
-  automatic; **Adjust the cast (advanced)** holds the manual controls (a character's gender, voice
-  and delivery with a Sample of their own first line, **Suggest voices again**, and the
-  **Auto-pick suggested voices** switch). The cast is saved per book under
-  `casts/` in the app data folder, and **Add to queue** carries a snapshot of it with the job. Units
+  little more even or more expressive than the book, as their profile suggests. Each chapter's point
+  of view is read from its narration (how often it says I/me/my outside quotes); in a first-person
+  story the "I" is whoever its "I said" lines were attributed to, and their lines are read in the
+  narrator's voice in that story only, so a collection can mix first- and third-person stories.
+  Cast is the default voice mode when an LLM is configured. All of this is automatic: with
+  **Auto-pick suggested voices** on, a book joins the queue by itself as soon as its cast is ready
+  (analyses run ahead of waiting books, so pick several books, then press **Start queued books**).
+  **Adjust the cast (advanced)** holds the manual controls (a character's gender, voice and delivery
+  with a Sample of their own first line, **Suggest voices again**, and the Auto-pick switch; with it
+  off, **Add to queue** is shown). The cast is saved per book under
+  `casts/` in the app data folder, and the queued job carries a snapshot of it. Units
   never span a change of voice; the pause between narration and a quote is the sentence pause.
   Validation on a real LLM: `docs/chatterbox-edition/experiments/multivoice/`.
 - **Adaptive delivery** (Chatterbox only, Make tab checkbox, on by default): dialogue tagged

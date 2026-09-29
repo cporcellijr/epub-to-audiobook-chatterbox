@@ -354,6 +354,18 @@ def narrating_character(cast: dict) -> Optional[str]:
     return None if key is None or cast["characters"][key].get("voice_picked") else key
 
 
+def chapter_narrator(cast: dict, chapter_hash: str) -> Optional[str]:
+    """The character whose dialogue this chapter reads in the narrator's voice: the chapter's own
+    first-person narrator (cast_profiles.chapter_narrators; none in a third-person chapter), or the
+    book's narrating_character for a cast analysed before chapters had one. Never a character the
+    owner gave a voice of their own."""
+    entry = (cast.get("chapters") or {}).get(chapter_hash) or {}
+    if "narrator" not in entry:
+        return narrating_character(cast)
+    character = cast.get("characters", {}).get(entry["narrator"] or "")
+    return entry["narrator"] if character and not character.get("voice_picked") else None
+
+
 def release_narrating_voice(cast: dict) -> bool:
     """Free a voice the narrating character still holds from an earlier suggestion (their lines use
     the narrator's voice), so another character can have it; True when one was freed."""

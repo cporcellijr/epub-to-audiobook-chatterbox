@@ -287,6 +287,26 @@ class TestCharacterDelivery(unittest.TestCase):
         # The owner gave Ada a voice of her own in the cast editor: it wins.
         self.assertEqual(self._voices(picked=True)['"Come here,"'][0], "Ada.wav")
 
+    def test_each_chapter_has_its_own_first_person_narrator(self):
+        # An anthology: this chapter is Tom's story, whatever the book's tone says; a third-person
+        # chapter (narrator None) reads everyone in their own voice.
+        from audiobook_generator.core import cast as cast_store
+        for narrator, expected in (("tom", ("Ada.wav", "Narrator.wav")), (None, ("Ada.wav", "Tom.wav"))):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self._cast_file(tmp)
+                cast = cast_store.load_cast(path)
+                cast["book_tone"] = {"point_of_view": "first", "pov_key": "ada"}
+                cast["chapters"][cast_store.text_hash(self.TEXT)].update(point_of_view="first" if narrator else "third",
+                                                                        narrator=narrator)
+                cast_store.save_cast(path, cast)
+                provider = _provider(voice_mode="cast", dialogue_voice="Dialogue.wav", cast_file=path,
+                                     adaptive_delivery=True, delivery_exaggeration=0.73, delivery_cfg_weight=0.5,
+                                     delivery_temperature=0.61)
+                responses = _ScriptedResponses()
+                _speak(provider, self.TEXT, responses, os.path.join(tmp, "out.mp3"))
+            voices = {call["input"]: call["voice"] for call in responses.calls}
+            self.assertEqual((voices['"Come here,"'], voices['"Fine,"']), expected)
+
 
 class TestKokoroIgnoresDelivery(unittest.TestCase):
 

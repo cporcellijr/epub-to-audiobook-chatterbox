@@ -4,11 +4,12 @@ import json
 import unittest
 
 from audiobook_generator.core.cast_profiles import (
-    ChapterText, Passage, ProfileError, _spread, character_passages, describe_book, drop_unsupported_accents,
-    first_lines, name_forms, narration_passages, parse_profile, parse_tone, profile_cast, profile_candidates,
-    render_excerpts, select_passages,
+    ChapterText, Passage, ProfileError, _spread, apply_chapter_narrators, chapter_narrators, chapter_point_of_view,
+    character_passages, describe_book, drop_unsupported_accents, first_lines, name_forms, narration_passages,
+    parse_profile, parse_tone, profile_cast, profile_candidates, render_excerpts, select_passages,
 )
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
+from audiobook_generator.core.speech_tags import first_person_tagged
 
 CHAPTER = (
     f'Ada Marsh put the lamp down. "You left the gate open," she said.{M}'
@@ -240,6 +241,89 @@ class TestBookTone(unittest.TestCase):
         self.assertNotIn("book_tone", cast)
         describe_book(cast, _chapters(), ScriptedChat("no", "still no"))
         self.assertNotIn("book_tone", cast)
+
+
+# A man tells the first story and is only ever named when spoken to; the narration names only her.
+_FIRST_PERSON = (f"I walked her home along the river, and my hands would not stay still. " * 20 + M
+                 + f'"You worry too much, Oliver," Bettie said.{M}'
+                 + f'"I know," I told her.{M}'
+                 + f'"Stay a while," I said.{M}'
+                 + f"Bettie laughed at me, and I did not mind at all. " * 10)
+_THIRD_PERSON = (f"The sea rose against the harbour wall while Tom mended the nets. " * 25 + M
+                 + f'"Storm coming," said Tom.{M}'
+                 + f'"Then we sail at dawn," he said.')
+_ANTHOLOGY_CHARACTERS = {
+    "bettie": {"name": "Bettie", "aliases": [], "gender": "female", "age": "adult", "lines": 1},
+    "oliver": {"name": "Oliver", "aliases": [], "gender": "male", "age": "adult", "lines": 2},
+    "tom": {"name": "Tom", "aliases": [], "gender": "male", "age": "adult", "lines": 2},
+}
+
+
+def _story(number, text, lines):
+    return ChapterText(number, chapter_segments(text), lines)
+
+
+class TestChapterNarrators(unittest.TestCase):
+    """Whether each chapter is told in the first person, and by whom (anthologies change both)."""
+
+    FIRST = {1: "bettie", 2: "oliver", 3: "oliver"}
+    THIRD = {1: "tom", 2: "tom"}
+
+    def _cast(self, *numbers):
+        return {"characters": {k: dict(v) for k, v in _ANTHOLOGY_CHARACTERS.items()},
+                "chapters": {f"h{n}": {"number": n, "lines": {}} for n in numbers}}
+
+    def test_point_of_view_comes_from_the_narration_not_the_dialogue(self):
+        self.assertEqual(chapter_point_of_view(_story(1, _FIRST_PERSON, self.FIRST)), "first")
+        self.assertEqual(chapter_point_of_view(_story(1, _THIRD_PERSON, self.THIRD)), "third")
+        self.assertIsNone(chapter_point_of_view(_chapters()[0]))  # too little narration to tell
+
+    def test_the_i_said_lines_name_the_narrator_over_the_tones_guess(self):
+        # Seen live: the tone saw only narration, where she is named and he never is, and answered her.
+        cast = self._cast(1)
+        chapters = [_story(1, _FIRST_PERSON, self.FIRST)]
+        wrong = dict(TestBookTone.TONE, pov_character="Bettie")
+        describe_book(cast, chapters, ScriptedChat(json.dumps(wrong)))
+        self.assertEqual((cast["book_tone"]["pov_key"], cast["book_tone"]["pov_character"]), ("oliver", "Oliver"))
+        self.assertEqual(cast["chapters"]["h1"], {"number": 1, "lines": {}, "point_of_view": "first",
+                                                  "narrator": "oliver"})
+
+    def test_an_anthology_keeps_each_storys_point_of_view_and_narrator(self):
+        cast = self._cast(1, 2, 3)
+        chapters = [_story(1, _THIRD_PERSON, self.THIRD), _story(2, _FIRST_PERSON, self.FIRST),
+                    _story(3, _FIRST_PERSON, self.FIRST)]
+        found = chapter_narrators(cast, chapters, None)
+        self.assertEqual(found, {1: {"point_of_view": "third", "narrator": None},
+                                 2: {"point_of_view": "first", "narrator": "oliver"},
+                                 3: {"point_of_view": "first", "narrator": "oliver"}})
+        apply_chapter_narrators(cast, chapters, found)
+        self.assertEqual(cast["book_tone"]["point_of_view"], "first")  # most of the narration is Oliver's
+        self.assertEqual(cast["chapters"]["h1"]["narrator"], None)
+
+    def test_a_story_without_i_said_lines_asks_the_llm_about_that_story_alone(self):
+        untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
+        chapters = [_story(1, _FIRST_PERSON, self.FIRST), _story(2, _THIRD_PERSON, self.THIRD),
+                    _story(3, untagged, {1: "bettie", 2: "tom", 3: "tom"})]
+        chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Tom")))
+        found = chapter_narrators(self._cast(1, 2, 3), chapters, None, chat)
+        self.assertEqual([found[n]["narrator"] for n in (1, 2, 3)], ["oliver", None, "tom"])
+        self.assertIn("(Chapter 3)", chat.prompts[0][1]["content"])
+        self.assertNotIn("(Chapter 1)", chat.prompts[0][1]["content"])
+        # Without an LLM (re-deriving a saved cast) that story's narrator stays unknown.
+        self.assertIsNone(chapter_narrators(self._cast(1, 2, 3), chapters, None)[3]["narrator"])
+
+    def test_first_person_tags_name_the_is_lines(self):
+        paragraphs = chapter_segments(f'"I know," I told her.{M}"Go," she said.{M}"Stay," said I.{M}I said, "Fine."')
+        self.assertEqual(len(first_person_tagged(paragraphs)), 3)
+
+    def test_mostly_third_person_drops_the_tones_narrator(self):
+        cast = self._cast(1, 2)
+        cast["book_tone"] = {"point_of_view": "first", "pov_key": "tom", "pov_character": "Tom"}
+        chapters = [_story(1, _THIRD_PERSON * 3, self.THIRD), _story(2, _FIRST_PERSON, self.FIRST)]
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, cast["book_tone"]))
+        self.assertEqual(cast["book_tone"]["point_of_view"], "third")
+        self.assertNotIn("pov_key", cast["book_tone"])
+        self.assertEqual(cast["chapters"]["h2"]["narrator"], "oliver")  # still read as Oliver's in its chapter
 
 
 if __name__ == "__main__":

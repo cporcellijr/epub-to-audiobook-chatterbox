@@ -188,6 +188,42 @@ class TestRoster(unittest.TestCase):
         self.assertEqual(roster.add("Mother"), key)
         self.assertEqual(roster.add("Mrs Hale"), key)
 
+    def test_words_anyone_may_be_called_are_never_aliases(self):
+        # Seen live: Chris collected "he", "honey" and "child"; Nina "his mom".
+        roster = Roster()
+        chris = roster.add("Chris", "male", aliases=["honey", "he", "child", "Chris", "Chrissy"])
+        self.assertEqual(roster.characters[chris]["aliases"], ["Chrissy"])
+        nina = roster.add("Nina", "female", aliases=["his mom", "Mom", "the woman"])
+        self.assertEqual(roster.add("Mom"), nina)  # a family word names her in this chapter
+        self.assertEqual(roster.characters[nina]["aliases"], [])  # ...but is never saved with her
+        oliver = roster.add("Oliver", "male", aliases=["I"])  # a first-person book's narrator
+        self.assertEqual(roster.add("I"), oliver)
+        self.assertNotEqual(roster.add("Honey"), chris)  # someone may really be called Honey
+        woman = roster.add("The Woman", "female")  # a character's own name is kept even when generic
+        self.assertEqual(roster.add("the woman"), woman)
+
+    def test_a_family_word_names_one_person_only_within_a_chapter(self):
+        # Seen live: a collection's six stories each had a "Mom", and all of them became one character.
+        roster = Roster()
+        terri = roster.add("Terri", "female", aliases=["Mom", "Mrs. McCallister"])
+        self.assertEqual(roster.add("Mom"), terri)
+        roster.new_chapter()
+        self.assertNotEqual(roster.add("Mom"), terri)  # the next story's mother is someone else
+        self.assertEqual(roster.add("Mrs McCallister"), terri)  # a real name still merges across chapters
+        roster.new_chapter()
+        ruth = roster.add("Ruth", "female", aliases=["Ma"])
+        self.assertEqual(roster.add("Ma"), ruth)
+        # A saved cast's family-word aliases are not restored as names either.
+        restored = Roster({"terri": {"name": "Terri", "aliases": ["Mom", "Terr"], "gender": "female", "lines": 3}})
+        self.assertEqual((restored.resolve("Terr"), restored.resolve("Mom")), ("terri", None))
+
+    def test_a_pronoun_as_the_speaker_is_an_unknown_speaker(self):
+        reply = json.dumps({"speakers": {"1": "he", "2": "She", "3": "I"},
+                            "characters": [{"name": "he", "gender": "male"}]})
+        speakers, characters, _ = parse_reply(reply, [1, 2, 3])
+        self.assertEqual(speakers, {1: None, 2: None, 3: "I"})
+        self.assertEqual(characters, [])
+
     def test_a_saved_cast_restores_the_roster(self):
         roster = Roster({"thomas baker": {"name": "Thomas Baker", "aliases": ["Tom"], "gender": "male",
                                           "age": "adult", "lines": 3}})
