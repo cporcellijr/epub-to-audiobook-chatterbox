@@ -1032,8 +1032,9 @@ Rob, Dennis, Henry, Jake, Scott", with her first line from another story.
 - **Never aliases** (`usable_alias`): pronouns (reflexive ones too), pet names, generic words ("the
   woman", "child") and descriptions ("his mom"). A pronoun answered as a speaker counts as an
   unknown speaker.
-- **Family words ("Mom", "Grandpa", "Step Mom", "little brother", in-laws) name one person only
-  within a chapter** (`Roster.chapter_aliases`, reset by `new_chapter`). They are never saved with
+- **Family words ("Mom", "Grandpa", "Step Mom", "little brother", in-laws) used as aliases name one
+  person only within a chapter** (`Roster.chapter_aliases`, reset by `new_chapter`). A character
+  whose only name is a family word is a different case; see §22.6. They are never saved with
   the character. Within one chapter they still merge ("said Mom"); across chapters only real names
   do. In a novel the cost is that a stray "said Mom" in a later chapter may become its own row. That
   follows the Roster's rule that splitting a character is cheaper than a wrong merge.
@@ -1059,9 +1060,35 @@ EPUB parser follows the reading order and keeps no grouping.
 Not yet judged by ear: the per-story narrator voices. Elena is also that book's dialogue voice, so
 the few unknown-speaker lines in Irene's story will sound like her.
 
-### 22.6 Tests
+### 22.6 Review fixes
 
-621 pass (595 before; 26 new). They cover:
+An outside review of the last six commits found three problems in the decision logic:
+- **An undecided chapter hid the book's narrator.** A chapter with too little narration to judge,
+  and no judged neighbour to follow, was saved as "no narrator". That blocked the fallback to the
+  book's known "I". Such a chapter now saves no chapter-level narrator, so `cast.chapter_narrator`
+  falls back to the book's.
+- **An untagged story inherited its neighbour's teller.** When a tagged first-person story was
+  followed by an untagged one, the second took the first's narrator and the LLM was never asked. A
+  chapter now borrows a neighbour's narrator (nearest first, then the run's pooled vote) only if
+  that character speaks in it. In a first-person novel the "I" nearly always has lines in every
+  chapter; in a collection's next story the previous teller doesn't appear. Otherwise the order
+  is: the book tone's narrator (single-run books only, if they speak there), then a tone request
+  about that chapter alone. That answer is lent to the following chapters like a vote, so a novel
+  with no "I said" lines asks once, not once per chapter.
+- **A character whose only name is a family word still merges across chapters.** §22.4 overstated
+  this: chapter scoping covers family words used as aliases, not a character the model knows only
+  as "Mom", whose name is global. This was left as it is on purpose. Scoping names per chapter would
+  split every unnamed "Mom" of a novel into one row per chapter, each with its own voice. In a
+  collection, unnamed mothers of different stories share a row and a voice, like any two stories'
+  characters with the same name. A named mother's "Mom" alias stays within its chapter, which is the
+  case seen live (§22.4).
+
+A dry run of the new logic on the three real casts (the first-person novel, Greene Shorts Volume 2,
+Home Temptation 4), with no LLM, gave the same narrators as saved.
+
+### 22.7 Tests
+
+623 pass (595 before; 28 new). They cover:
 - the batch flow: queuing after the cast, analyses first, Start visibility, and the note on the
   analysis row;
 - pronoun point of view, per-chapter votes (including side-by-side stories), the per-run LLM

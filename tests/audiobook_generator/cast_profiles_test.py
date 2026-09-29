@@ -304,10 +304,37 @@ class TestChapterNarrators(unittest.TestCase):
         # Seen live: a collection's first two stories are both in the first person, told by different people.
         untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
         chapters = [_story(1, _FIRST_PERSON, self.FIRST), _story(2, _FIRST_PERSON, {1: "oliver", 2: "bettie", 3: "bettie"}),
-                    _story(3, untagged, {1: "tom", 2: "tom", 3: "tom"})]
+                    _story(3, untagged, {1: "tom", 2: "bettie", 3: "tom"})]
         found = chapter_narrators(self._cast(1, 2, 3), chapters, None)
-        # A chapter with too few "I said" lines of its own follows the one before it.
+        # A chapter with too few "I said" lines of its own follows the nearest one whose teller speaks in it.
         self.assertEqual([found[n]["narrator"] for n in (1, 2, 3)], ["oliver", "bettie", "bettie"])
+
+    def test_an_untagged_story_next_to_a_tagged_one_is_asked_about_not_handed_its_teller(self):
+        # Review finding: the next story of a collection has other people, so its neighbour's
+        # teller (who doesn't speak in it) is no answer; the LLM is asked about that chapter alone.
+        untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
+        chapters = [_story(1, _FIRST_PERSON, self.FIRST), _story(2, untagged, {1: "tom", 2: "tom", 3: "tom"})]
+        chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Tom")))
+        found = chapter_narrators(self._cast(1, 2), chapters, None, chat)
+        self.assertEqual([found[n]["narrator"] for n in (1, 2)], ["oliver", "tom"])
+        self.assertIn("(Chapter 2)", chat.prompts[0][1]["content"])
+        # A novel's untagged chapter where the "I" speaks follows its neighbour without asking.
+        chapters[1] = _story(2, untagged, {1: "bettie", 2: "oliver", 3: "oliver"})
+        chat = ScriptedChat()
+        self.assertEqual(chapter_narrators(self._cast(1, 2), chapters, None, chat)[2]["narrator"], "oliver")
+        self.assertEqual(chat.prompts, [])
+
+    def test_a_chapter_too_short_to_tell_keeps_the_books_narrator(self):
+        # Review finding: an undecided chapter used to save "no narrator", hiding the book's own.
+        from audiobook_generator.core import cast as cast_store
+        cast = self._cast(1)
+        cast["book_tone"] = {"point_of_view": "first", "pov_key": "tom", "pov_character": "Tom"}
+        chapters = [ChapterText(1, chapter_segments(CHAPTER), dict(LINES))]  # too little narration
+        found = chapter_narrators(cast, chapters, cast["book_tone"])
+        self.assertEqual(found, {})
+        apply_chapter_narrators(cast, chapters, found)
+        self.assertNotIn("narrator", cast["chapters"]["h1"])
+        self.assertEqual((cast["book_tone"]["pov_key"], cast_store.chapter_narrator(cast, "h1")), ("tom", "tom"))
 
     def test_a_story_without_i_said_lines_asks_the_llm_about_that_story_alone(self):
         untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
