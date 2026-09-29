@@ -31,19 +31,19 @@ class TestPreset(unittest.TestCase):
         self.assertEqual(preset(MOOD_SOFT, APPROVED_BASELINE), (0.35, 0.35, 0.5, -6.0))
         self.assertEqual(preset(MOOD_NORMAL, APPROVED_BASELINE), (0.73, 0.5, 0.61, 0.0))
         self.assertEqual(preset(MOOD_EMPHATIC, APPROVED_BASELINE), (0.85, 0.46, 0.64, 0.5))
-        self.assertEqual(preset(MOOD_EXCITED, APPROVED_BASELINE), (1.0, 0.4, 0.7, 1.5))
+        self.assertEqual(preset(MOOD_EXCITED, APPROVED_BASELINE), (0.91, 0.45, 0.7, 1.5))
 
     def test_relative_presets_at_another_baseline_including_the_floors(self):
         baseline = Baseline(0.5, 0.6, 0.4)
         # soft exaggeration (0.5*0.48=0.24) and soft temperature (0.4-0.11=0.29) both hit their floor.
         self.assertEqual(preset(MOOD_SOFT, baseline), (0.25, 0.45, 0.3, -6.0))
         self.assertEqual(preset(MOOD_NORMAL, baseline), (0.5, 0.6, 0.4, 0.0))
-        self.assertEqual(preset(MOOD_EXCITED, baseline), (0.77, 0.5, 0.49, 1.5))
+        self.assertEqual(preset(MOOD_EXCITED, baseline), (0.68, 0.55, 0.49, 1.5))
 
     def test_excited_exaggeration_and_temperature_ceilings(self):
         baseline = Baseline(0.9, 0.5, 0.85)
         exaggeration, _, temperature, _ = preset(MOOD_EXCITED, baseline)
-        self.assertEqual(exaggeration, 1.0)   # 0.9 + 0.27 = 1.17, capped at 1.0
+        self.assertEqual(exaggeration, 1.0)   # 0.9 + 0.18 = 1.08, capped at 1.0
         self.assertEqual(temperature, 0.9)    # 0.85 + 0.09 = 0.94, capped at 0.9
 
     def test_unrecognised_mood_behaves_like_normal(self):

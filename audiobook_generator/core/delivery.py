@@ -42,9 +42,12 @@ def preset(mood: str, baseline: Baseline) -> Tuple[float, float, float, float]:
     """(exaggeration, cfg_weight, temperature, gain_db) for one mood around a book's baseline
     sliders. The formulas keep the spacing the owner approved by ear at their own baseline
     (exaggeration 0.73, CFG 0.5, temperature 0.61): at exactly that baseline they reproduce the
-    approved soft/normal/excited numbers (0.35/0.35/0.5/-6dB, baseline/0dB, 1.0/0.4/0.7/+1.5dB).
-    Punctuation alone uses the gentler emphatic preset; explicit speech cues keep full excitement.
-    An unrecognised mood is treated as "normal".
+    approved soft/normal numbers (0.35/0.35/0.5/-6dB, baseline/0dB). Excited was 1.0/0.4/0.7/+1.5dB
+    there; softened 2026-09-29 to +0.18 exaggeration and -0.05 CFG (0.91/0.45/0.7) after Elena's
+    loudest excited take sounded distorted. That was the model's own rendering (no sample clipped
+    at any stage), not the gain, which peak guarding mostly cancels anyway: Chatterbox already
+    normalizes peaks to -0.45 dBFS. Punctuation alone uses the gentler emphatic preset; explicit
+    speech cues keep full excitement. An unrecognised mood is treated as "normal".
     """
     b_exag, b_cfg, b_temp = baseline
     if mood == MOOD_SOFT:
@@ -54,7 +57,7 @@ def preset(mood: str, baseline: Baseline) -> Tuple[float, float, float, float]:
         return (min(1.0, round(b_exag + 0.12, 2)), max(0.2, round(b_cfg - 0.04, 2)),
                 min(0.9, round(b_temp + 0.03, 2)), 0.5)
     if mood == MOOD_EXCITED:
-        return (min(1.0, round(b_exag + 0.27, 2)), max(0.2, round(b_cfg - 0.1, 2)),
+        return (min(1.0, round(b_exag + 0.18, 2)), max(0.2, round(b_cfg - 0.05, 2)),
                 min(0.9, round(b_temp + 0.09, 2)), 1.5)
     return (round(b_exag, 2), round(b_cfg, 2), round(b_temp, 2), 0.0)
 

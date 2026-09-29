@@ -505,6 +505,8 @@ def delete_own_voice(name: Optional[str], jobs: List[dict]) -> str:
         raise gr.Error(f"'{name}' is used by '{book}' in the queue. Remove or finish that book first.")
     os.remove(path)
     voice_measure.forget_features(name)
+    if name in cast_store.load_voice_genders():
+        cast_store.save_voice_gender(name, None)
     return f"Deleted **{os.path.splitext(name)[0]}**."
 
 

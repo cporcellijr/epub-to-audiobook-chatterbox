@@ -935,3 +935,23 @@ the second seed, two attempts, and the baseline settings. The app container was 
 restarted with an empty queue; the page returned HTTP 200 and the running image contained the
 one-word guard. The final full suite passes 595 tests. Book clip offsets also follow the
 M4B's cumulative chapter rounding, avoiding drift over many chapters.
+
+## 21. Softer excited delivery; deleted voices forget their gender (2026-09-29)
+
+The owner heard slight distortion in Elena's loudest excited Voice lab take and asked for a lower
+excited volume boost. A measurement showed that the boost was not the cause. At the saved sliders
+(0.65/0.4/0.6), three normal and three excited takes of the preview phrase were requested as WAV.
+Every take peaked at exactly -0.45 dBFS because Chatterbox's server scales any clip over 0.99 to
+0.95 with a linear gain, not a limiter. No take had samples at full scale, whether raw or after
+`guarded_gain` and an MP3 round trip (excited peaked at -0.85 dBFS). Because of this server
+normalization, the peak guard cuts the excited +1.5 dB to about -0.5 dB. The boost therefore
+rarely applies, and it cannot clip. The harshness comes from the model's own rendering at 0.92
+exaggeration and CFG 0.3.
+
+Excited now steps exaggeration by +0.18 (was +0.27) and CFG by -0.05 (was -0.10). Temperature
+(+0.09) and gain (+1.5 dB) are unchanged. At the approved baseline, excited is now 0.91/0.45/0.7.
+It remains above emphatic (0.85/0.46/0.64). The owner still needs to judge the result by ear.
+
+Deleting a voice in the Voice lab previously forgot its measurement but kept its entry in
+`voice_genders.json`, so entries for deleted voices accumulated. Deleting a voice now removes its
+gender entry too. Files deleted outside the app (for example, in Explorer) are still not noticed.

@@ -222,7 +222,7 @@ class TestDeliveryBaselineAndPreview(unittest.TestCase):
             payloads = [json.loads(call.args[0].data) for call in urlopen.call_args_list]
             self.assertEqual(len(payloads), 3)
             self.assertEqual([(p["exaggeration"], p["cfg_weight"], p["temperature"]) for p in payloads],
-                             [(0.35, 0.35, 0.5), (0.73, 0.5, 0.61), (1.0, 0.4, 0.7)])
+                             [(0.35, 0.35, 0.5), (0.73, 0.5, 0.61), (0.91, 0.45, 0.7)])
             self.assertTrue(all(p["predefined_voice_id"] == "Elena.wav" and p["text"] == "Hello." for p in payloads))
             combined = AudioSegment.from_file(path)
             self.assertGreater(len(combined), 1500)  # 3 clips + 2 gaps of ~1 s: much longer than one clip alone
@@ -350,11 +350,15 @@ class TestVoiceMeasuring(unittest.TestCase):
         self.assertIn("Sounds **low for a woman** (150 Hz)", chatterbox_ui.voice_sound_text("Ada.wav"))
         self.assertIn("high for a woman", chatterbox_ui.voice_sound_text("Bea.wav"))
 
-    def test_deleting_a_voice_forgets_its_measurement(self):
+    def test_deleting_a_voice_forgets_its_measurement_and_gender(self):
+        from audiobook_generator.core import cast as cast_store
+        cast_store.save_voice_gender("Ada.wav", "female")
+        cast_store.save_voice_gender("Bea.wav", "female")
         with patch.object(chatterbox_ui, "_post_json", return_value=b"wav"):
             chatterbox_ui.measure_voices()
         chatterbox_ui.delete_own_voice("Ada.wav", [])
         self.assertNotIn("Ada.wav", chatterbox_ui.voice_measure.load_features())
+        self.assertEqual(cast_store.load_voice_genders(), {"Bea.wav": "female"})
 
 
 class TestBuildConfig(unittest.TestCase):
