@@ -78,8 +78,9 @@ def _escape_concat_path(path: str) -> str:
 
 
 def build_m4b(chapters: List[Tuple[str, str]], output_path: str, title: str, author: str,
-              cover_path: Optional[str] = None, bitrate: str = "64k") -> None:
-    """Encode (chapter title, audio file) pairs, in order, into output_path.
+              cover_path: Optional[str] = None, bitrate: str = "64k") -> List[float]:
+    """Encode (chapter title, audio file) pairs, in order, into output_path, and return each
+    chapter's duration in seconds as laid out in the book (its chapter marker's length).
 
     Writes to a hidden temporary file in the same folder and renames it into place, so a
     library scanner never sees a half-written book.
@@ -148,3 +149,4 @@ def build_m4b(chapters: List[Tuple[str, str]], output_path: str, title: str, aut
                 os.remove(temp_output)
             raise RuntimeError(f"ffmpeg could not build the M4B: {result.stderr.strip()[-500:]}")
     os.replace(temp_output, output_path)
+    return durations

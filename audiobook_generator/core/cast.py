@@ -381,11 +381,13 @@ def release_narrating_voice(cast: dict) -> bool:
 
 
 def suggest_narrator(cast: dict, voices: List[Tuple[str, str]], traits: Dict[str, dict],
-                     exclude: Tuple[str, ...] = ()) -> Optional[str]:
+                     exclude: Tuple[str, ...] = (), current: Optional[str] = None) -> Optional[str]:
     """The measured voice that best fits the narrator the book's tone asks for (cast["book_tone"]),
     or None when there is no tone, nothing measured, or no gender/voice targets (the owner's voice
     then stays). A first-person book's narrator is its viewpoint character: their known gender, and
-    their profile's voice targets where they have one, come before the tone's."""
+    their profile's voice targets where they have one, come before the tone's. When only a gender
+    is asked for, the owner's `current` narrator is kept if it has that gender: every voice of the
+    gender fits equally, so switching would only swap in the first one listed."""
     tone = cast.get("book_tone") or {}
     wants = tone.get("narrator") or {}
     targets = {key: wants.get(key) for key in ("pitch", "quality", "delivery")}
@@ -398,6 +400,8 @@ def suggest_narrator(cast: dict, voices: List[Tuple[str, str]], traits: Dict[str
             gender = pov["gender"]
     if not traits or not any(targets.values()) and gender not in ("female", "male"):
         return None
+    if not any(targets.values()) and current not in exclude and dict(voices).get(current) == gender:
+        return current
     candidates = [voice for voice, voice_gender in voices if voice not in exclude and voice in traits
                   and (gender not in ("female", "male") or voice_gender in (gender, "neutral"))]
     if not candidates:

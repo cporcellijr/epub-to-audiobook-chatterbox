@@ -205,6 +205,14 @@ class TestParagraphMood(unittest.TestCase):
         text = '\u201cHush,\u201d she whispered. \u201cWhy?\u201d he asked.'
         self.assertEqual(self.moods(text), {1: "soft", 2: "normal"})
 
+    def test_a_shout_outranks_an_untagged_exclamation_in_its_paragraph(self):
+        text = '“Go!” He stood up. “Get out,” he shouted.'
+        self.assertEqual(self.moods(text), {1: "excited", 2: "excited"})
+
+    def test_a_whisper_does_not_soften_an_untagged_exclamation(self):
+        text = '“Go!” He stood up. “Get out,” she whispered.'
+        self.assertEqual(self.moods(text), {1: "emphatic", 2: "soft"})
+
     def test_conflicting_cues_lend_nothing(self):
         text = '\u201cHush,\u201d she whispered. \u201cNo,\u201d he shouted. \u201cWell.\u201d'
         self.assertEqual(self.moods(text), {1: "soft", 2: "excited", 3: "normal"})

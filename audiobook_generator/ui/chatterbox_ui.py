@@ -1065,17 +1065,19 @@ def _fill_missing_voices(cast: dict, path: str, engine: str, narrator_voice: Opt
     return cast
 
 
-def _fill_narrator_suggestion(cast: dict, path: str, engine: str) -> Optional[dict]:
+def _fill_narrator_suggestion(cast: dict, path: str, engine: str,
+                              narrator_voice: Optional[str] = None) -> Optional[dict]:
     """The narrator the book's tone asks for (cast["narrator_suggestion"]: voice and delivery
     sliders), worked out once and saved; None when there is no book tone, the engine's voices aren't
-    measured (Kokoro), or nothing fits. Voices the owner picked for characters are never offered."""
+    measured (Kokoro), or nothing fits. Voices the owner picked for characters are never offered;
+    the owner's narrator_voice is kept when the tone asks only for a gender it already has."""
     if cast.get("narrator_suggestion"):
         return cast["narrator_suggestion"]
     if engine == "kokoro" or not cast.get("book_tone"):
         return None
     voices = engine_voices_with_gender(engine)
     picked = tuple(c["voice"] for c in cast["characters"].values() if c.get("voice_picked") and c.get("voice"))
-    voice = cast_store.suggest_narrator(cast, voices, engine_voice_traits(engine, voices), picked)
+    voice = cast_store.suggest_narrator(cast, voices, engine_voice_traits(engine, voices), picked, narrator_voice)
     if not voice:
         return None
     saved = read_saved_settings()
@@ -1105,7 +1107,7 @@ def resuggest_cast_voices(cast_key: Optional[str], engine: str, narrator_voice: 
         return (gr.update(),) * 7
     path, cast = _finished_cast(cast_key)
     cast.pop("narrator_suggestion", None)
-    suggestion = _fill_narrator_suggestion(cast, path, engine)
+    suggestion = _fill_narrator_suggestion(cast, path, engine, narrator_voice)
     cleared = cast_store.clear_suggested_voices(cast)
     cast = _fill_missing_voices(cast, path, engine, suggestion["voice"] if suggestion else narrator_voice)
     cast_store.save_cast(path, cast)
@@ -1205,7 +1207,7 @@ def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional
         return (gr.update(value=None, visible=False), [],
                 f"✗ The cast analysis failed: {cast.get('error') or 'see the log'}. Press **Analyse selected chapters** to try again.",
                 stamp)
-    suggestion = _fill_narrator_suggestion(cast, path, engine) if auto_pick else None
+    suggestion = _fill_narrator_suggestion(cast, path, engine, narrator_voice) if auto_pick else None
     cast = _fill_missing_voices(cast, path, engine, suggestion["voice"] if suggestion else narrator_voice)
     rows, keys = cast_rows(cast, engine)
     stamp[1] = os.path.getmtime(path)  # the fills may just have saved

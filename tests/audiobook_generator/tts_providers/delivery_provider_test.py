@@ -102,6 +102,17 @@ class TestBaselineWithAdaptiveOff(unittest.TestCase):
                 _speak(provider, '"Fine."', responses, os.path.join(tmp, "out.mp3"))
         self.assertEqual(_settings(responses.calls[0]), {"exaggeration": 0.9, "cfg_weight": 0.2, "temperature": 0.3})
 
+    def test_saved_defaults_are_read_once_per_chapter(self):
+        provider = _provider(adaptive_delivery=True)  # every slider comes from Chatterbox's saved defaults
+        responses = _ScriptedResponses()
+        with patch("audiobook_generator.core.delivery.saved_chatterbox_defaults",
+                   return_value=delivery.Baseline(0.5, 0.5, 0.5)) as saved:
+            with tempfile.TemporaryDirectory() as tmp:
+                _speak(provider, f'"Fine," she said.{M}"Get out!" he shouted.', responses,
+                       os.path.join(tmp, "out.mp3"))
+        self.assertGreater(len(responses.calls), 2)
+        self.assertEqual(saved.call_count, 1)
+
 
 class TestAdaptiveDeliveryOn(unittest.TestCase):
 

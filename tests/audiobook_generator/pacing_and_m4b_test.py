@@ -24,6 +24,7 @@ from audiobook_generator.tts_providers.openai_tts_provider import (
     OpenAITTSProvider,
     paced_units,
     paragraph_mode_units,
+    _chatterbox_input,
     _silence_runs,
     _stretch_sentence_gaps,
 )
@@ -320,6 +321,39 @@ class TestPacedSpeech(unittest.TestCase):
             self._speak(provider, "The lantern burned steadily beside the window.")
         self.assertEqual(provider.client.audio.speech.create.call_count, 3)
 
+    def test_keeps_the_closest_take_when_every_retry_has_an_implausible_length(self):
+        # A quick "Well…" can be real speech: three short takes must not fail the chapter (and
+        # with it the M4B). The one nearest a plausible length is kept, with its own seed.
+        provider = self._provider(400, 1000)
+        provider.client.audio.speech.create.side_effect = [
+            SimpleNamespace(content=_wav_from_segment(_tone(ms))) for ms in (700, 880, 800)]
+        tags = SimpleNamespace(title="Ch", author="A", book_title="B", idx=1, cover=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.mp3")
+            with patch("audiobook_generator.tts_providers.openai_tts_provider.set_audio_tags"), patch(
+                    "audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow",
+                    side_effect=[10, 20, 30]):
+                provider.text_to_speech("“Well…”", path, tags)
+            duration = len(AudioSegment.from_file(path))
+            with open(path + ".clips.json", encoding="utf-8") as file:
+                clip = json.load(file)["clips"][0]
+        self.assertEqual(provider.client.audio.speech.create.call_count, 3)
+        self.assertAlmostEqual(duration, 880, delta=80)
+        self.assertEqual((clip["seed"], clip["attempts"], clip["flagged"]), (21, 3, "too-short ellipsis audio"))
+
+    def test_a_take_with_a_long_silent_gap_is_never_the_one_kept(self):
+        provider = self._provider(400, 1000)
+        silent = _wav_from_segment(_tone(200) + _silence(4000) + _tone(200))
+        provider.client.audio.speech.create.side_effect = [
+            SimpleNamespace(content=content) for content in (silent, _wav_from_segment(_tone(700)), silent)]
+        self.assertAlmostEqual(self._speak(provider, "“Well…”"), 700, delta=80)
+
+    def test_repairs_an_opening_quote_used_to_close_any_line(self):
+        self.assertEqual(_chatterbox_input("“Wait—“"), "“Wait—”")
+        self.assertEqual(_chatterbox_input("“Who’s there?“"), "“Who’s there?”")
+        self.assertEqual(_chatterbox_input("„Ja“"), "„Ja“")  # German quotes close with “
+        self.assertEqual(_chatterbox_input("“Fine.”"), "“Fine.”")
+
     def test_retries_a_truncated_short_line_ending_in_ellipsis(self):
         provider = self._provider(400, 1000)
         provider.client.audio.speech.create.side_effect = [
@@ -613,13 +647,16 @@ class TestBuildM4b(unittest.TestCase):
                             "-ac", "1", "-c:a", "aac", "-f", "adts", one], check=True)
             _aac(two, 3)
             output = os.path.join(tmp, "Book.m4b")
-            build_m4b([("One", one), ("Two", two)], output, "Book", "Author")
+            chapter_seconds = build_m4b([("One", one), ("Two", two)], output, "Book", "Author")
             info = _ffprobe(output)
             packets = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
                                       "packet=duration_time", "-of", "csv=p=0", output],
                                      capture_output=True, text=True, check=True).stdout.split()
         durations = [float(value.strip(",")) for value in packets]
         self.assertAlmostEqual(float(info["chapters"][1]["start_time"]), 8.0, delta=0.15)
+        # The durations it returns are the ones the chapter markers were laid out with.
+        self.assertEqual(len(chapter_seconds), 2)
+        self.assertAlmostEqual(float(info["chapters"][1]["start_time"]), chapter_seconds[0], delta=0.001)
         self.assertEqual([d for d in durations if d < 0.01], [])
         self.assertAlmostEqual(sum(durations), 11.0, delta=0.2)
 

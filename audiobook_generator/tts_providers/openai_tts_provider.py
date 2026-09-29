@@ -88,11 +88,24 @@ def _long_silence_ms(audio: AudioSegment) -> int:
     return longest
 
 
+_ELLIPSIS_MIN_MS = 950
+
+
+def _overlong_ms(chars: int) -> int:
+    """The longest plausible take of a short (up to 35 character) line."""
+    return max(6000, chars * 300)
+
+
+def _truncated_ms(chars: int) -> int:
+    """The shortest plausible take of a long (45+ character) quoted line."""
+    return chars * 40
+
+
 def _truncated_ellipsis(audio: AudioSegment, text: str) -> bool:
     """A drawn-out short line should not end in under a second of audio."""
     spoken = text.strip().strip('"“”\'‘’').strip()
     return (len(spoken) <= 15 and spoken.endswith(("…", "..."))
-            and len(spoken.rstrip("….")) >= 4 and len(audio) < 950)
+            and len(spoken.rstrip("….")) >= 4 and len(audio) < _ELLIPSIS_MIN_MS)
 
 
 def _implausible_quote_duration(audio: AudioSegment, text: str) -> Optional[str]:
@@ -102,9 +115,9 @@ def _implausible_quote_duration(audio: AudioSegment, text: str) -> Optional[str]
         return None
     spoken = quoted.strip('"“”\'‘’').strip()
     chars = len(spoken)
-    if 1 <= chars <= 35 and len(audio) > max(6000, chars * 300):
+    if 1 <= chars <= 35 and len(audio) > _overlong_ms(chars):
         return "overlong short dialogue"
-    if chars >= 45 and len(audio) < chars * 40:
+    if chars >= 45 and len(audio) < _truncated_ms(chars):
         return "truncated dialogue"
     return None
 
@@ -115,9 +128,20 @@ def _implausible_short_narration_duration(audio: AudioSegment, text: str) -> Opt
     if text.lstrip().startswith(('“', '"', '‘', "'")):
         return None  # quoted lines have their own duration check
     chars = len(spoken)
-    if 1 <= chars <= 35 and len(audio) > max(6000, chars * 300):
+    if 1 <= chars <= 35 and len(audio) > _overlong_ms(chars):
         return "overlong short narration"
     return None
+
+
+def _duration_miss(audio: AudioSegment, text: str, reason: str) -> float:
+    """How far a take rejected for `reason` (a length check above) is from its limit, as a
+    fraction of the limit: the take nearest a plausible length is the one kept when every retry
+    is rejected."""
+    chars = len(text.strip().strip('"“”\'‘’').strip())
+    if reason.startswith("overlong"):
+        return len(audio) / _overlong_ms(chars) - 1
+    limit = _ELLIPSIS_MIN_MS if reason == "too-short ellipsis audio" else _truncated_ms(chars)
+    return 1 - len(audio) / limit
 
 
 def _new_seed(previous: Optional[int] = None) -> int:
@@ -127,11 +151,14 @@ def _new_seed(previous: Optional[int] = None) -> int:
 
 
 def _chatterbox_input(text: str) -> str:
-    """Remove a mismatched end quote from an interrupted line in the EPUB."""
+    """Repair a mismatched end quote in the EPUB: an interrupted line ("You-“) loses its quotes and
+    ends in a dash; any other line closed with an opening “ gets its proper ”."""
     quoted = text.strip()
     if quoted.startswith(('“', '"')) and quoted.endswith(('-“', '-"')):
         inner = quoted[1:-2].replace("…", "...").replace("...", "... ")
         return " ".join(inner.split()) + "—"
+    if len(quoted) > 1 and quoted.startswith("“") and quoted.endswith("“"):
+        return quoted[:-1] + "”"
     return text
 
 
@@ -677,10 +704,12 @@ class OpenAITTSProvider(BaseTTSProvider):
                              and self._adaptive_active() else {})
         return self._offsets
 
-    def _voice_baseline(self, voice: Optional[str], speaker: Optional[str] = None,
-                        text: str = "") -> delivery.Baseline:
-        """Ease a character's delivery offset in over the same short-line range as moods."""
-        baseline = self._delivery_baseline()
+    def _voice_baseline(self, voice: Optional[str], speaker: Optional[str] = None, text: str = "",
+                        baseline: Optional[delivery.Baseline] = None) -> delivery.Baseline:
+        """Ease a character's delivery offset in over the same short-line range as moods, around
+        `baseline` (the book's, read here when the caller hasn't already)."""
+        if baseline is None:
+            baseline = self._delivery_baseline()
         offset = self._character_offsets().get(speaker or "", 0.0)
         if not offset:
             return baseline
@@ -689,8 +718,8 @@ class OpenAITTSProvider(BaseTTSProvider):
             offset *= strength
         return baseline._replace(exaggeration=round(min(2.0, max(0.25, baseline.exaggeration + offset)), 2))
 
-    def _delivery_extra_body(self, mood: str, voice: Optional[str] = None,
-                             speaker: Optional[str] = None, text: str = "") -> Optional[dict]:
+    def _delivery_extra_body(self, mood: str, voice: Optional[str] = None, speaker: Optional[str] = None,
+                             text: str = "", baseline: Optional[delivery.Baseline] = None) -> Optional[dict]:
         """The Chatterbox-only extra_body sliders for one unit, or None when neither adaptive
         delivery nor a per-book baseline applies (today's plain request, unchanged).
 
@@ -702,7 +731,7 @@ class OpenAITTSProvider(BaseTTSProvider):
             return None
         effective_mood = mood if self.config.adaptive_delivery else delivery.MOOD_NORMAL
         exaggeration, cfg_weight, temperature, _ = delivery.unit_preset(
-            effective_mood, self._voice_baseline(voice, speaker, text), text)
+            effective_mood, self._voice_baseline(voice, speaker, text, baseline), text)
         return {"exaggeration": exaggeration, "cfg_weight": cfg_weight, "temperature": temperature}
 
     def __str__(self) -> str:
@@ -871,6 +900,9 @@ class OpenAITTSProvider(BaseTTSProvider):
         if not units:
             raise ValueError("No speakable text in this chapter")
         adaptive = self._adaptive_active()
+        # Once per chapter: filling in unset sliders can mean reading Chatterbox's config file.
+        baseline = (self._delivery_baseline() if self._is_chatterbox_engine()
+                    and (self.config.adaptive_delivery or self._has_custom_baseline()) else None)
         pieces: List[bytes] = []
         audio_format = None
         previous_paragraph = None
@@ -895,48 +927,18 @@ class OpenAITTSProvider(BaseTTSProvider):
                 input=_chatterbox_input(unit) if self._is_chatterbox_engine() else unit,
                 response_format="wav",
             )
-            extra_body = self._delivery_extra_body(mood, voice, speaker=speaker, text=unit)
+            extra_body = self._delivery_extra_body(mood, voice, speaker=speaker, text=unit, baseline=baseline)
             if extra_body is not None:
                 request_kwargs["extra_body"] = extra_body
             if self._is_chatterbox_engine() and len(unit.strip()) <= _SHORT_UNIT_CHARS:
                 request_kwargs["extra_body"] = {**request_kwargs.get("extra_body", {}),
                                                 "seed": _new_seed()}
-            for attempt in range(_BAD_CLIP_RETRIES + 1):
-                if attempt:
-                    # The server's audiobook preset fixes the seed, so repeating an
-                    # unchanged request reproduces the same silent clip every time.
-                    request_kwargs["extra_body"] = {
-                        **request_kwargs.get("extra_body", {}),
-                        "seed": _new_seed(request_kwargs.get("extra_body", {}).get("seed")),
-                    }
-                response = self._create_speech(**request_kwargs)
-                audio = AudioSegment.from_file(io.BytesIO(response.content), format="wav")
-                silent_ms = _long_silence_ms(audio) if self._is_chatterbox_engine() else 0
-                if silent_ms >= _BAD_CLIP_SILENCE_MS:
-                    bad_reason = "near-silent audio"
-                    logger.warning("Chatterbox returned %.1fs of near-silence for %s (attempt %d/%d)",
-                                   silent_ms / 1000, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
-                elif self._is_chatterbox_engine() and _truncated_ellipsis(audio, unit):
-                    bad_reason = "too-short ellipsis audio"
-                    logger.warning("Chatterbox returned %.2fs for the trailing ellipsis in %s (attempt %d/%d)",
-                                   len(audio) / 1000, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
-                elif self._is_chatterbox_engine() and (reason := _implausible_quote_duration(audio, unit)):
-                    bad_reason = reason
-                    logger.warning("Chatterbox returned %.2fs of %s for %s (attempt %d/%d)",
-                                   len(audio) / 1000, reason, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
-                elif self._is_chatterbox_engine() and (reason := _implausible_short_narration_duration(audio, unit)):
-                    bad_reason = reason
-                    logger.warning("Chatterbox returned %.2fs of %s for %s (attempt %d/%d)",
-                                   len(audio) / 1000, reason, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
-                else:
-                    break
-            else:
-                raise RuntimeError(f"Chatterbox returned repeated {bad_reason} for {chunk_id}")
+            audio, params, attempts, flagged = self._speak_take(request_kwargs, unit, chunk_id)
             if sentence_count > 1 and sentence_gap_ms > 0:
                 audio = _stretch_sentence_gaps(audio, sentence_count - 1, sentence_gap_ms)
             if adaptive:
                 audio = delivery.guarded_gain(audio, delivery.unit_preset(
-                    mood, self._voice_baseline(voice, speaker, unit), unit)[3])
+                    mood, self._voice_baseline(voice, speaker, unit, baseline), unit)[3])
             if audio_format is None:
                 audio_format = (audio.frame_rate, audio.channels, audio.sample_width)
             else:
@@ -953,15 +955,15 @@ class OpenAITTSProvider(BaseTTSProvider):
             pieces.append(audio.raw_data)
             timeline_frames += len(audio.raw_data) // (audio_format[1] * audio_format[2])
             if self._is_chatterbox_engine():
-                params = request_kwargs.get("extra_body", {})
                 clip_entries.append({
                     "chunk": number, "text_sha1": hashlib.sha1(unit.encode("utf-8")).hexdigest(),
                     "text_length": len(unit), "voice": voice, "mood": mood,
                     "start_ms": round(start_frame * 1000 / audio_format[0] / speed),
                     "end_ms": round(timeline_frames * 1000 / audio_format[0] / speed),
-                    "seed": params.get("seed"), "attempts": attempt + 1,
+                    "seed": params.get("seed"), "attempts": attempts,
                     "settings": {key: params[key] for key in ("exaggeration", "cfg_weight", "temperature")
                                  if key in params},
+                    **({"flagged": flagged} if flagged else {}),
                 })
                 logger.info("Clip %s: chapter %.3f–%.3fs, seed=%s, settings=%s",
                             chunk_id, clip_entries[-1]["start_ms"] / 1000,
@@ -980,6 +982,48 @@ class OpenAITTSProvider(BaseTTSProvider):
                 os.replace(f"{map_path}.tmp", map_path)
             except OSError as error:
                 logger.warning("Could not save clip locations for %s: %s", output_file, error)
+
+    def _speak_take(self, request_kwargs: dict, unit: str,
+                    chunk_id: str) -> Tuple[AudioSegment, dict, int, Optional[str]]:
+        """One unit's audio, requested again with a new seed while Chatterbox's take is bad:
+        (audio, the extra_body it was made with, attempts made, the length check it still fails).
+
+        A take with a long near-silent gap is never kept. When every attempt is rejected only for
+        an implausible length, the one nearest a plausible length is kept instead of failing the
+        chapter (and with it the whole M4B): a quick "Well…" can be real speech."""
+        rejected = []
+        for attempt in range(_BAD_CLIP_RETRIES + 1):
+            if attempt:
+                # The server's audiobook preset fixes the seed, so repeating an
+                # unchanged request reproduces the same silent clip every time.
+                request_kwargs["extra_body"] = {
+                    **request_kwargs.get("extra_body", {}),
+                    "seed": _new_seed(request_kwargs.get("extra_body", {}).get("seed")),
+                }
+            response = self._create_speech(**request_kwargs)
+            audio = AudioSegment.from_file(io.BytesIO(response.content), format="wav")
+            params = request_kwargs.get("extra_body", {})
+            if not self._is_chatterbox_engine():
+                return audio, params, attempt + 1, None
+            silent_ms = _long_silence_ms(audio)
+            if silent_ms >= _BAD_CLIP_SILENCE_MS:
+                logger.warning("Chatterbox returned %.1fs of near-silence for %s (attempt %d/%d)",
+                               silent_ms / 1000, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
+                continue
+            reason = (("too-short ellipsis audio" if _truncated_ellipsis(audio, unit) else None)
+                      or _implausible_quote_duration(audio, unit)
+                      or _implausible_short_narration_duration(audio, unit))
+            if not reason:
+                return audio, params, attempt + 1, None
+            logger.warning("Chatterbox returned %.2fs of %s for %s (attempt %d/%d)",
+                           len(audio) / 1000, reason, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
+            rejected.append((_duration_miss(audio, unit, reason), attempt, audio, params, reason))
+        if not rejected:
+            raise RuntimeError(f"Chatterbox returned repeated near-silent audio for {chunk_id}")
+        _, attempt, audio, params, reason = min(rejected, key=lambda take: take[:2])
+        logger.warning("Keeping attempt %d of %s (%.2fs of %s): no attempt had a plausible length",
+                       attempt + 1, chunk_id, len(audio) / 1000, reason)
+        return audio, params, _BAD_CLIP_RETRIES + 1, reason
 
     def _combine_and_export(self, pieces: List[bytes], audio_format: Tuple[int, int, int], speed: float,
                              output_file: str, audio_tags: AudioTags) -> None:

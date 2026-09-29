@@ -185,11 +185,12 @@ def segment_moods(paragraphs: List[List[Segment]]) -> Dict[int, str]:
                 untagged.append(piece.line_id)
         # One speaker's manner holds for the paragraph: "Tom, are you awake?" she whispered. "Don't
         # wake Mother." reads the second quotation softly too. Only quotations with no tag of their
-        # own and no mood of their own borrow it, and only when the paragraph's cues agree.
+        # own borrow it, and only when the paragraph's cues agree. A quotation's own mood is kept,
+        # except that its '!' alone is outranked by a shout ("Go!" ... "Now!" he shouted).
         if len(cues) == 1:
             lent = next(iter(cues))
             for line_id in untagged:
-                if moods[line_id] == MOOD_NORMAL:
+                if moods[line_id] == MOOD_NORMAL or (moods[line_id] == MOOD_EMPHATIC and lent == MOOD_EXCITED):
                     moods[line_id] = lent
     return moods
 

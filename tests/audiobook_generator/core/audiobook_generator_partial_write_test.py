@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from audiobook_generator.core.audiobook_generator import AudiobookGenerator
+from audiobook_generator.core.audiobook_generator import AudiobookGenerator, _make_output_folder
 
 
 def _provider(write: bool = True, fail: bool = False, clip_map=None) -> MagicMock:
@@ -69,6 +69,15 @@ class TestProcessChapterPartialWrite(unittest.TestCase):
             self.assertEqual(json.load(f), clip_map)
         self.assertFalse(any(name.endswith(".part.clips.json") for name in self._files()))
 
+    def test_finished_loose_files_are_handed_to_the_library_manager(self):
+        self.generator.config.output_text = True
+        owned = []
+        with patch("audiobook_generator.core.audiobook_generator.get_tts_provider", return_value=_provider()), \
+                patch("audiobook_generator.core.audiobook_generator._set_output_owner", side_effect=owned.append):
+            self.assertTrue(self.generator.process_chapter(1, "Chapter One", "text"))
+        self.assertEqual(sorted(os.path.basename(path) for path in owned),
+                         ["0001_Chapter_One.mp3", "0001_Chapter_One.txt"])
+
     def test_failed_chapter_removes_partial_clip_map(self):
         with patch("audiobook_generator.core.audiobook_generator.get_tts_provider",
                    return_value=_provider(fail=True, clip_map={"version": 1, "duration_ms": 1, "clips": []})):
@@ -90,10 +99,8 @@ class TestMergeClipMaps(unittest.TestCase):
                 json.dump({"version": 1, "duration_ms": 2000, "clips": [
                     {"start_ms": 0, "end_ms": 2000, "text_sha1": "three", "voice": "B"}]}, f)
             output = os.path.join(tmp, "book.m4b")
-            durations = {first: 2.0, second: 3.0, third: 1.0}
-            with patch("audiobook_generator.core.audiobook_generator._duration_seconds",
-                       side_effect=lambda path: durations[path]):
-                AudiobookGenerator._merge_clip_maps([("one", first), ("two", second), ("three", third)], output)
+            AudiobookGenerator._merge_clip_maps([("one", first), ("two", second), ("three", third)],
+                                                [2.0, 3.0, 1.0], output)
             with open(output + ".clips.json", encoding="utf-8") as f:
                 result = json.load(f)
         self.assertEqual(result["duration_ms"], 6000)
@@ -109,13 +116,25 @@ class TestMergeClipMaps(unittest.TestCase):
                     json.dump({"version": 1, "duration_ms": 1000,
                                "clips": [{"start_ms": 0, "end_ms": 1000}]}, f)
             output = os.path.join(tmp, "book.m4b")
-            with patch("audiobook_generator.core.audiobook_generator._duration_seconds",
-                       return_value=1.0006):
-                AudiobookGenerator._merge_clip_maps(chapters, output)
+            AudiobookGenerator._merge_clip_maps(chapters, [1.0006] * 3, output)
             with open(output + ".clips.json", encoding="utf-8") as f:
                 result = json.load(f)
         self.assertEqual([clip["book_start_ms"] for clip in result["clips"]], [0, 1001, 2001])
         self.assertEqual(result["duration_ms"], 3002)
+
+
+class TestMakeOutputFolder(unittest.TestCase):
+
+    def test_hands_over_the_folder_and_every_parent_it_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.abspath(tmp)
+            target = os.path.join(tmp, "Author", "Title")
+            owned = []
+            with patch("audiobook_generator.core.audiobook_generator._set_output_owner", side_effect=owned.append):
+                _make_output_folder(target)
+                _make_output_folder(target)  # already there: just the folder itself again
+            self.assertTrue(os.path.isdir(target))
+        self.assertEqual(owned, [os.path.join(tmp, "Author"), target, target])
 
 
 if __name__ == "__main__":

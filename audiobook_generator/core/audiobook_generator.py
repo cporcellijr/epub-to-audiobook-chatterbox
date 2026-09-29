@@ -1,7 +1,6 @@
 import hashlib
 import json
 import logging
-import math
 import mimetypes
 import multiprocessing
 import os
@@ -10,7 +9,7 @@ import shutil
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core.audio_tags import AudioTags
-from audiobook_generator.core.m4b import BadChapterFileError, _duration_seconds, build_m4b, safe_book_file_name
+from audiobook_generator.core.m4b import BadChapterFileError, build_m4b, safe_book_file_name
 from audiobook_generator.tts_providers.base_tts_provider import get_tts_provider
 from audiobook_generator.utils.log_handler import setup_logging
 from audiobook_generator.utils.filename_sanitizer import make_safe_filename
@@ -32,6 +31,19 @@ def _set_output_owner(path: str) -> None:
             os.chown(path, int(uid), -1)
         except (OSError, ValueError) as exc:
             logger.warning("Could not set audiobook output owner for %s: %s", path, exc)
+
+
+def _make_output_folder(path: str) -> None:
+    """os.makedirs for output, giving the folder and every parent folder it had to create to the
+    library manager (AUDIOBOOK_OUTPUT_UID), so it can rename or delete the whole book."""
+    created = []
+    folder = os.path.abspath(path)
+    while not os.path.isdir(folder) and os.path.dirname(folder) != folder:
+        created.append(folder)
+        folder = os.path.dirname(folder)
+    os.makedirs(path, exist_ok=True)
+    for folder in reversed(created or [os.path.abspath(path)]):
+        _set_output_owner(folder)
 
 
 _MIME_TO_EXT = {
@@ -149,6 +161,7 @@ class AudiobookGenerator:
                 text_file = os.path.join(self.config.output_folder, safe_txt_name)
                 with open(text_file, "w", encoding="utf-8") as f:
                     f.write(text)
+                _set_output_owner(text_file)
 
             # Skip audio generation in preview mode
             if self.config.preview:
@@ -188,6 +201,7 @@ class AudiobookGenerator:
             try:
                 tts_provider.text_to_speech(text, partial_file, audio_tags)
                 os.replace(partial_file, output_file)
+                _set_output_owner(output_file)
                 try:
                     if os.path.isfile(partial_map):
                         os.replace(partial_map, output_map)
@@ -240,8 +254,7 @@ class AudiobookGenerator:
             # Preview writes nothing unless chapter text was asked for, so previewing into a
             # library folder doesn't leave an empty or cover-only "book" behind.
             if not self.config.preview or self.config.output_text:
-                os.makedirs(self.config.output_folder, exist_ok=True)
-                _set_output_owner(self.config.output_folder)
+                _make_output_folder(self.config.output_folder)
 
             # Log and save book metadata
             self.book_title = book_parser.get_book_title()
@@ -250,7 +263,7 @@ class AudiobookGenerator:
             logger.info(f"Book author: {self.book_author}")
 
             if not self.config.preview:
-                os.makedirs(self.chapter_folder(), exist_ok=True)
+                _make_output_folder(self.chapter_folder())
 
             self.cover = book_parser.get_book_cover()
             cover_path = None
@@ -265,6 +278,7 @@ class AudiobookGenerator:
                 cover_path = os.path.join(cover_dir, f"cover.{ext}")
                 with open(cover_path, 'wb') as f:
                     f.write(self.cover.data)
+                _set_output_owner(cover_path)
                 logger.info(f"Cover saved: {cover_path}")
 
             chapters = book_parser.get_chapters(tts_provider.get_break_string())
@@ -391,7 +405,7 @@ class AudiobookGenerator:
                     for idx, title, _ in sorted(tasks)]
         output_path = os.path.join(self.config.output_folder, f"{safe_book_file_name(self.book_title)}.m4b")
         try:
-            build_m4b(chapters, output_path, self.book_title or "", self.book_author or "", cover_path)
+            durations = build_m4b(chapters, output_path, self.book_title or "", self.book_author or "", cover_path)
         except BadChapterFileError as e:
             # Name the bad chapter and delete it, so a retry with skip_existing
             # regenerates just that one instead of failing the same way forever (F-33).
@@ -404,7 +418,7 @@ class AudiobookGenerator:
             )
             raise
         try:
-            self._merge_clip_maps(chapters, output_path)
+            self._merge_clip_maps(chapters, durations, output_path)
         except Exception as exc:
             logger.warning("Could not merge chapter clip maps into %s.clips.json: %s", output_path, exc)
             for path in (output_path + ".clips.json", output_path + ".clips.json.part"):
@@ -425,12 +439,12 @@ class AudiobookGenerator:
         logger.info(f"✅ M4B saved: {output_path}")
 
     @staticmethod
-    def _merge_clip_maps(chapters, output_path: str) -> None:
+    def _merge_clip_maps(chapters, durations, output_path: str) -> None:
         """Write a book-level clip map, scaling each chapter's local times to its mux duration.
 
         Missing per-chapter maps are allowed. The AAC stream copied into the M4B may have a
         different measured duration from the provider's pre-encode timeline, so scale each
-        chapter's positions to the same packet duration used by build_m4b.
+        chapter's positions to the duration build_m4b laid it out with (`durations`, seconds).
         """
         mapped_chapters = [(audio_path, audio_path + ".clips.json") for _, audio_path in chapters
                            if os.path.isfile(audio_path + ".clips.json")]
@@ -443,9 +457,9 @@ class AudiobookGenerator:
         mapped_paths = {audio_path: map_path for audio_path, map_path in mapped_chapters}
         merged = []
         elapsed_seconds = 0.0
-        for _, audio_path in chapters:
+        for (_, audio_path), duration in zip(chapters, durations):
             chapter_start_ms = int(round(elapsed_seconds * 1000))
-            elapsed_seconds += math.ceil(_duration_seconds(audio_path) * 1_000_000) / 1_000_000
+            elapsed_seconds += duration
             chapter_end_ms = int(round(elapsed_seconds * 1000))
             chapter_duration_ms = chapter_end_ms - chapter_start_ms
             map_path = mapped_paths.get(audio_path)
