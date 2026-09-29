@@ -21,7 +21,8 @@ from openai import APIConnectionError, APIStatusError, OpenAI
 from audiobook_generator.core.audio_tags import AudioTags
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import delivery
-from audiobook_generator.core.dialogue import DIALOGUE, PARAGRAPH_MARK, Segment, chapter_segments
+from audiobook_generator.core.dialogue import DIALOGUE, NARRATION, PARAGRAPH_MARK, Segment, chapter_segments
+from audiobook_generator.core.speech_tags import has_speech_tag
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.utils.utils import split_text, split_long_sentence, set_audio_tags, merge_audio_segments
 from audiobook_generator.tts_providers.base_tts_provider import BaseTTSProvider
@@ -82,6 +83,13 @@ def _long_silence_ms(audio: AudioSegment) -> int:
         run = run + len(frame) if frame.dBFS <= _BAD_CLIP_SILENCE_DBFS else 0
         longest = max(longest, run)
     return longest
+
+
+def _truncated_ellipsis(audio: AudioSegment, text: str) -> bool:
+    """A drawn-out short line should not end in under a second of audio."""
+    spoken = text.strip().strip('"“”\'‘’').strip()
+    return (len(spoken) <= 15 and spoken.endswith(("…", "..."))
+            and len(spoken.rstrip("….")) >= 4 and len(audio) < 950)
 
 
 def _split_oversized_unit(unit: str) -> List[str]:
@@ -222,6 +230,36 @@ def paragraph_mode_units(text: str, language: str) -> List[Tuple[int, str, int, 
 VoiceOf = Callable[[Segment], str]
 
 
+def _speech_segments(text: str) -> List[List[Segment]]:
+    """Keep short quoted terms inside prose in the narrator's sentence.
+
+    Cast line IDs come from chapter_segments and remain unchanged for real dialogue;
+    this only changes the units sent to TTS. A quoted name such as
+    `before he could, “Lena” materialized` is not a six-character speech line.
+    """
+    result = []
+    for paragraph in chapter_segments(text):
+        spoken = []
+        i = 0
+        while i < len(paragraph):
+            piece = paragraph[i]
+            if (piece.kind == DIALOGUE and not piece.continues and spoken
+                    and spoken[-1].kind == NARRATION and i + 1 < len(paragraph)
+                    and paragraph[i + 1].kind == NARRATION):
+                quoted = piece.text.strip().strip('"“”„«»\'‘’').strip()
+                after = paragraph[i + 1].text
+                if (quoted and len(quoted) <= 30 and len(quoted.split()) <= 2
+                        and quoted[-1] not in '.!?…,:;' and after[:1].islower()
+                        and not has_speech_tag(spoken[-1].text, after)):
+                    spoken[-1] = Segment(NARRATION, 0, f"{spoken[-1].text} {piece.text} {after}")
+                    i += 2
+                    continue
+            spoken.append(piece)
+            i += 1
+        result.append(spoken)
+    return result
+
+
 def voiced_units(text: str, language: str, voice_of: VoiceOf) -> List[Tuple[int, str, bool, str]]:
     """(paragraph number, text, continues_previous, voice) sentence-mode units for multi-voice
     narration. Units are built inside each narration or dialogue segment, never across two, so a
@@ -229,7 +267,7 @@ def voiced_units(text: str, language: str, voice_of: VoiceOf) -> List[Tuple[int,
     within a segment. The first unit of a segment is a normal sentence boundary (sentence pause,
     or the paragraph pause when the paragraph changes)."""
     units: List[Tuple[int, str, bool, str]] = []
-    for number, segments in enumerate(chapter_segments(text)):
+    for number, segments in enumerate(_speech_segments(text)):
         for piece in segments:
             voice = voice_of(piece)
             units.extend((number, unit, continues, voice) for unit, continues in _sentence_units(piece.text, language))
@@ -240,7 +278,7 @@ def voiced_paragraph_units(text: str, language: str, voice_of: VoiceOf) -> List[
     """(paragraph number, text, sentence_count, continues_previous, voice) paragraph-mode units
     for multi-voice narration: each segment is packed like a paragraph of its own."""
     units: List[Tuple[int, str, int, bool, str]] = []
-    for number, segments in enumerate(chapter_segments(text)):
+    for number, segments in enumerate(_speech_segments(text)):
         for piece in segments:
             voice = voice_of(piece)
             units.extend((number, unit, count, continues, voice)
@@ -258,7 +296,7 @@ def adaptive_units(text: str, language: str, voice_of: VoiceOf, mood_of: MoodOf,
     delivery: built inside each narration/dialogue segment exactly like voiced_units, with every
     unit of a segment also tagged with that segment's mood (core.delivery)."""
     units: List[Tuple[int, str, bool, str, str]] = []
-    for number, segments in enumerate(chapter_segments(text)):
+    for number, segments in enumerate(_speech_segments(text)):
         for piece in segments:
             voice, mood = voice_of(piece), mood_of(piece)
             speaker = speaker_of(piece) if speaker_of else None
@@ -273,7 +311,7 @@ def adaptive_paragraph_units(text: str, language: str, voice_of: VoiceOf,
     """Paragraph-mode counterpart of adaptive_units: each segment is packed like a paragraph of
     its own, tagged with both its voice and its mood."""
     units: List[Tuple[int, str, int, bool, str, str]] = []
-    for number, segments in enumerate(chapter_segments(text)):
+    for number, segments in enumerate(_speech_segments(text)):
         for piece in segments:
             voice, mood = voice_of(piece), mood_of(piece)
             speaker = speaker_of(piece) if speaker_of else None
@@ -823,12 +861,18 @@ class OpenAITTSProvider(BaseTTSProvider):
                 response = self._create_speech(**request_kwargs)
                 audio = AudioSegment.from_file(io.BytesIO(response.content), format="wav")
                 silent_ms = _long_silence_ms(audio) if self._is_chatterbox_engine() else 0
-                if silent_ms < _BAD_CLIP_SILENCE_MS:
+                if silent_ms >= _BAD_CLIP_SILENCE_MS:
+                    bad_reason = "near-silent audio"
+                    logger.warning("Chatterbox returned %.1fs of near-silence for %s (attempt %d/%d)",
+                                   silent_ms / 1000, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
+                elif self._is_chatterbox_engine() and _truncated_ellipsis(audio, unit):
+                    bad_reason = "too-short ellipsis audio"
+                    logger.warning("Chatterbox returned %.2fs for the trailing ellipsis in %s (attempt %d/%d)",
+                                   len(audio) / 1000, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
+                else:
                     break
-                logger.warning("Chatterbox returned %.1fs of near-silence for %s (attempt %d/%d)",
-                               silent_ms / 1000, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
             else:
-                raise RuntimeError(f"Chatterbox returned repeated near-silent audio for {chunk_id}")
+                raise RuntimeError(f"Chatterbox returned repeated {bad_reason} for {chunk_id}")
             if sentence_count > 1 and sentence_gap_ms > 0:
                 audio = _stretch_sentence_gaps(audio, sentence_count - 1, sentence_gap_ms)
             if adaptive:

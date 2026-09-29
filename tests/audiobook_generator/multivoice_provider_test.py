@@ -108,6 +108,19 @@ class TestVoicedUnits(unittest.TestCase):
         self.assertEqual(len(single), 2)
         self.assertEqual(single[0][1], text.split(M)[0])
 
+    def test_quoted_name_inside_prose_stays_with_narrator(self):
+        text = 'Before he could answer, “Lena” materialized in the hall. “Stop!” she said.'
+        self.assertEqual([s.line_id for p in chapter_segments(text) for s in p if s.kind == DIALOGUE], [1, 2])
+        units = voiced_units(text, "en", _narrator_or_dialogue)
+        self.assertIn((0, 'Before he could answer, “Lena” materialized in the hall.', False,
+                       'Narrator.wav'), units)
+        self.assertIn((0, '“Stop!”', False, 'Dialogue.wav'), units)
+        self.assertFalse(any(unit == '“Lena”' for _, unit, _, _ in units))
+
+    def test_short_quote_with_speech_tag_keeps_dialogue_voice(self):
+        units = voiced_units('He called out, “Lena” said Mara.', 'en', _narrator_or_dialogue)
+        self.assertIn((0, '“Lena”', False, 'Dialogue.wav'), units)
+
 
 class TestProviderVoices(unittest.TestCase):
 

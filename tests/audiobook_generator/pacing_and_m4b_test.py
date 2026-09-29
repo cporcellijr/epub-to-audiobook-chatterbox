@@ -319,6 +319,19 @@ class TestPacedSpeech(unittest.TestCase):
             self._speak(provider, "The lantern burned steadily beside the window.")
         self.assertEqual(provider.client.audio.speech.create.call_count, 3)
 
+    def test_retries_a_truncated_short_line_ending_in_ellipsis(self):
+        provider = self._provider(400, 1000)
+        provider.client.audio.speech.create.side_effect = [
+            SimpleNamespace(content=_wav_from_segment(_tone(780))),
+            SimpleNamespace(content=_wav_from_segment(_tone(1220))),
+        ]
+        with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow", return_value=123):
+            self._speak(provider, "“She’s…”")
+        self.assertEqual(provider.client.audio.speech.create.call_count, 2)
+        first, second = [call.kwargs for call in provider.client.audio.speech.create.call_args_list]
+        self.assertNotIn("seed", first.get("extra_body", {}))
+        self.assertEqual(second["extra_body"]["seed"], 124)
+
     def test_without_pauses_marks_are_never_spoken(self):
         provider = self._provider(None, None)
         provider.client.audio.speech.create.return_value = SimpleNamespace(content=b"ID3", response=MagicMock())
