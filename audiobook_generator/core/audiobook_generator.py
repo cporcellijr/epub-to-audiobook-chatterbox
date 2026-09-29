@@ -23,6 +23,16 @@ CHAPTER_WORK_FOLDER = ".chapters"
 CHAPTER_MANIFEST_FILENAME = ".manifest.json"
 
 
+def _set_output_owner(path: str) -> None:
+    """Let a library manager with a different container UID manage finished output."""
+    uid = os.environ.get("AUDIOBOOK_OUTPUT_UID")
+    if uid and hasattr(os, "chown"):
+        try:
+            os.chown(path, int(uid), -1)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not set audiobook output owner for %s: %s", path, exc)
+
+
 _MIME_TO_EXT = {
     'image/jpeg': 'jpg',
     'image/png': 'png',
@@ -208,6 +218,7 @@ class AudiobookGenerator:
             # library folder doesn't leave an empty or cover-only "book" behind.
             if not self.config.preview or self.config.output_text:
                 os.makedirs(self.config.output_folder, exist_ok=True)
+                _set_output_owner(self.config.output_folder)
 
             # Log and save book metadata
             self.book_title = book_parser.get_book_title()
@@ -375,6 +386,8 @@ class AudiobookGenerator:
             # the hidden chapter folder.
             final_cover = os.path.join(self.config.output_folder, os.path.basename(cover_path))
             shutil.copyfile(cover_path, final_cover)
+            _set_output_owner(final_cover)
+        _set_output_owner(output_path)
         shutil.rmtree(self.chapter_folder(), ignore_errors=True)
         logger.info(f"✅ M4B saved: {output_path}")
 

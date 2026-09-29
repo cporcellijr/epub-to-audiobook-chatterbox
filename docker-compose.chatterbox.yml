@@ -78,6 +78,8 @@ services:
       - CHATTERBOX_CONFIG=/chatterbox/config.yaml
       # Searchable "Book" picker lists this library.
       - EBOOK_LIBRARY_DIR=/library
+      # Give the library manager's container user ownership of finished book folders/files.
+      - AUDIOBOOK_OUTPUT_UID=${AUDIOBOOK_OUTPUT_UID:-}
       # Optional second engine. Leave unset (the default) to hide the Engine choice entirely.
       - KOKORO_BASE_URL=${KOKORO_BASE_URL:-}
       - KOKORO_DEFAULT_VOICE=${KOKORO_DEFAULT_VOICE:-}
