@@ -18,8 +18,9 @@ from audiobook_generator.core.speech_tags import has_speech_tag
 
 MOOD_SOFT = "soft"
 MOOD_NORMAL = "normal"
+MOOD_EMPHATIC = "emphatic"
 MOOD_EXCITED = "excited"
-MOODS = (MOOD_SOFT, MOOD_NORMAL, MOOD_EXCITED)
+MOODS = (MOOD_SOFT, MOOD_NORMAL, MOOD_EMPHATIC, MOOD_EXCITED)
 
 
 class Baseline(NamedTuple):
@@ -42,12 +43,16 @@ def preset(mood: str, baseline: Baseline) -> Tuple[float, float, float, float]:
     sliders. The formulas keep the spacing the owner approved by ear at their own baseline
     (exaggeration 0.73, CFG 0.5, temperature 0.61): at exactly that baseline they reproduce the
     approved soft/normal/excited numbers (0.35/0.35/0.5/-6dB, baseline/0dB, 1.0/0.4/0.7/+1.5dB).
+    Punctuation alone uses the gentler emphatic preset; explicit speech cues keep full excitement.
     An unrecognised mood is treated as "normal".
     """
     b_exag, b_cfg, b_temp = baseline
     if mood == MOOD_SOFT:
         return (max(0.25, round(b_exag * 0.48, 2)), max(0.2, round(b_cfg - 0.15, 2)),
                 max(0.3, round(b_temp - 0.11, 2)), -6.0)
+    if mood == MOOD_EMPHATIC:
+        return (min(1.0, round(b_exag + 0.12, 2)), max(0.2, round(b_cfg - 0.04, 2)),
+                min(0.9, round(b_temp + 0.03, 2)), 0.5)
     if mood == MOOD_EXCITED:
         return (min(1.0, round(b_exag + 0.27, 2)), max(0.2, round(b_cfg - 0.1, 2)),
                 min(0.9, round(b_temp + 0.09, 2)), 1.5)
@@ -127,13 +132,16 @@ def mood_of(before: str, quote_text: str, after: str) -> str:
     """Rule-based mood for one dialogue line. Verb and adverb cues come only from the speech tag
     around it: the narration right before it (when that is a lead-in, i.e. ends in ',' or ':') and
     the narration right after it, never the spoken words ("I whispered it to him" is not a whisper).
-    From the quotation itself only a closing '!' counts, as excited. A soft cue always wins."""
+    A closing '!' on its own is mild emphasis; an explicit excited speech cue is stronger.
+    A soft cue always wins."""
     lead_in = before if before.rstrip().endswith((",", ":")) else ""
     texts = (lead_in, after)
     if any(_has_soft_cue(t) for t in texts):
         return MOOD_SOFT
-    if any(_has_excited_cue(t) for t in texts) or _ends_with_exclaim(quote_text):
+    if any(_has_excited_cue(t) for t in texts):
         return MOOD_EXCITED
+    if _ends_with_exclaim(quote_text):
+        return MOOD_EMPHATIC
     return MOOD_NORMAL
 
 

@@ -65,7 +65,8 @@ The repo holds the whole stack:
   Chatterbox voices get theirs from a **Voice gender** setting in the Voice lab) and, for Chatterbox,
   by how each voice measures against the profile: **Measure voices** in the Voice lab has each voice
   speak one sentence and measures its pitch, huskiness and liveliness (a voice you add is measured
-  straight away). The main characters stay distinct from each other and the narrator; lines whose
+  straight away). The main characters are matched as a group so a scarce fitting voice is not spent
+  on someone with good alternatives. They stay distinct from each other and the narrator; lines whose
   speaker the LLM couldn't tell get the dialogue voice. The analysis also reads the book's tone
   (point of view, mood, pace, intensity): when the cast is shown, the narrator voice and the book's
   delivery sliders are set from it, and with adaptive delivery each character's lines are read a
@@ -78,9 +79,10 @@ The repo holds the whole stack:
   Validation on a real LLM: `docs/chatterbox-edition/experiments/multivoice/`.
 - **Adaptive delivery** (Chatterbox only, Make tab checkbox, on by default): dialogue tagged
   whispered/murmured/shouted/screamed and the like (rule-based, or the cast's own read in Cast mode)
-  is spoken softer and quieter, or more excited (and a little louder when the clip has headroom), around this book's baseline
-  sliders (its Voice lab exaggeration/CFG/temperature, shown live under the checkbox) instead of one
-  flat delivery for the whole book. A per-book baseline (the Voice lab sliders at the moment you
+  is spoken softer and quieter, or more excited (and a little louder when the clip has headroom),
+  around this book's Voice lab sliders instead of one flat delivery for the whole book. An exclamation
+  mark without an explicit excited speech cue gets milder emphasis, especially for a short quote.
+  A per-book baseline (the Voice lab sliders at the moment you
   **Add to queue**) is sent even with adaptive delivery switched off, so a book can have its own
   "voice" without the mood swings. A mood's gain is applied only as far as the headroom allows (peak
   -1 dBFS), so an excited take can never clip (WORKLOG #17). Voice lab has a **▶ Play soft / normal / excited** button to audition the three deliveries

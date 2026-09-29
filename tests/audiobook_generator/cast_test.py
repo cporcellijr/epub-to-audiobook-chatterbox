@@ -209,6 +209,17 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(suggestions["lead"], "Husky.wav")
         self.assertEqual(suggestions["second"], "Deep.wav")  # the other low voice, not a shared one
 
+    def test_group_match_keeps_a_scarce_clear_voice_for_the_character_who_needs_it(self):
+        cast = _cast({"lead": (50, "female", None), "second": (10, "female", None)})
+        _wants(cast, "lead", pitch="high")
+        _wants(cast, "second", pitch="high", quality="clear")
+        voices = [("Clear.wav", "female"), ("Husky.wav", "female")]
+        traits = {"Clear.wav": {"pitch": 0.8, "husky": 0.0, "expressive": 0.5},
+                  "Husky.wav": {"pitch": 0.9, "husky": 1.0, "expressive": 0.5}}
+        # Taking Clear for the lead's tiny pitch advantage would leave the second with a poor fit.
+        self.assertEqual(cast_store.suggest_voices(cast, voices, "Narrator.wav", traits),
+                         {"lead": "Husky.wav", "second": "Clear.wav"})
+
     def test_without_targets_or_measurements_the_list_order_decides_as_before(self):
         cast = _cast({"a": (5, "female", None)})
         self.assertEqual(cast_store.suggest_voices(cast, FEMALE, "Narrator.wav", TRAITS), {"a": "Deep.wav"})

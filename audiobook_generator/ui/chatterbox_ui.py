@@ -300,7 +300,7 @@ def preview_delivery_range(voice: str, phrase: str, exaggeration: float, cfg_wei
     text = (phrase or "").strip() or PREVIEW_PHRASE
     baseline = delivery.Baseline(float(exaggeration), float(cfg_weight), float(temperature))
     combined: Optional[AudioSegment] = None
-    for mood in delivery.MOODS:
+    for mood in (delivery.MOOD_SOFT, delivery.MOOD_NORMAL, delivery.MOOD_EXCITED):
         mood_exaggeration, mood_cfg_weight, mood_temperature, gain_db = delivery.preset(mood, baseline)
         payload = {
             "text": text,
@@ -1129,8 +1129,10 @@ def _cast_summary(cast: dict) -> str:
     if unknown:
         parts.append(f"{unknown} unknown (spoken by the dialogue voice)")
     moods = cast_store.mood_counts(cast)
-    if moods.get("soft") or moods.get("excited"):
-        parts.append(f"{moods.get('soft', 0)} soft, {moods.get('excited', 0)} excited")
+    mood_parts = [f"{moods[key]} {label}" for key, label in
+                  (("soft", "soft"), ("emphatic", "emphasized"), ("excited", "excited")) if moods.get(key)]
+    if mood_parts:
+        parts.append(", ".join(mood_parts))
     if stats.get("invalid_after_retry"):
         parts.append(f"{stats['invalid_after_retry']} window(s) the LLM never answered usably")
     if stats.get("profiles"):

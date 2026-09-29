@@ -3,6 +3,7 @@ adaptive delivery off, mood-based presets and the narrator voice for every segme
 mode when adaptive delivery is on, gain plus the peak guard applied to the decoded audio, and
 Kokoro's total exemption (no extra_body, no gain, regardless of what a config carries)."""
 import io
+import hashlib
 import os
 import struct
 import tempfile
@@ -14,7 +15,7 @@ from pydub import AudioSegment
 
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import delivery
-from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M
+from audiobook_generator.core.dialogue import DIALOGUE, PARAGRAPH_MARK as M, chapter_segments
 from audiobook_generator.tts_providers.openai_tts_provider import OpenAITTSProvider
 
 
@@ -121,6 +122,22 @@ class TestAdaptiveDeliveryOn(unittest.TestCase):
         self.assertIn({"exaggeration": 0.64, "cfg_weight": 0.35, "temperature": 0.5}, bodies)  # short soft quote
         self.assertIn({"exaggeration": 0.8, "cfg_weight": 0.4, "temperature": 0.7}, bodies)    # short excited quote
         self.assertIn({"exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61}, bodies)    # normal narration
+
+    def test_an_untagged_exclamation_uses_mild_emphasis(self):
+        provider = _provider(**self._baseline_kwargs())
+        responses = _ScriptedResponses()
+        with tempfile.TemporaryDirectory() as tmp:
+            _speak(provider, '"Get out!"', responses, os.path.join(tmp, "out.mp3"))
+        self.assertEqual(responses.calls[0]["extra_body"],
+                         {"exaggeration": 0.76, "cfg_weight": 0.46, "temperature": 0.64})
+
+    def test_a_saved_excited_label_yields_to_the_new_punctuation_rule(self):
+        text = '"Get out!"'
+        provider = _provider(**self._baseline_kwargs())
+        provider.cast = {"chapters": {hashlib.sha1(text.encode("utf-8")).hexdigest():
+                                      {"moods": {"1": "excited"}}}}
+        quote = next(piece for paragraph in chapter_segments(text) for piece in paragraph if piece.kind == DIALOGUE)
+        self.assertEqual(provider._mood_of(text)(quote), delivery.MOOD_EMPHATIC)
 
     def test_gain_and_peak_guard_are_applied_before_the_pauses_are_joined(self):
         provider = _provider(output_format="wav", **self._baseline_kwargs())

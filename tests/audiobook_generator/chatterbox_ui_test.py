@@ -1457,10 +1457,10 @@ class TestCastPanel(unittest.TestCase):
             "anne": {"name": "Anne", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav"},
         })
         cast["chapters"]["h1"] = {"number": 1, "title": "One", "lines": {"1": "anne"},
-                                  "moods": {"1": "soft", "2": "excited", "3": "excited"}}
+                                  "moods": {"1": "soft", "2": "excited", "3": "excited", "4": "emphatic"}}
         self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
         _, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
-        self.assertIn("1 soft, 2 excited", status)
+        self.assertIn("1 soft, 1 emphasized, 2 excited", status)
 
     def test_summary_omits_mood_counts_when_every_line_is_normal(self):
         cast = self._save("k", self.cast_store.STATUS_DONE, {

@@ -11,7 +11,7 @@ from pydub import AudioSegment
 
 from audiobook_generator.core import delivery
 from audiobook_generator.core.delivery import (
-    APPROVED_BASELINE, MOOD_EXCITED, MOOD_NORMAL, MOOD_SOFT, Baseline, mood_of, peak_guard, preset,
+    APPROVED_BASELINE, MOOD_EMPHATIC, MOOD_EXCITED, MOOD_NORMAL, MOOD_SOFT, Baseline, mood_of, peak_guard, preset,
     saved_chatterbox_defaults, segment_moods,
 )
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
@@ -30,6 +30,7 @@ class TestPreset(unittest.TestCase):
     def test_approved_baseline_reproduces_the_approved_numbers_exactly(self):
         self.assertEqual(preset(MOOD_SOFT, APPROVED_BASELINE), (0.35, 0.35, 0.5, -6.0))
         self.assertEqual(preset(MOOD_NORMAL, APPROVED_BASELINE), (0.73, 0.5, 0.61, 0.0))
+        self.assertEqual(preset(MOOD_EMPHATIC, APPROVED_BASELINE), (0.85, 0.46, 0.64, 0.5))
         self.assertEqual(preset(MOOD_EXCITED, APPROVED_BASELINE), (1.0, 0.4, 0.7, 1.5))
 
     def test_relative_presets_at_another_baseline_including_the_floors(self):
@@ -131,9 +132,10 @@ class TestMoodOf(unittest.TestCase):
         for after in ("he said loudly.", "he said angrily.", "he said furiously."):
             self.assertEqual(mood_of("", '"Get out."', after), MOOD_EXCITED, after)
 
-    def test_exclamation_mark_alone_is_excited(self):
-        self.assertEqual(mood_of("", '"Get out!"', ""), MOOD_EXCITED)
-        self.assertEqual(mood_of("", "“Get out!”", ""), MOOD_EXCITED)  # curly quotes
+    def test_exclamation_mark_alone_is_mildly_emphatic(self):
+        self.assertEqual(mood_of("", '"Get out!"', ""), MOOD_EMPHATIC)
+        self.assertEqual(mood_of("", "“Get out!”", ""), MOOD_EMPHATIC)  # curly quotes
+        self.assertEqual(mood_of("", '"Get out!"', "she shouted."), MOOD_EXCITED)
 
     def test_soft_wins_over_an_exclamation_mark(self):
         self.assertEqual(mood_of("", '"Get out!"', "she whispered."), MOOD_SOFT)
@@ -154,7 +156,7 @@ class TestCuesComeFromTheTag(unittest.TestCase):
         self.assertEqual(mood_of("", '"He shouted at me."', "she said."), MOOD_NORMAL)
 
     def test_a_closing_exclamation_in_the_line_still_counts(self):
-        self.assertEqual(mood_of("", '"He shouted at me!"', "she said."), MOOD_EXCITED)
+        self.assertEqual(mood_of("", '"He shouted at me!"', "she said."), MOOD_EMPHATIC)
 
 
 class TestSegmentMoods(unittest.TestCase):

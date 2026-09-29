@@ -126,8 +126,8 @@ def chapter_moods(cast: dict, chapter_hash: str) -> Optional[Dict[int, str]]:
 
 
 def mood_counts(cast: dict) -> Dict[str, int]:
-    """{mood: line count} across every analysed chapter's saved moods (soft/normal/excited)."""
-    counts = {"soft": 0, "normal": 0, "excited": 0}
+    """{mood: line count} across every analysed chapter's saved moods."""
+    counts = {"soft": 0, "normal": 0, "emphatic": 0, "excited": 0}
     for chapter in cast.get("chapters", {}).values():
         for mood in (chapter.get("moods") or {}).values():
             if mood in counts:
@@ -410,6 +410,46 @@ def suggest_narrator(cast: dict, voices: List[Tuple[str, str]], traits: Dict[str
         match_cost(narrator, traits[voice]), candidates.index(voice)))
 
 
+def _match_main_voices(characters: List[Tuple[str, dict]], available: List[Tuple[str, str]],
+                       traits: Dict[str, dict]) -> Dict[str, str]:
+    """Find distinct voices for up to eight prominent characters together.
+
+    The state is a bitmask of characters already assigned. Each voice is considered once, so the
+    search stays small even with a large voice library. If the whole group cannot be matched by
+    gender, try a smaller leading group and leave the rest to the usual sharing fallback.
+    """
+    group = characters[:min(8, len(available))]
+    if len(group) < 2 or not traits or not any(any(voice_targets(c).values()) for _, c in group):
+        return {}
+    for size in range(len(group), 1, -1):
+        selected = group[:size]
+        most_lines = max(1, *(int(c.get("lines", 0)) for _, c in selected))
+        weights = [1 + max(0, int(c.get("lines", 0))) / most_lines for _, c in selected]
+        states = {0: (0.0, (-1,) * size)}
+        for voice_index, (voice, gender) in enumerate(available):
+            next_states = states.copy()  # leaving this voice unused is always allowed
+            for mask, (score, choices) in states.items():
+                for i, (_, character) in enumerate(selected):
+                    if mask & (1 << i):
+                        continue
+                    wanted = character.get("gender", "unknown")
+                    if wanted in ("female", "male") and gender not in (wanted, "neutral"):
+                        continue
+                    # Exact gender stays preferred; a neutral voice can free an exact match for
+                    # another character when that gives the group a better result.
+                    neutral_cost = 5.0 if wanted in ("female", "male") and gender == "neutral" else 0.0
+                    candidate = (score + weights[i] * (neutral_cost + match_cost(character, traits.get(voice))),
+                                 choices[:i] + (voice_index,) + choices[i + 1:])
+                    new_mask = mask | (1 << i)
+                    if new_mask not in next_states or candidate < next_states[new_mask]:
+                        next_states[new_mask] = candidate
+            states = next_states
+        complete = states.get((1 << size) - 1)
+        if complete:
+            return {key: available[voice_index][0] for (key, _), voice_index in zip(selected, complete[1])}
+    return {}
+
+
 def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Optional[str],
                    traits: Optional[Dict[str, dict]] = None) -> Dict[str, str]:
     """Pick a voice for every character that has none yet: {character key: voice}.
@@ -417,8 +457,9 @@ def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Op
     voices are (voice, gender) pairs for the job's engine. Characters with the most lines are
     served first and get a voice nobody else has, matching their gender (a neutral voice fits
     anyone; an unknown gender takes any voice). Among those, the voice whose measured traits
-    best fit the character's profile (match_cost) wins; with no traits or no profile targets,
-    the first in the list does. The narrator's voice is never suggested. Only when every
+    best fit the character's profile (match_cost) wins; the prominent characters are matched as a
+    group so one early choice cannot leave another with a poor fit. With no traits or no profile
+    targets, the first fitting voice in the list wins. The narrator's voice is never suggested. Only when every
     suitable voice is taken does a character share one, with the least-used voice first, so the
     main characters always sound distinct. Voices already chosen by the owner are kept and count
     as taken. A first-person book's narrating character (narrating_character) gets none: their
@@ -439,8 +480,14 @@ def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Op
     ordered = ([item for item in ranked if item[1].get("gender", "unknown") != "unknown"]
                + [item for item in ranked if item[1].get("gender", "unknown") == "unknown"])
     narrating = narrating_character(cast)
+    unassigned = [(key, c) for key, c in ordered if not c.get("voice") and key != narrating]
+    available = [(voice, gender) for voice, gender in candidates if use_count[voice] == 0]
+    suggestions.update(_match_main_voices(unassigned, available, traits))
+    for voice in suggestions.values():
+        use_count[voice] += 1
+    voice_genders = dict(candidates)
     for key, character in ordered:
-        if character.get("voice") or key == narrating:  # a first-person narrator speaks in the narrator's voice
+        if character.get("voice") or key == narrating or key in suggestions:
             continue
         wanted = character.get("gender", "unknown")
 
@@ -449,7 +496,7 @@ def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Op
 
         pool = [voice for voice, gender in candidates if fits(gender)] or [voice for voice, _ in candidates]
         # Prefer an exact gender match over a neutral voice among the unused ones.
-        exact = [voice for voice in pool if dict(candidates)[voice] == wanted and use_count[voice] == 0]
+        exact = [voice for voice in pool if voice_genders[voice] == wanted and use_count[voice] == 0]
         unused = exact or [voice for voice in pool if use_count[voice] == 0]
 
         def cost(voice: str) -> tuple:
