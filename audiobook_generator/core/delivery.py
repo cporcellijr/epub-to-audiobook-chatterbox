@@ -54,6 +54,21 @@ def preset(mood: str, baseline: Baseline) -> Tuple[float, float, float, float]:
     return (round(b_exag, 2), round(b_cfg, 2), round(b_temp, 2), 0.0)
 
 
+def unit_preset(mood: str, baseline: Baseline, text: str) -> Tuple[float, float, float, float]:
+    """Ease mood-specific exaggeration in short units, where Chatterbox is prone to artifacts.
+
+    Mood changes reach their full exaggeration at the same 40-character size used to pack short
+    sentences. Quotes remain separate from narration, so a short quote can still be a tiny request.
+    """
+    values = preset(mood, baseline)
+    if mood == MOOD_NORMAL:
+        return values
+    normal_exaggeration = preset(MOOD_NORMAL, baseline)[0]
+    strength = min(1.0, len(text.strip()) / 40.0)
+    exaggeration = normal_exaggeration + (values[0] - normal_exaggeration) * strength
+    return (round(exaggeration, 2), *values[1:])
+
+
 def guarded_gain(audio: AudioSegment, gain_db: float) -> AudioSegment:
     """A mood's gain, but never more than takes the clip's peak to PEAK_GUARD_DBFS (a louder clip is
     turned down to it, as peak_guard does).

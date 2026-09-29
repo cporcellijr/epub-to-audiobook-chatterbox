@@ -48,6 +48,16 @@ class TestPreset(unittest.TestCase):
     def test_unrecognised_mood_behaves_like_normal(self):
         self.assertEqual(preset("shouting-into-a-pillow", APPROVED_BASELINE), preset(MOOD_NORMAL, APPROVED_BASELINE))
 
+    def test_short_units_dampen_mood_exaggeration_without_changing_normal_delivery(self):
+        short = delivery.unit_preset(MOOD_EXCITED, APPROVED_BASELINE, '"Stop!"')
+        normal = delivery.unit_preset(MOOD_NORMAL, APPROVED_BASELINE, '"Stop!"')
+        full = delivery.unit_preset(MOOD_EXCITED, APPROVED_BASELINE, "A much longer expressive line." * 2)
+
+        self.assertGreater(short[0], APPROVED_BASELINE.exaggeration)
+        self.assertLess(short[0], preset(MOOD_EXCITED, APPROVED_BASELINE)[0])
+        self.assertEqual(normal, preset(MOOD_NORMAL, APPROVED_BASELINE))
+        self.assertEqual(full, preset(MOOD_EXCITED, APPROVED_BASELINE))
+
 
 class TestPeakGuard(unittest.TestCase):
 

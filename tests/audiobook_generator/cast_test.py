@@ -307,7 +307,20 @@ class TestDelivery(unittest.TestCase):
         self.assertEqual(cast_store.suggest_narrator(cast, voices, traits), "Man.wav")
         self.assertIsNone(cast_store.suggest_narrator(cast, voices, {}))  # nothing measured: keep the owner's
         cast["book_tone"]["narrator"] = {"gender": "male"}
-        self.assertIsNone(cast_store.suggest_narrator(cast, voices, traits))  # nothing asked for
+        self.assertEqual(cast_store.suggest_narrator(cast, voices, traits), "Man.wav")
+
+    def test_gender_only_narrator_prefers_matching_gender_then_neutral(self):
+        cast = _cast({})
+        cast["book_tone"] = {"narrator": {"gender": "female"}}
+        voices = [("Neutral.wav", "neutral"), ("Male.wav", "male"), ("Female.wav", "female")]
+        traits = {voice: {"pitch": 0.5, "husky": 0.5, "expressive": 0.5} for voice, _ in voices}
+        self.assertEqual(cast_store.suggest_narrator(cast, voices, traits), "Female.wav")
+        self.assertEqual(cast_store.suggest_narrator(cast, voices[:1], traits), "Neutral.wav")
+
+    def test_narrator_without_gender_or_voice_targets_has_no_suggestion(self):
+        cast = _cast({})
+        cast["book_tone"] = {"narrator": {"gender": "either"}}
+        self.assertIsNone(cast_store.suggest_narrator(cast, FEMALE, TRAITS))
 
 
 class TestFirstPerson(unittest.TestCase):

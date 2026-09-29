@@ -118,8 +118,8 @@ class TestAdaptiveDeliveryOn(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _speak(provider, text, responses, os.path.join(tmp, "out.mp3"))
         bodies = [call["extra_body"] for call in responses.calls]
-        self.assertIn({"exaggeration": 0.35, "cfg_weight": 0.35, "temperature": 0.5}, bodies)   # soft
-        self.assertIn({"exaggeration": 1.0, "cfg_weight": 0.4, "temperature": 0.7}, bodies)      # excited
+        self.assertIn({"exaggeration": 0.64, "cfg_weight": 0.35, "temperature": 0.5}, bodies)  # short soft quote
+        self.assertIn({"exaggeration": 0.8, "cfg_weight": 0.4, "temperature": 0.7}, bodies)    # short excited quote
         self.assertIn({"exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61}, bodies)    # normal narration
 
     def test_gain_and_peak_guard_are_applied_before_the_pauses_are_joined(self):

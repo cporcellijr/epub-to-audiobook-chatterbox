@@ -249,9 +249,11 @@ def voiced_paragraph_units(text: str, language: str, voice_of: VoiceOf) -> List[
 
 
 MoodOf = Callable[[Segment], str]
+SpeakerOf = Callable[[Segment], Optional[str]]
 
 
-def adaptive_units(text: str, language: str, voice_of: VoiceOf, mood_of: MoodOf) -> List[Tuple[int, str, bool, str, str]]:
+def adaptive_units(text: str, language: str, voice_of: VoiceOf, mood_of: MoodOf,
+                   speaker_of: Optional[SpeakerOf] = None) -> List[tuple]:
     """(paragraph number, text, continues_previous, voice, mood) sentence-mode units for adaptive
     delivery: built inside each narration/dialogue segment exactly like voiced_units, with every
     unit of a segment also tagged with that segment's mood (core.delivery)."""
@@ -259,19 +261,24 @@ def adaptive_units(text: str, language: str, voice_of: VoiceOf, mood_of: MoodOf)
     for number, segments in enumerate(chapter_segments(text)):
         for piece in segments:
             voice, mood = voice_of(piece), mood_of(piece)
-            units.extend((number, unit, continues, voice, mood) for unit, continues in _sentence_units(piece.text, language))
+            speaker = speaker_of(piece) if speaker_of else None
+            units.extend((number, unit, continues, voice, mood, speaker) if speaker_of else
+                         (number, unit, continues, voice, mood)
+                         for unit, continues in _sentence_units(piece.text, language))
     return units
 
 
 def adaptive_paragraph_units(text: str, language: str, voice_of: VoiceOf,
-                             mood_of: MoodOf) -> List[Tuple[int, str, int, bool, str, str]]:
+                             mood_of: MoodOf, speaker_of: Optional[SpeakerOf] = None) -> List[tuple]:
     """Paragraph-mode counterpart of adaptive_units: each segment is packed like a paragraph of
     its own, tagged with both its voice and its mood."""
     units: List[Tuple[int, str, int, bool, str, str]] = []
     for number, segments in enumerate(chapter_segments(text)):
         for piece in segments:
             voice, mood = voice_of(piece), mood_of(piece)
-            units.extend((number, unit, count, continues, voice, mood)
+            speaker = speaker_of(piece) if speaker_of else None
+            units.extend((number, unit, count, continues, voice, mood, speaker) if speaker_of else
+                         (number, unit, count, continues, voice, mood)
                          for unit, count, continues in _paragraph_units(piece.text, language))
     return units
 
@@ -523,6 +530,13 @@ class OpenAITTSProvider(BaseTTSProvider):
             return cast_store.character_voice(self.cast, speaker) or dialogue_voice
         return voice_of
 
+    def _speaker_of(self, text: str) -> SpeakerOf:
+        """The cast key behind each dialogue unit, kept even when voices are shared."""
+        if self.cast is None:
+            return lambda piece: None
+        lines = cast_store.chapter_lines(self.cast, hashlib.sha1(text.encode("utf-8")).hexdigest()) or {}
+        return lambda piece: lines.get(piece.line_id) if piece.kind == DIALOGUE else None
+
     def _mood_of(self, text: str) -> MoodOf:
         """The per-segment mood rule for one chapter (adaptive delivery): narration is always
         "normal"; a dialogue line's mood is the cast's saved mood when this is cast mode and the
@@ -575,23 +589,23 @@ class OpenAITTSProvider(BaseTTSProvider):
         return delivery.Baseline(exaggeration, cfg_weight, temperature)
 
     def _character_offsets(self) -> dict:
-        """{voice: exaggeration offset} from the cast's per-character delivery (cast mode with
-        adaptive delivery only; core.cast.voice_exaggeration_offsets)."""
+        """{character key: exaggeration offset} for adaptive cast delivery."""
         if getattr(self, "_offsets", None) is None:
-            self._offsets = (cast_store.voice_exaggeration_offsets(self.cast, self.config.voice_name)
+            self._offsets = (cast_store.exaggeration_offsets(self.cast)
                              if self.cast is not None and self.config.voice_mode == VOICE_MODE_CAST
                              and self._adaptive_active() else {})
         return self._offsets
 
-    def _voice_baseline(self, voice: Optional[str]) -> delivery.Baseline:
-        """The book's baseline, with this voice's character offset when it has one."""
+    def _voice_baseline(self, voice: Optional[str], speaker: Optional[str] = None) -> delivery.Baseline:
+        """The book's baseline, shifted by this speaker's delivery even when a voice is shared."""
         baseline = self._delivery_baseline()
-        offset = self._character_offsets().get(voice or "", 0.0)
+        offset = self._character_offsets().get(speaker or "", 0.0)
         if not offset:
             return baseline
         return baseline._replace(exaggeration=round(min(2.0, max(0.25, baseline.exaggeration + offset)), 2))
 
-    def _delivery_extra_body(self, mood: str, voice: Optional[str] = None) -> Optional[dict]:
+    def _delivery_extra_body(self, mood: str, voice: Optional[str] = None,
+                             speaker: Optional[str] = None, text: str = "") -> Optional[dict]:
         """The Chatterbox-only extra_body sliders for one unit, or None when neither adaptive
         delivery nor a per-book baseline applies (today's plain request, unchanged).
 
@@ -602,7 +616,8 @@ class OpenAITTSProvider(BaseTTSProvider):
         if not self._is_chatterbox_engine() or not (self.config.adaptive_delivery or self._has_custom_baseline()):
             return None
         effective_mood = mood if self.config.adaptive_delivery else delivery.MOOD_NORMAL
-        exaggeration, cfg_weight, temperature, _ = delivery.preset(effective_mood, self._voice_baseline(voice))
+        exaggeration, cfg_weight, temperature, _ = delivery.unit_preset(
+            effective_mood, self._voice_baseline(voice, speaker), text)
         return {"exaggeration": exaggeration, "cfg_weight": cfg_weight, "temperature": temperature}
 
     def __str__(self) -> str:
@@ -716,8 +731,11 @@ class OpenAITTSProvider(BaseTTSProvider):
         if self._adaptive_active():
             voice_of = self._voice_of(text) if self.config.voice_mode != VOICE_MODE_SINGLE else (
                 lambda piece: self.config.voice_name)
-            units = [(paragraph, unit, 1, continues, voice, mood) for paragraph, unit, continues, voice, mood
-                     in adaptive_units(text, language, voice_of, self._mood_of(text))]
+            speaker_of = self._speaker_of(text) if self.config.voice_mode == VOICE_MODE_CAST else None
+            units = [(paragraph, unit, 1, continues, voice, mood, speaker[0]) if speaker_of else
+                     (paragraph, unit, 1, continues, voice, mood)
+                     for paragraph, unit, continues, voice, mood, *speaker in adaptive_units(
+                         text, language, voice_of, self._mood_of(text), speaker_of)]
         elif self.config.voice_mode == VOICE_MODE_SINGLE:
             units = [(paragraph, unit, 1, continues, self.config.voice_name, delivery.MOOD_NORMAL)
                      for paragraph, unit, continues in paced_units(text, language)]
@@ -741,7 +759,8 @@ class OpenAITTSProvider(BaseTTSProvider):
         if self._adaptive_active():
             voice_of = self._voice_of(text) if self.config.voice_mode != VOICE_MODE_SINGLE else (
                 lambda piece: self.config.voice_name)
-            units = adaptive_paragraph_units(text, language, voice_of, self._mood_of(text))
+            speaker_of = self._speaker_of(text) if self.config.voice_mode == VOICE_MODE_CAST else None
+            units = adaptive_paragraph_units(text, language, voice_of, self._mood_of(text), speaker_of)
         elif self.config.voice_mode == VOICE_MODE_SINGLE:
             units = [(paragraph, unit, count, continues, self.config.voice_name, delivery.MOOD_NORMAL)
                      for paragraph, unit, count, continues in paragraph_mode_units(text, language)]
@@ -750,7 +769,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                      continues, voice in voiced_paragraph_units(text, language, self._voice_of(text))]
         self._speak_units(units, output_file, audio_tags)
 
-    def _speak_units(self, units: List[Tuple[int, str, int, bool, str, str]], output_file: str,
+    def _speak_units(self, units: List[tuple], output_file: str,
                      audio_tags: AudioTags) -> None:
         """Request each (paragraph, text, sentence_count, continues_previous, voice, mood) unit at
         speed 1.0, insert the configured pauses between them and export the chapter once.
@@ -772,7 +791,9 @@ class OpenAITTSProvider(BaseTTSProvider):
         pieces: List[bytes] = []
         audio_format = None
         previous_paragraph = None
-        for number, (paragraph, unit, sentence_count, continues_previous, voice, mood) in enumerate(units, 1):
+        for number, item in enumerate(units, 1):
+            paragraph, unit, sentence_count, continues_previous, voice, mood, *speaker = item
+            speaker = speaker[0] if speaker else None
             chunk_id = f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{number}_of_{len(units)}"
             detail = f", sentences={sentence_count}" if self.config.paced_unit_mode == "paragraph" else ""
             if self.config.voice_mode != VOICE_MODE_SINGLE:
@@ -789,7 +810,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                 input=unit,
                 response_format="wav",
             )
-            extra_body = self._delivery_extra_body(mood, voice)
+            extra_body = self._delivery_extra_body(mood, voice, speaker=speaker, text=unit)
             if extra_body is not None:
                 request_kwargs["extra_body"] = extra_body
             for attempt in range(_BAD_CLIP_RETRIES + 1):

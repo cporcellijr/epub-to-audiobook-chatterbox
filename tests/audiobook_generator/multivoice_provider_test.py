@@ -168,6 +168,36 @@ class TestProviderVoices(unittest.TestCase):
             ("Dialogue.wav", '"Who is there?"'),                          # unknown speaker
         ])
 
+    def test_adaptive_delivery_uses_each_speakers_setting_when_their_voice_is_shared(self):
+        text = ('"Ada says this in a complete sentence that is long enough."' + M +
+                '"Bo answers in a complete sentence that is long enough."')
+        cast = cast_store.new_cast("k", "/x.epub", "T", "A", "chatterbox", "Narrator.wav", [1])
+        cast["characters"] = {
+            "ada": {"name": "Ada", "voice": "Shared.wav", "delivery": "even", "lines": 1},
+            "bo": {"name": "Bo", "voice": "Shared.wav", "delivery": "expressive", "lines": 1},
+        }
+        cast["chapters"][cast_store.text_hash(text)] = {
+            "number": 1, "lines": {"1": "ada", "2": "bo"},
+        }
+
+        for mode in ("sentence", "paragraph"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "cast.json")
+                cast_store.save_cast(path, cast)
+                provider = self._provider(
+                    voice_mode="cast", dialogue_voice="Shared.wav", cast_file=path,
+                    adaptive_delivery=True, delivery_exaggeration=0.5,
+                    delivery_cfg_weight=0.5, delivery_temperature=0.8, paced_unit_mode=mode,
+                )
+                tags = SimpleNamespace(title="Ch", author="A", book_title="B", idx=1, cover=None)
+                with patch("audiobook_generator.tts_providers.openai_tts_provider.set_audio_tags"):
+                    provider.text_to_speech(text, os.path.join(tmp, "out.mp3"), tags)
+
+                calls = provider.client.audio.speech.create.call_args_list
+                self.assertEqual([call.kwargs["voice"] for call in calls], ["Shared.wav", "Shared.wav"])
+                self.assertEqual(
+                    [call.kwargs["extra_body"]["exaggeration"] for call in calls], [0.38, 0.62])
+
     def test_cast_mode_with_an_unanalysed_chapter_speaks_all_quotes_with_the_dialogue_voice(self):
         cast = cast_store.new_cast("k", "/x.epub", "T", "A", "chatterbox", "Narrator.wav", [1])
         with tempfile.TemporaryDirectory() as tmp:
