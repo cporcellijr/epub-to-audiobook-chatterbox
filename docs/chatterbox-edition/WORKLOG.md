@@ -955,3 +955,116 @@ It remains above emphatic (0.85/0.46/0.64). The owner still needs to judge the r
 Deleting a voice in the Voice lab previously forgot its measurement but kept its entry in
 `voice_genders.json`, so entries for deleted voices accumulated. Deleting a voice now removes its
 gender entry too. Files deleted outside the app (for example, in Explorer) are still not noticed.
+
+## 22. Batch queuing, and first-person narrators per story (2026-09-29)
+
+### 22.1 Pick books, analyse, press Start once
+
+The owner's workflow is to pick a book and analyse it, then pick the next one while that analysis
+still runs, and so on, and press Start only after choosing every book. Decisions:
+- **Cast is the default voice mode** when an LLM is configured (without one it isn't offered).
+- **With Auto-pick on, the book queues itself when its cast is ready**; nothing starts until
+  **Start queued books**. At Analyse, the Make tab's book options go with the analysis job
+  (`then_queue`). When the job finishes, `JobQueue.on_done` calls `queue_book_after_cast`: it sets
+  the narrator and delivery from the book's tone, exactly as the page does, and queues the book.
+  This runs in the queue rather than the page on purpose. Otherwise a book would only be queued if
+  the page happened to show it when its analysis finished, so analysing book B while A runs would
+  lose A. Anything that fails the usual checks is noted on the analysis row ("book not queued:
+  …"). The output folder is checked at Analyse time, so a clash shows at once.
+- **Add to queue is hidden** while Cast mode and Auto-pick are both on.
+- **Analyses always run ahead of waiting books** (`tick`), so pressing Start early never lets a
+  book generate before a later analysis. **Start** shows as soon as an analysis will bring a book,
+  not only once a book is waiting. Analysing after Start joins the running batch; before, it put
+  the queue back into preparing and held the remaining books.
+
+Known gap: a book analysed earlier, with Auto-pick on, has no Add button. The owner unticks
+Auto-pick to add it, or re-analyses.
+
+### 22.2 Bug: the book tone named the wrong "I"
+
+The first auto-picked book (a first-person novel) was narrated by Zoe. The book tone had named
+Bettie as the "I", so her 263 lines were read in the narrator voice, and the narrator voice was
+matched to her gender. The narrator is Oliver. The tone request (§17.2) sees only paragraphs
+without dialogue. There Bettie is named on every page and Oliver never is: he is only named when
+spoken to ("Hey, Oliver"). The attribution had it right: 73 of the 74 lines tagged "I said" / "I
+told her" were Oliver's, and one was Jake's.
+
+### 22.3 Point of view and narrator per chapter
+
+- **Point of view by pronoun rate, with no LLM** (`chapter_point_of_view`): a chapter is first
+  person when its narration (text outside quotes) has at least 20 I/me/my per 1,000 words. Measured
+  rates were 80–120 in first-person chapters, 36 in the lowest seen, and 0 in every third-person
+  chapter checked. Comparing with he/she didn't help: "she" was as frequent as "I" in the
+  first-person chapters. A chapter with fewer than 150 narration words stays undecided and follows
+  its neighbours.
+- **The "I" comes from attribution** (`chapter_narrators`): a chapter's narrator is whoever its
+  "I said" lines (`speech_tags.first_person_tagged`) were attributed to, if at least 2 of them and
+  more than half agree. Each chapter votes on its own. At first, consecutive first-person chapters
+  were pooled as one story, but in Greene Shorts Volume 2 two first-person stories sit side by
+  side, and the pooled vote gave Irene's name to Nate's story (18 of 18 of its lines were Nate's). A
+  chapter with too few votes follows the chapter before it (else after), then the run's pooled
+  vote. Only a run with no "I said" lines at all falls back: to the book tone when it is the book's
+  only first-person run, else to one tone request about that run alone.
+- **The book's own point of view follows its chapters** (`apply_chapter_narrators`): first person
+  when most of the narration words are, told by whoever narrates most of them. This overrides the
+  tone's guess.
+- **The generator reads each chapter's narrator** (`cast.chapter_narrator`). A third-person chapter
+  has none. A cast analysed before this change falls back to the book-level narrator.
+- **A first-person story told by someone other than the book's own "I" is narrated in that
+  character's voice** (`cast.chapter_narrator_voice`), narration and lines alike. Otherwise one
+  narrator voice, chosen from a mostly third-person book's tone, read a man's first-person story in
+  a female voice (Volume 2: Gianna reading Nate). The teller's suggested voice already fits their
+  gender and profile and is distinct from the others, so no new pick is needed. The owner changes it
+  in the editor as for any character. The cast panel lists each story's teller and voice.
+  First-person novels are unchanged: their "I" is the book narrator.
+
+A pronoun scan of the library's 34 collection-like titles (out of 1,518 books) found 19 that mix
+points of view. Several were true collections: Greene Shorts, Aberrations, Here Be Monsters. Others
+were long series with a single first-person chapter, most likely an author's note. Such a chapter
+costs at most one extra tone request and has no dialogue for a narrator to speak.
+
+### 22.4 Aliases: names only, family words per chapter
+
+The same runs showed characters collecting aliases that aren't names: Chris had "he", "honey" and
+"child", and others had "Himself" and "Herself". In Greene Shorts Volume 1, every mother in six
+stories merged into one "Terri" through "Mom", "Ma", "Mommy" and "Mama": 312 lines, "intimate with
+Rob, Dennis, Henry, Jake, Scott", with her first line from another story.
+- **Never aliases** (`usable_alias`): pronouns (reflexive ones too), pet names, generic words ("the
+  woman", "child") and descriptions ("his mom"). A pronoun answered as a speaker counts as an
+  unknown speaker.
+- **Family words ("Mom", "Grandpa", "Step Mom", "little brother", in-laws) name one person only
+  within a chapter** (`Roster.chapter_aliases`, reset by `new_chapter`). They are never saved with
+  the character. Within one chapter they still merge ("said Mom"); across chapters only real names
+  do. In a novel the cost is that a stray "said Mom" in a later chapter may become its own row. That
+  follows the Roster's rule that splitting a character is cheaper than a wrong merge.
+- **"I" stays an alias.** In a first-person book the model uses it for the narrator (Oliver had
+  it). In Volume 2 it did not carry across stories: Nate had "I", yet Irene's story's lines went to
+  Irene.
+
+Real story boundaries, which would give each story its own character list, are not detected: the
+EPUB parser follows the reading order and keeps no grouping.
+
+### 22.5 Live checks
+
+- **The first-person novel, re-analysed from scratch:** Oliver in all 8 chapters, narrator Gabriel
+  (male), Bettie in her own voice (Zoe). The book queued itself and generated.
+- **Home Temptation 4 (three third-person stories):** every story chapter came out third person, in
+  line with the tone; no narrator.
+- **Greene Shorts Volume 1:** chapter 5 narrated by Terri and chapter 7 by Scott, the rest third
+  person. This was the run that exposed the "Mom" merge. It was deleted and not generated.
+- **Greene Shorts Volume 2:** chapters 3 (Nate) and 4 (Irene) are first person, 5–8 third. The
+  per-chapter vote was applied to the saved cast and to the queued job's snapshot without an LLM
+  (backups in `data/cast_backups/`). Narration: Thomas (Nate), Elena (Irene), Gianna for the rest.
+
+Not yet judged by ear: the per-story narrator voices. Elena is also that book's dialogue voice, so
+the few unknown-speaker lines in Irene's story will sound like her.
+
+### 22.6 Tests
+
+621 pass (595 before; 26 new). They cover:
+- the batch flow: queuing after the cast, analyses first, Start visibility, and the note on the
+  analysis row;
+- pronoun point of view, per-chapter votes (including side-by-side stories), the per-run LLM
+  fallback and the book-level override;
+- the chapter narrator and teller voice in the provider;
+- alias filtering and chapter-scoped family words.
