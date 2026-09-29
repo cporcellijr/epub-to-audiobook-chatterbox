@@ -888,5 +888,10 @@ joins. Both takes were replaced, with short fades at the joins, in a second sepa
 Duration and silence checks cannot reliably detect every brief phonetic artifact; a listening
 preview remains useful for these cases. The original audiobooks were left unchanged.
 
+A subsequent listening check found the second repair's short narrator take near 10 seconds
+sounded worse, while its interrupted line near 15 seconds improved. The absence of a visible
+splice spike did not predict listening quality. Three contextual comparisons now vary only the
+short narrator take; the improved later line is held fixed while choosing a replacement by ear.
+
 The audiobook test suite passed all 580 tests after the provider changes. The running app loaded
 the updated code, and the repaired M4Bs retained their chapter markers, cover art and metadata.
