@@ -864,3 +864,29 @@ no suggestion and a freed voice, the narrator following their profile, no delive
 provider's voice rule, the table/editor/Sample flow, the unnamed narrator, and "Unknown" as a
 character. Not measured by ear: whether one voice for narration and the narrator's dialogue sounds
 right across a whole first-person book.
+
+## 19. Chatterbox artifact hunt: short dialogue and quoted narration (2026-09-29)
+
+Two completed audiobooks exposed defects that the existing three-second silence check missed.
+In one, a short utterance ending in an ellipsis produced 0.78 seconds of damaged audio. A quoted
+name embedded in prose was also split out as dialogue and stretched to 3.2 seconds. Speech-unit
+construction now keeps a short, unpunctuated quoted term with its surrounding narration when no
+speech tag is present. Cast line IDs stay unchanged. A short trailing-ellipsis clip under 0.95
+seconds is retried with a new seed.
+
+In a later book, alignment of the chapter's 243 speech units with the final M4B found three more
+defects in one passage: a 19-character quote lasted about 7.1 seconds, a 60-character quote lasted
+about 1.2 seconds, and a 20-character interrupted quote ran for over 20 seconds. The last had a
+mismatched end quote in the source. The provider now repairs that punctuation before sending it to
+Chatterbox and retries a quoted clip whose duration is implausible for its text length. Repeated
+bad results fail the chapter instead of entering the final audiobook.
+
+The first manual repair removed the large distortions, but review found two small residual
+artifacts: one in a preserved narrator clip near the 10-second mark of the preview, and one inside
+a newly generated interrupted line near 15–16 seconds. Waveform checks found no click at the
+joins. Both takes were replaced, with short fades at the joins, in a second separate repair.
+Duration and silence checks cannot reliably detect every brief phonetic artifact; a listening
+preview remains useful for these cases. The original audiobooks were left unchanged.
+
+The audiobook test suite passed all 580 tests after the provider changes. The running app loaded
+the updated code, and the repaired M4Bs retained their chapter markers, cover art and metadata.
