@@ -298,12 +298,11 @@ def exaggeration_offset(character: dict) -> float:
 
 def exaggeration_offsets(cast: dict) -> Dict[str, float]:
     """{character key: exaggeration offset}. A delivery the owner set is applied as it is (+/-
-    CHARACTER_EXAGGERATION_STEP, or 0 for "as the book"). One from the profile is centred on the
-    cast's line-weighted average and capped at the step: measured 2026-09-28, the model called 5 of
-    6 characters of a dramatic book "expressive", and uncentred that made nearly all its dialogue
-    louder instead of making characters differ. The book's tone sets the level (the narrator's
-    sliders); characters differ around it. A character with no delivery at all (no profile), and a
-    first-person book's narrating character, stay as the book and don't count in the average."""
+    CHARACTER_EXAGGERATION_STEP, or 0 for "as the book"). One from the profile is partly centred
+    on the cast's line-weighted average and capped at the step. Removing half the average keeps an
+    "expressive" cast a little livelier than the book without adding the full step to every line.
+    A character with no delivery at all (no profile), and a first-person book's narrating
+    character, stay as the book and don't count in the average."""
     characters = cast.get("characters", {})
     narrating = narrating_character(cast)  # reads in the narrator's voice and delivery: no offset, not averaged
     owner_set = {key for key, c in characters.items() if (c.get("delivery") or "auto") != "auto" and key != narrating}
@@ -318,7 +317,7 @@ def exaggeration_offsets(cast: dict) -> Dict[str, float]:
         if key in owner_set:
             offsets[key] = round(scores[key] * CHARACTER_EXAGGERATION_STEP, 2)
         elif key in weights:
-            step = CHARACTER_EXAGGERATION_STEP * (scores[key] - mean)
+            step = CHARACTER_EXAGGERATION_STEP * (scores[key] - mean / 2)
             offsets[key] = round(max(-CHARACTER_EXAGGERATION_STEP, min(CHARACTER_EXAGGERATION_STEP, step)), 2)
         else:
             offsets[key] = 0.0

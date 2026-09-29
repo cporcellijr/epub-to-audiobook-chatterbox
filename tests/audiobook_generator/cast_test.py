@@ -274,7 +274,7 @@ class TestDelivery(unittest.TestCase):
                          cast_store.CHARACTER_EXAGGERATION_STEP)
         self.assertEqual(cast_store.exaggeration_offset({}), 0.0)
 
-    def test_profile_deliveries_are_centred_on_the_cast_and_the_owners_are_kept(self):
+    def test_profile_deliveries_are_partly_centred_and_the_owners_are_kept(self):
         # Measured live: nearly every character of a dramatic book came back "expressive".
         cast = _cast({f"c{n}": (10, "female", None) for n in range(5)})
         cast["characters"]["calm"] = {"name": "Calm", "aliases": [], "gender": "male", "age": "adult", "lines": 10}
@@ -282,12 +282,20 @@ class TestDelivery(unittest.TestCase):
             _wants(cast, f"c{n}", delivery="expressive")
         _wants(cast, "calm", delivery="even")
         offsets = cast_store.exaggeration_offsets(cast)
-        self.assertEqual(offsets["c0"], 0.04)    # expressive, like most: only a little above the book
+        self.assertEqual(offsets["c0"], 0.08)    # expressive, like most: a little above the book
         self.assertEqual(offsets["calm"], -0.12)  # the one even character stands out (capped at the step)
         cast["characters"]["c0"]["delivery"] = "expressive"  # the owner's own setting is applied as it is
         self.assertEqual(cast_store.exaggeration_offsets(cast)["c0"], 0.12)
         cast["characters"]["extra"] = {"name": "Extra", "aliases": [], "gender": "male", "age": "adult", "lines": 2}
         self.assertEqual(cast_store.exaggeration_offsets(cast)["extra"], 0.0)  # no profile: as the book
+
+    def test_an_all_expressive_cast_keeps_a_small_boost(self):
+        cast = _cast({"lead": (93, "male", None), "second": (62, "female", None),
+                      "third": (61, "female", None), "fourth": (57, "female", None)})
+        for key in cast["characters"]:
+            _wants(cast, key, delivery="expressive")
+        self.assertEqual(cast_store.exaggeration_offsets(cast),
+                         {key: 0.06 for key in cast["characters"]})
 
     def test_offsets_are_looked_up_by_voice_never_for_the_narrator_or_a_mixed_voice(self):
         cast = _cast({"a": (5, "female", "A.wav"), "b": (4, "male", "B.wav"), "c": (3, "male", "B.wav"),
