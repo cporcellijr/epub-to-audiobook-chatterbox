@@ -22,6 +22,8 @@ import tempfile
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+from audiobook_generator.core.delivery import MOODS
+
 CASTS_FOLDER = "casts"
 VOICE_GENDERS_FILE = "voice_genders.json"
 CAST_VERSION = 1
@@ -127,7 +129,7 @@ def chapter_moods(cast: dict, chapter_hash: str) -> Optional[Dict[int, str]]:
 
 def mood_counts(cast: dict) -> Dict[str, int]:
     """{mood: line count} across every analysed chapter's saved moods."""
-    counts = {"soft": 0, "normal": 0, "emphatic": 0, "excited": 0}
+    counts = {mood: 0 for mood in MOODS}
     for chapter in cast.get("chapters", {}).values():
         for mood in (chapter.get("moods") or {}).values():
             if mood in counts:
@@ -324,24 +326,6 @@ def exaggeration_offsets(cast: dict) -> Dict[str, float]:
     return offsets
 
 
-def voice_exaggeration_offsets(cast: dict, narrator_voice: Optional[str]) -> Dict[str, float]:
-    """{voice: exaggeration offset} for the voices the cast gives its characters (exaggeration_offsets).
-    Units carry a voice, not a character, so this is looked up by voice: the narrator's voice never
-    has an offset, and neither does a voice shared by characters whose offsets differ."""
-    by_character = exaggeration_offsets(cast)
-    offsets: Dict[str, float] = {}
-    mixed = set()
-    for key, character in cast.get("characters", {}).items():
-        voice = character.get("voice")
-        if not voice or voice == narrator_voice:
-            continue
-        offset = by_character[key]
-        if voice in offsets and offsets[voice] != offset:
-            mixed.add(voice)
-        offsets.setdefault(voice, offset)
-    return {voice: offset for voice, offset in offsets.items() if offset and voice not in mixed}
-
-
 def narrator_delivery(book_tone: Optional[dict], base: Tuple[float, float, float]) -> Tuple[float, float, float]:
     """(exaggeration, cfg_weight, temperature) for the narrator: the base sliders nudged by the
     book's intensity and pace; unchanged when the book tone says nothing about them."""
@@ -418,10 +402,16 @@ def _match_main_voices(characters: List[Tuple[str, dict]], available: List[Tuple
     """Find distinct voices for up to eight prominent characters together.
 
     The state is a bitmask of characters already assigned. Each voice is considered once, so the
-    search stays small even with a large voice library. If the whole group cannot be matched by
-    gender, try a smaller leading group and leave the rest to the usual sharing fallback.
+    search stays small even with a large voice library. A character no available voice fits by
+    gender is left out, so they can't block the others. If the whole group still cannot be matched
+    by gender, try a smaller leading group and leave the rest to the usual sharing fallback.
     """
-    group = characters[:min(8, len(available))]
+    def fits(character: dict, gender: str) -> bool:
+        wanted = character.get("gender", "unknown")
+        return wanted not in ("female", "male") or gender in (wanted, "neutral")
+
+    matchable = [(key, c) for key, c in characters if any(fits(c, gender) for _, gender in available)]
+    group = matchable[:min(8, len(available))]
     if len(group) < 2 or not traits or not any(any(voice_targets(c).values()) for _, c in group):
         return {}
     for size in range(len(group), 1, -1):
@@ -435,9 +425,9 @@ def _match_main_voices(characters: List[Tuple[str, dict]], available: List[Tuple
                 for i, (_, character) in enumerate(selected):
                     if mask & (1 << i):
                         continue
-                    wanted = character.get("gender", "unknown")
-                    if wanted in ("female", "male") and gender not in (wanted, "neutral"):
+                    if not fits(character, gender):
                         continue
+                    wanted = character.get("gender", "unknown")
                     # Exact gender stays preferred; a neutral voice can free an exact match for
                     # another character when that gives the group a better result.
                     neutral_cost = 5.0 if wanted in ("female", "male") and gender == "neutral" else 0.0

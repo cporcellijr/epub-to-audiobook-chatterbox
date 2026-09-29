@@ -78,6 +78,27 @@ class TestProcessChapterPartialWrite(unittest.TestCase):
         self.assertEqual(sorted(os.path.basename(path) for path in owned),
                          ["0001_Chapter_One.mp3", "0001_Chapter_One.txt"])
 
+    def test_a_killed_runs_partial_clip_map_is_not_adopted(self):
+        for name in (".0001_Chapter_One.mp3.part.clips.json", ".0001_Chapter_One.mp3.part.clips.json.tmp"):
+            with open(os.path.join(self.tmp.name, name), "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "duration_ms": 1, "clips": []}, f)
+        with patch("audiobook_generator.core.audiobook_generator.get_tts_provider", return_value=_provider()):
+            self.assertTrue(self.generator.process_chapter(1, "Chapter One", "text"))
+        self.assertEqual(self._files(), [".manifest.json", "0001_Chapter_One.mp3"])
+
+    def test_an_unfinished_clip_map_write_leaves_nothing_behind(self):
+        provider = _provider()
+        write_audio = provider.text_to_speech.side_effect
+
+        def text_to_speech(text, output_file, audio_tags):
+            write_audio(text, output_file, audio_tags)
+            open(output_file + ".clips.json.tmp", "w").close()  # the map's write failed part way
+
+        provider.text_to_speech.side_effect = text_to_speech
+        with patch("audiobook_generator.core.audiobook_generator.get_tts_provider", return_value=provider):
+            self.assertTrue(self.generator.process_chapter(1, "Chapter One", "text"))
+        self.assertEqual(self._files(), [".manifest.json", "0001_Chapter_One.mp3"])
+
     def test_failed_chapter_removes_partial_clip_map(self):
         with patch("audiobook_generator.core.audiobook_generator.get_tts_provider",
                    return_value=_provider(fail=True, clip_map={"version": 1, "duration_ms": 1, "clips": []})):

@@ -182,6 +182,14 @@ class TestSegmentMoods(unittest.TestCase):
         text = f'She whispered, "First part.{M}"Second part," she said.'
         self.assertEqual(segment_moods(chapter_segments(text)), {1: MOOD_SOFT, 2: MOOD_SOFT})
 
+    def test_an_exclamation_alone_never_calms_or_raises_a_continued_speech(self):
+        shout = f'He shouted, "Run to the gate.{M}"Don\'t stop!'
+        self.assertEqual(segment_moods(chapter_segments(shout)), {1: MOOD_EXCITED, 2: MOOD_EXCITED})
+        whisper = f'She whispered, "Stay low.{M}"Not a sound!'
+        self.assertEqual(segment_moods(chapter_segments(whisper)), {1: MOOD_SOFT, 2: MOOD_SOFT})
+        plain = f'"Run to the gate.{M}"Don\'t stop!'
+        self.assertEqual(segment_moods(chapter_segments(plain)), {1: MOOD_NORMAL, 2: MOOD_EMPHATIC})
+
     def test_a_clear_new_cue_in_a_continued_paragraph_overrides_the_inherited_mood(self):
         text = f'She whispered, "First part.{M}"Second part," he shouted.'
         self.assertEqual(segment_moods(chapter_segments(text)), {1: MOOD_SOFT, 2: MOOD_EXCITED})

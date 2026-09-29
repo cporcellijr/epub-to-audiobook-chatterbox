@@ -198,6 +198,12 @@ class AudiobookGenerator:
             partial_file = os.path.join(os.path.dirname(output_file), f".{safe_audio_name}.part")
             partial_map = partial_file + ".clips.json"
             output_map = output_file + ".clips.json"
+            # The provider writes its clip map via "<map>.tmp". Either can be left by a run that was
+            # killed; a stale map must not be adopted by a provider that writes none this time.
+            partial_leftovers = (partial_map, partial_map + ".tmp")
+            for leftover in partial_leftovers:
+                if os.path.exists(leftover):
+                    os.remove(leftover)
             try:
                 tts_provider.text_to_speech(text, partial_file, audio_tags)
                 os.replace(partial_file, output_file)
@@ -219,12 +225,13 @@ class AudiobookGenerator:
             finally:
                 if os.path.exists(partial_file):
                     os.remove(partial_file)
-                if os.path.exists(partial_map):
-                    try:
-                        os.remove(partial_map)
-                    except OSError as exc:
-                        logger.warning("Could not remove partial clip map for chapter %s at %s: %s", idx,
-                                       partial_map, exc)
+                for leftover in partial_leftovers:
+                    if os.path.exists(leftover):
+                        try:
+                            os.remove(leftover)
+                        except OSError as exc:
+                            logger.warning("Could not remove partial clip map for chapter %s at %s: %s", idx,
+                                           leftover, exc)
             self._update_manifest(safe_audio_name, original_chapter_number, text_hash)
 
             logger.info(f"✅ Converted chapter {idx}: {title}, output file: {output_file}")

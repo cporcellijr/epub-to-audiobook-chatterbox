@@ -220,6 +220,16 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(cast_store.suggest_voices(cast, voices, "Narrator.wav", traits),
                          {"lead": "Husky.wav", "second": "Clear.wav"})
 
+    def test_a_lead_no_voice_fits_does_not_stop_the_others_being_matched_together(self):
+        cast = _cast({"lead": (90, "male", None), "second": (50, "female", None), "third": (10, "female", None)})
+        _wants(cast, "second", pitch="high")
+        _wants(cast, "third", pitch="high", quality="clear")
+        voices = [("Clear.wav", "female"), ("Husky.wav", "female")]
+        traits = {"Clear.wav": {"pitch": 0.8, "husky": 0.0, "expressive": 0.5},
+                  "Husky.wav": {"pitch": 0.9, "husky": 1.0, "expressive": 0.5}}
+        suggestions = cast_store.suggest_voices(cast, voices, "Narrator.wav", traits)
+        self.assertEqual((suggestions["second"], suggestions["third"]), ("Husky.wav", "Clear.wav"))
+
     def test_without_targets_or_measurements_the_list_order_decides_as_before(self):
         cast = _cast({"a": (5, "female", None)})
         self.assertEqual(cast_store.suggest_voices(cast, FEMALE, "Narrator.wav", TRAITS), {"a": "Deep.wav"})
@@ -296,14 +306,6 @@ class TestDelivery(unittest.TestCase):
             _wants(cast, key, delivery="expressive")
         self.assertEqual(cast_store.exaggeration_offsets(cast),
                          {key: 0.06 for key in cast["characters"]})
-
-    def test_offsets_are_looked_up_by_voice_never_for_the_narrator_or_a_mixed_voice(self):
-        cast = _cast({"a": (5, "female", "A.wav"), "b": (4, "male", "B.wav"), "c": (3, "male", "B.wav"),
-                      "d": (2, "female", "Narrator.wav")})
-        for key, delivery in (("a", "expressive"), ("b", "even"), ("c", "expressive"), ("d", "even")):
-            cast["characters"][key]["delivery"] = delivery
-        self.assertEqual(cast_store.voice_exaggeration_offsets(cast, "Narrator.wav"),
-                         {"A.wav": cast_store.CHARACTER_EXAGGERATION_STEP})
 
     def test_the_narrators_sliders_follow_the_books_intensity_and_pace(self):
         base = (0.73, 0.5, 0.61)

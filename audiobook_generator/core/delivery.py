@@ -59,19 +59,22 @@ def preset(mood: str, baseline: Baseline) -> Tuple[float, float, float, float]:
     return (round(b_exag, 2), round(b_cfg, 2), round(b_temp, 2), 0.0)
 
 
-def unit_preset(mood: str, baseline: Baseline, text: str) -> Tuple[float, float, float, float]:
-    """Ease mood-specific delivery in short units, where Chatterbox is prone to artifacts.
+def short_line_strength(text: str) -> float:
+    """How much of a delivery change a unit gets, 0.0-1.0: none up to 12 characters, easing in to
+    all of it at 40, since Chatterbox is prone to artifacts on short, strongly shaded requests."""
+    return min(1.0, max(0.0, (len(text.strip()) - 12) / 28.0))
 
-    Units up to 12 characters use the book's normal settings. Mood adjustments then ease in
-    gradually, reaching their full values at 40 characters. Quotes remain separate from narration,
-    so a short quote can still be a tiny request.
+
+def unit_preset(mood: str, baseline: Baseline, text: str) -> Tuple[float, float, float, float]:
+    """Ease mood-specific delivery in short units (short_line_strength): units up to 12 characters
+    use the book's normal settings. Quotes remain separate from narration, so a short quote can
+    still be a tiny request.
     """
     values = preset(mood, baseline)
     if mood == MOOD_NORMAL:
         return values
     normal = preset(MOOD_NORMAL, baseline)
-    length = len(text.strip())
-    strength = min(1.0, max(0.0, (length - 12) / 28.0))
+    strength = short_line_strength(text)
     return tuple(round(start + (end - start) * strength, 2)
                  for start, end in zip(normal, values))
 
@@ -173,9 +176,13 @@ def segment_moods(paragraphs: List[List[Segment]]) -> Dict[int, str]:
             after = segments[i + 1].text if i + 1 < len(segments) and segments[i + 1].kind == NARRATION else ""
             if piece.continues:
                 # A speech continued over paragraphs keeps its mood, unless this paragraph gives a
-                # clear new cue of its own ("... and run!" he shouted).
+                # clear new cue of its own ("... and run!" he shouted). A '!' alone only lifts a
+                # speech that had no mood yet; it never calms a shout or raises a whisper.
+                inherited = moods.get(piece.line_id - 1, MOOD_NORMAL)
                 own = mood_of(before, piece.text, after)
-                moods[piece.line_id] = own if own != MOOD_NORMAL else moods.get(piece.line_id - 1, MOOD_NORMAL)
+                if own == MOOD_NORMAL or (own == MOOD_EMPHATIC and inherited != MOOD_NORMAL):
+                    own = inherited
+                moods[piece.line_id] = own
                 continue
             moods[piece.line_id] = mood_of(before, piece.text, after)
             cue = _cue_mood(before, after)
