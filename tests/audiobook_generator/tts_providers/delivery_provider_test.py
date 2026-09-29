@@ -67,16 +67,21 @@ def _speak(provider: OpenAITTSProvider, text: str, responses: _ScriptedResponses
         provider.text_to_speech(text, output_file, tags)
 
 
+def _settings(call: dict) -> dict:
+    return {key: value for key, value in call.get("extra_body", {}).items() if key != "seed"}
+
+
 class TestBaselineWithAdaptiveOff(unittest.TestCase):
 
-    def test_adaptive_off_and_no_baseline_sends_exactly_todays_request_kwargs(self):
+    def test_adaptive_off_and_no_baseline_only_sends_a_seed_for_short_lines(self):
         provider = _provider()
         responses = _ScriptedResponses()
         with tempfile.TemporaryDirectory() as tmp:
             _speak(provider, '"Fine," she said.', responses, os.path.join(tmp, "out.mp3"))
         self.assertTrue(responses.calls)
         for call in responses.calls:
-            self.assertNotIn("extra_body", call)
+            self.assertEqual(_settings(call), {})
+            self.assertGreater(call["extra_body"]["seed"], 0)
 
     def test_a_baseline_with_adaptive_off_sends_the_plain_baseline_on_every_request(self):
         provider = _provider(delivery_exaggeration=0.8, delivery_cfg_weight=0.45, delivery_temperature=0.5)
@@ -86,7 +91,7 @@ class TestBaselineWithAdaptiveOff(unittest.TestCase):
             _speak(provider, '"Fine," she whispered.', responses, os.path.join(tmp, "out.mp3"))
         self.assertTrue(responses.calls)
         for call in responses.calls:
-            self.assertEqual(call["extra_body"], {"exaggeration": 0.8, "cfg_weight": 0.45, "temperature": 0.5})
+            self.assertEqual(_settings(call), {"exaggeration": 0.8, "cfg_weight": 0.45, "temperature": 0.5})
 
     def test_a_partial_baseline_is_filled_in_from_chatterbox_saved_defaults(self):
         provider = _provider(delivery_exaggeration=0.9)  # cfg/temperature left unset
@@ -95,7 +100,7 @@ class TestBaselineWithAdaptiveOff(unittest.TestCase):
                   return_value=delivery.Baseline(0.1, 0.2, 0.3)):
             with tempfile.TemporaryDirectory() as tmp:
                 _speak(provider, '"Fine."', responses, os.path.join(tmp, "out.mp3"))
-        self.assertEqual(responses.calls[0]["extra_body"], {"exaggeration": 0.9, "cfg_weight": 0.2, "temperature": 0.3})
+        self.assertEqual(_settings(responses.calls[0]), {"exaggeration": 0.9, "cfg_weight": 0.2, "temperature": 0.3})
 
 
 class TestAdaptiveDeliveryOn(unittest.TestCase):
@@ -112,24 +117,35 @@ class TestAdaptiveDeliveryOn(unittest.TestCase):
             _speak(provider, text, responses, os.path.join(tmp, "out.mp3"))
         self.assertEqual({call["voice"] for call in responses.calls}, {"Narrator.wav"})
 
-    def test_each_segments_mood_preset_is_sent_via_extra_body(self):
+    def test_very_short_mooded_quotes_use_the_book_baseline(self):
         provider = _provider(**self._baseline_kwargs())
         responses = _ScriptedResponses()
         text = f'She whispered, "Go now."{M}"Get out!" he shouted.'
         with tempfile.TemporaryDirectory() as tmp:
             _speak(provider, text, responses, os.path.join(tmp, "out.mp3"))
-        bodies = [call["extra_body"] for call in responses.calls]
-        self.assertIn({"exaggeration": 0.64, "cfg_weight": 0.35, "temperature": 0.5}, bodies)  # short soft quote
-        self.assertIn({"exaggeration": 0.8, "cfg_weight": 0.4, "temperature": 0.7}, bodies)    # short excited quote
-        self.assertIn({"exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61}, bodies)    # normal narration
+        bodies = [_settings(call) for call in responses.calls]
+        baseline = {"exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61}
+        self.assertGreaterEqual(bodies.count(baseline), 2)  # both short mooded quotes
+        self.assertIn(baseline, bodies)                     # normal narration
+
+    def test_medium_mooded_quote_eases_parameters_toward_its_full_preset(self):
+        provider = _provider(**self._baseline_kwargs())
+        responses = _ScriptedResponses()
+        with tempfile.TemporaryDirectory() as tmp:
+            _speak(provider, 'She whispered, "I will remember this."', responses,
+                   os.path.join(tmp, "out.mp3"))
+        # The medium quote receives only part of the soft preset.
+        quote_body = next(_settings(call) for call in responses.calls if _settings(call) != {
+            "exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61})
+        self.assertEqual(quote_body, {"exaggeration": 0.58, "cfg_weight": 0.44, "temperature": 0.57})
 
     def test_an_untagged_exclamation_uses_mild_emphasis(self):
         provider = _provider(**self._baseline_kwargs())
         responses = _ScriptedResponses()
         with tempfile.TemporaryDirectory() as tmp:
             _speak(provider, '"Get out!"', responses, os.path.join(tmp, "out.mp3"))
-        self.assertEqual(responses.calls[0]["extra_body"],
-                         {"exaggeration": 0.76, "cfg_weight": 0.46, "temperature": 0.64})
+        self.assertEqual(_settings(responses.calls[0]),
+                         {"exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61})
 
     def test_a_saved_excited_label_yields_to_the_new_punctuation_rule(self):
         text = '"Get out!"'
@@ -155,10 +171,23 @@ class TestAdaptiveDeliveryOn(unittest.TestCase):
         # alone, since the narration unit after it ("she whispered.") stays at 0 dB.
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "out.wav")
-            _speak(provider, '"I will do this," she whispered.', responses, path)
+            _speak(provider, '"No." she whispered.', responses, path)
             exported = AudioSegment.from_file(path)
-        self.assertAlmostEqual(exported[:300].max_dBFS, -9.0, delta=0.3)  # -3 dBFS raw, -6 dB gain
+        self.assertAlmostEqual(exported[:300].max_dBFS, -3.0, delta=0.3)  # short quote keeps baseline gain
         self.assertAlmostEqual(exported.max_dBFS, -3.0, delta=0.3)  # the narration unit, untouched
+
+    def test_medium_excited_gain_is_applied_partially(self):
+        provider = _provider(output_format="wav", **self._baseline_kwargs())
+        responses = _ScriptedResponses(peak_amplitude=23197)  # about -3 dBFS raw
+        quote = "An urgent reply."
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.wav")
+            _speak(provider, '"' + quote + '" he shouted.', responses, path)
+            exported = AudioSegment.from_file(path)
+        expected_gain = delivery.unit_preset(delivery.MOOD_EXCITED, delivery.APPROVED_BASELINE, quote)[3]
+        self.assertGreater(expected_gain, 0.0)
+        self.assertLess(expected_gain, delivery.preset(delivery.MOOD_EXCITED, delivery.APPROVED_BASELINE)[3])
+        self.assertAlmostEqual(exported[:300].max_dBFS, -3.0 + expected_gain, delta=0.3)
 
     def test_mood_is_logged_like_voice_is_today(self):
         provider = _provider(**self._baseline_kwargs())
@@ -175,7 +204,7 @@ class TestCharacterDelivery(unittest.TestCase):
 
     TEXT = '"Come here," said Ada. "Fine," said Tom. "Who knows," said a stranger.'
 
-    def _cast_file(self, tmp: str) -> str:
+    def _cast_file(self, tmp: str, text: str = None) -> str:
         from audiobook_generator.core import cast as cast_store
         cast = cast_store.new_cast("k", "/x.epub", "T", "A", "chatterbox", "Narrator.wav", [1])
         cast["characters"] = {
@@ -187,26 +216,39 @@ class TestCharacterDelivery(unittest.TestCase):
             "sam": {"name": "Sam", "aliases": [], "gender": "male", "age": "adult", "lines": 5, "voice": "Sam.wav",
                     "profile": {"voice_targets": {"delivery": "even"}}},
         }
-        cast["chapters"][cast_store.text_hash(self.TEXT)] = {"number": 1, "lines": {"1": "ada", "2": "tom", "3": None}}
+        cast["chapters"][cast_store.text_hash(text or self.TEXT)] = {
+            "number": 1, "lines": {"1": "ada", "2": "tom", "3": None}}
         path = os.path.join(tmp, "cast.json")
         cast_store.save_cast(path, cast)
         return path
 
-    def _bodies(self, adaptive: bool) -> dict:
+    def _bodies(self, adaptive: bool, text: str = None) -> dict:
+        text = text or self.TEXT
         with tempfile.TemporaryDirectory() as tmp:
-            provider = _provider(voice_mode="cast", dialogue_voice="Dialogue.wav", cast_file=self._cast_file(tmp),
+            provider = _provider(voice_mode="cast", dialogue_voice="Dialogue.wav", cast_file=self._cast_file(tmp, text),
                                  adaptive_delivery=adaptive, delivery_exaggeration=0.73, delivery_cfg_weight=0.5,
                                  delivery_temperature=0.61)
             responses = _ScriptedResponses()
-            _speak(provider, self.TEXT, responses, os.path.join(tmp, "out.mp3"))
+            # This test's fixed 300 ms fake response is deliberately too short for the longer
+            # dialogue fixture; duration validation belongs to the paced speech tests.
+            with patch("audiobook_generator.tts_providers.openai_tts_provider._implausible_quote_duration",
+                       return_value=None):
+                _speak(provider, text, responses, os.path.join(tmp, "out.mp3"))
         return {call["input"]: call["extra_body"]["exaggeration"] for call in responses.calls}
 
-    def test_each_characters_lines_get_their_delivery_around_the_book(self):
+    def test_very_short_character_lines_use_the_book_baseline(self):
         bodies = self._bodies(adaptive=True)
-        self.assertEqual(bodies['"Come here,"'], 0.85)   # expressive (profile): +0.12 against Sam's even
-        self.assertEqual(bodies['"Fine,"'], 0.61)        # even (the owner's setting): -0.12 as set
+        self.assertEqual(bodies['"Come here,"'], 0.73)
+        self.assertEqual(bodies['"Fine,"'], 0.73)
         self.assertEqual(bodies['"Who knows,"'], 0.73)   # an unknown speaker: the book's own
         self.assertEqual(bodies["said Ada."], 0.73)      # narration: the book's own
+
+    def test_long_character_lines_keep_their_cast_delivery(self):
+        text = ('"Come here, I have something important to tell you now," said Ada. '
+                '"I suppose that is all you have to say for now," said Tom.')
+        bodies = self._bodies(adaptive=True, text=text)
+        self.assertEqual(bodies['"Come here, I have something important to tell you now,"'], 0.85)
+        self.assertEqual(bodies['"I suppose that is all you have to say for now,"'], 0.61)
 
     def test_without_adaptive_delivery_every_line_keeps_the_books_baseline(self):
         self.assertEqual(set(self._bodies(adaptive=False).values()), {0.73})

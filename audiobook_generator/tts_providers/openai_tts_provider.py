@@ -1,8 +1,10 @@
 import base64
 import hashlib
 import io
+import json
 import logging
 import math
+import os
 import secrets
 import subprocess
 import time
@@ -47,6 +49,7 @@ _PYDUB_EXPORT = {"aac": ("adts", "aac"), "opus": ("opus", "libopus")}
 _BAD_CLIP_SILENCE_MS = 3000
 _BAD_CLIP_SILENCE_DBFS = -50
 _BAD_CLIP_RETRIES = 2
+_SHORT_UNIT_CHARS = 25
 
 # F-02: after a restart the app can start before Chatterbox has finished loading its model
 # (observed ~12 s); the OpenAI SDK's own retries give up after ~7 s. RETRYABLE_STATUS_CODES are
@@ -99,11 +102,28 @@ def _implausible_quote_duration(audio: AudioSegment, text: str) -> Optional[str]
         return None
     spoken = quoted.strip('"“”\'‘’').strip()
     chars = len(spoken)
-    if 8 <= chars <= 35 and len(audio) > max(6000, chars * 300):
+    if 1 <= chars <= 35 and len(audio) > max(6000, chars * 300):
         return "overlong short dialogue"
     if chars >= 45 and len(audio) < chars * 40:
         return "truncated dialogue"
     return None
+
+
+def _implausible_short_narration_duration(audio: AudioSegment, text: str) -> Optional[str]:
+    """Catch a short narration tag looping even though it is not a quoted line."""
+    spoken = text.strip().strip('"“”\'‘’').strip()
+    if text.lstrip().startswith(('“', '"', '‘', "'")):
+        return None  # quoted lines have their own duration check
+    chars = len(spoken)
+    if 1 <= chars <= 35 and len(audio) > max(6000, chars * 300):
+        return "overlong short narration"
+    return None
+
+
+def _new_seed(previous: Optional[int] = None) -> int:
+    """Give a short unit or rejected take its own reproducible Chatterbox sample."""
+    seed = secrets.randbelow(2**31 - 1) + 1
+    return seed if seed != previous else seed % (2**31 - 1) + 1
 
 
 def _chatterbox_input(text: str) -> str:
@@ -657,12 +677,16 @@ class OpenAITTSProvider(BaseTTSProvider):
                              and self._adaptive_active() else {})
         return self._offsets
 
-    def _voice_baseline(self, voice: Optional[str], speaker: Optional[str] = None) -> delivery.Baseline:
-        """The book's baseline, shifted by this speaker's delivery even when a voice is shared."""
+    def _voice_baseline(self, voice: Optional[str], speaker: Optional[str] = None,
+                        text: str = "") -> delivery.Baseline:
+        """Ease a character's delivery offset in over the same short-line range as moods."""
         baseline = self._delivery_baseline()
         offset = self._character_offsets().get(speaker or "", 0.0)
         if not offset:
             return baseline
+        if text:
+            strength = min(1.0, max(0.0, (len(text.strip()) - 12) / 28.0))
+            offset *= strength
         return baseline._replace(exaggeration=round(min(2.0, max(0.25, baseline.exaggeration + offset)), 2))
 
     def _delivery_extra_body(self, mood: str, voice: Optional[str] = None,
@@ -678,7 +702,7 @@ class OpenAITTSProvider(BaseTTSProvider):
             return None
         effective_mood = mood if self.config.adaptive_delivery else delivery.MOOD_NORMAL
         exaggeration, cfg_weight, temperature, _ = delivery.unit_preset(
-            effective_mood, self._voice_baseline(voice, speaker), text)
+            effective_mood, self._voice_baseline(voice, speaker, text), text)
         return {"exaggeration": exaggeration, "cfg_weight": cfg_weight, "temperature": temperature}
 
     def __str__(self) -> str:
@@ -847,11 +871,11 @@ class OpenAITTSProvider(BaseTTSProvider):
         if not units:
             raise ValueError("No speakable text in this chapter")
         adaptive = self._adaptive_active()
-        baseline = self._delivery_baseline() if adaptive else None
-
         pieces: List[bytes] = []
         audio_format = None
         previous_paragraph = None
+        timeline_frames = 0
+        clip_entries = []
         for number, item in enumerate(units, 1):
             paragraph, unit, sentence_count, continues_previous, voice, mood, *speaker = item
             speaker = speaker[0] if speaker else None
@@ -874,12 +898,16 @@ class OpenAITTSProvider(BaseTTSProvider):
             extra_body = self._delivery_extra_body(mood, voice, speaker=speaker, text=unit)
             if extra_body is not None:
                 request_kwargs["extra_body"] = extra_body
+            if self._is_chatterbox_engine() and len(unit.strip()) <= _SHORT_UNIT_CHARS:
+                request_kwargs["extra_body"] = {**request_kwargs.get("extra_body", {}),
+                                                "seed": _new_seed()}
             for attempt in range(_BAD_CLIP_RETRIES + 1):
                 if attempt:
                     # The server's audiobook preset fixes the seed, so repeating an
                     # unchanged request reproduces the same silent clip every time.
                     request_kwargs["extra_body"] = {
-                        **request_kwargs.get("extra_body", {}), "seed": secrets.randbelow(2**31 - 1) + 1,
+                        **request_kwargs.get("extra_body", {}),
+                        "seed": _new_seed(request_kwargs.get("extra_body", {}).get("seed")),
                     }
                 response = self._create_speech(**request_kwargs)
                 audio = AudioSegment.from_file(io.BytesIO(response.content), format="wav")
@@ -896,6 +924,10 @@ class OpenAITTSProvider(BaseTTSProvider):
                     bad_reason = reason
                     logger.warning("Chatterbox returned %.2fs of %s for %s (attempt %d/%d)",
                                    len(audio) / 1000, reason, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
+                elif self._is_chatterbox_engine() and (reason := _implausible_short_narration_duration(audio, unit)):
+                    bad_reason = reason
+                    logger.warning("Chatterbox returned %.2fs of %s for %s (attempt %d/%d)",
+                                   len(audio) / 1000, reason, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
                 else:
                     break
             else:
@@ -903,7 +935,8 @@ class OpenAITTSProvider(BaseTTSProvider):
             if sentence_count > 1 and sentence_gap_ms > 0:
                 audio = _stretch_sentence_gaps(audio, sentence_count - 1, sentence_gap_ms)
             if adaptive:
-                audio = delivery.guarded_gain(audio, delivery.preset(mood, baseline)[3])
+                audio = delivery.guarded_gain(audio, delivery.unit_preset(
+                    mood, self._voice_baseline(voice, speaker, unit), unit)[3])
             if audio_format is None:
                 audio_format = (audio.frame_rate, audio.channels, audio.sample_width)
             else:
@@ -915,10 +948,38 @@ class OpenAITTSProvider(BaseTTSProvider):
                     gap_ms = paragraph_gap_ms if paragraph != previous_paragraph else sentence_gap_ms
                 gap_frames = int(audio_format[0] * gap_ms / 1000)
                 pieces.append(b"\0" * gap_frames * audio_format[1] * audio_format[2])
+                timeline_frames += gap_frames
+            start_frame = timeline_frames
             pieces.append(audio.raw_data)
+            timeline_frames += len(audio.raw_data) // (audio_format[1] * audio_format[2])
+            if self._is_chatterbox_engine():
+                params = request_kwargs.get("extra_body", {})
+                clip_entries.append({
+                    "chunk": number, "text_sha1": hashlib.sha1(unit.encode("utf-8")).hexdigest(),
+                    "text_length": len(unit), "voice": voice, "mood": mood,
+                    "start_ms": round(start_frame * 1000 / audio_format[0] / speed),
+                    "end_ms": round(timeline_frames * 1000 / audio_format[0] / speed),
+                    "seed": params.get("seed"), "attempts": attempt + 1,
+                    "settings": {key: params[key] for key in ("exaggeration", "cfg_weight", "temperature")
+                                 if key in params},
+                })
+                logger.info("Clip %s: chapter %.3f–%.3fs, seed=%s, settings=%s",
+                            chunk_id, clip_entries[-1]["start_ms"] / 1000,
+                            clip_entries[-1]["end_ms"] / 1000, params.get("seed", "default"),
+                            clip_entries[-1]["settings"])
             previous_paragraph = paragraph
 
         self._combine_and_export(pieces, audio_format, speed, output_file, audio_tags)
+        if clip_entries:
+            map_path = f"{output_file}.clips.json"
+            try:
+                with open(f"{map_path}.tmp", "w", encoding="utf-8") as output:
+                    json.dump({"version": 1,
+                               "duration_ms": round(timeline_frames * 1000 / audio_format[0] / speed),
+                               "clips": clip_entries}, output, ensure_ascii=False)
+                os.replace(f"{map_path}.tmp", map_path)
+            except OSError as error:
+                logger.warning("Could not save clip locations for %s: %s", output_file, error)
 
     def _combine_and_export(self, pieces: List[bytes], audio_format: Tuple[int, int, int], speed: float,
                              output_file: str, audio_tags: AudioTags) -> None:

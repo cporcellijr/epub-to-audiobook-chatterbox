@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import math
 import mimetypes
 import multiprocessing
 import os
@@ -9,7 +10,7 @@ import shutil
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core.audio_tags import AudioTags
-from audiobook_generator.core.m4b import BadChapterFileError, build_m4b, safe_book_file_name
+from audiobook_generator.core.m4b import BadChapterFileError, _duration_seconds, build_m4b, safe_book_file_name
 from audiobook_generator.tts_providers.base_tts_provider import get_tts_provider
 from audiobook_generator.utils.log_handler import setup_logging
 from audiobook_generator.utils.filename_sanitizer import make_safe_filename
@@ -182,12 +183,34 @@ class AudiobookGenerator:
             # (audio + tags), so an interrupted run never leaves a truncated or untagged chapter
             # that skip_existing would then keep, or that a library scanner would pick up.
             partial_file = os.path.join(os.path.dirname(output_file), f".{safe_audio_name}.part")
+            partial_map = partial_file + ".clips.json"
+            output_map = output_file + ".clips.json"
             try:
                 tts_provider.text_to_speech(text, partial_file, audio_tags)
                 os.replace(partial_file, output_file)
+                try:
+                    if os.path.isfile(partial_map):
+                        os.replace(partial_map, output_map)
+                        _set_output_owner(output_map)
+                    elif os.path.exists(output_map):
+                        os.remove(output_map)
+                except OSError as exc:
+                    logger.warning("Could not move clip map for chapter %s to %s: %s", idx, output_map, exc)
+                    if os.path.isfile(partial_map) and os.path.exists(output_map):
+                        try:
+                            os.remove(output_map)
+                        except OSError as remove_exc:
+                            logger.warning("Could not remove stale clip map for chapter %s at %s: %s",
+                                           idx, output_map, remove_exc)
             finally:
                 if os.path.exists(partial_file):
                     os.remove(partial_file)
+                if os.path.exists(partial_map):
+                    try:
+                        os.remove(partial_map)
+                    except OSError as exc:
+                        logger.warning("Could not remove partial clip map for chapter %s at %s: %s", idx,
+                                       partial_map, exc)
             self._update_manifest(safe_audio_name, original_chapter_number, text_hash)
 
             logger.info(f"✅ Converted chapter {idx}: {title}, output file: {output_file}")
@@ -380,6 +403,16 @@ class AudiobookGenerator:
                 f"just that chapter."
             )
             raise
+        try:
+            self._merge_clip_maps(chapters, output_path)
+        except Exception as exc:
+            logger.warning("Could not merge chapter clip maps into %s.clips.json: %s", output_path, exc)
+            for path in (output_path + ".clips.json", output_path + ".clips.json.part"):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError as cleanup_error:
+                    logger.warning("Could not remove stale clip map %s: %s", path, cleanup_error)
         if cover_path and os.path.isfile(cover_path):
             # The owner keeps a folder cover beside the finished M4B, like the rest of
             # their library (F-23); the working copy is removed below with the rest of
@@ -390,4 +423,51 @@ class AudiobookGenerator:
         _set_output_owner(output_path)
         shutil.rmtree(self.chapter_folder(), ignore_errors=True)
         logger.info(f"✅ M4B saved: {output_path}")
+
+    @staticmethod
+    def _merge_clip_maps(chapters, output_path: str) -> None:
+        """Write a book-level clip map, scaling each chapter's local times to its mux duration.
+
+        Missing per-chapter maps are allowed. The AAC stream copied into the M4B may have a
+        different measured duration from the provider's pre-encode timeline, so scale each
+        chapter's positions to the same packet duration used by build_m4b.
+        """
+        mapped_chapters = [(audio_path, audio_path + ".clips.json") for _, audio_path in chapters
+                           if os.path.isfile(audio_path + ".clips.json")]
+        output_map_path = output_path + ".clips.json"
+        if not mapped_chapters:
+            if os.path.exists(output_map_path):
+                os.remove(output_map_path)
+            return
+
+        mapped_paths = {audio_path: map_path for audio_path, map_path in mapped_chapters}
+        merged = []
+        elapsed_seconds = 0.0
+        for _, audio_path in chapters:
+            chapter_start_ms = int(round(elapsed_seconds * 1000))
+            elapsed_seconds += math.ceil(_duration_seconds(audio_path) * 1_000_000) / 1_000_000
+            chapter_end_ms = int(round(elapsed_seconds * 1000))
+            chapter_duration_ms = chapter_end_ms - chapter_start_ms
+            map_path = mapped_paths.get(audio_path)
+            if map_path:
+                with open(map_path, "r", encoding="utf-8") as f:
+                    clip_map = json.load(f)
+                local_duration_ms = int(clip_map["duration_ms"])
+                if local_duration_ms <= 0 or not isinstance(clip_map.get("clips"), list):
+                    raise ValueError(f"Invalid clip map: {map_path}")
+                scale = chapter_duration_ms / local_duration_ms
+                for clip in clip_map["clips"]:
+                    item = dict(clip)
+                    start = int(round(int(clip["start_ms"]) * scale))
+                    end = int(round(int(clip["end_ms"]) * scale))
+                    item["book_start_ms"] = chapter_start_ms + start
+                    item["book_end_ms"] = chapter_start_ms + end
+                    merged.append(item)
+
+        final_map = {"version": 1, "duration_ms": int(round(elapsed_seconds * 1000)), "clips": merged}
+        temp_path = output_path + ".clips.json.part"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(final_map, f, ensure_ascii=False)
+        os.replace(temp_path, output_map_path)
+        _set_output_owner(output_map_path)
 

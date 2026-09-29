@@ -49,14 +49,22 @@ class TestPreset(unittest.TestCase):
     def test_unrecognised_mood_behaves_like_normal(self):
         self.assertEqual(preset("shouting-into-a-pillow", APPROVED_BASELINE), preset(MOOD_NORMAL, APPROVED_BASELINE))
 
-    def test_short_units_dampen_mood_exaggeration_without_changing_normal_delivery(self):
+    def test_very_short_units_use_baseline_and_longer_units_ease_into_full_mood(self):
         short = delivery.unit_preset(MOOD_EXCITED, APPROVED_BASELINE, '"Stop!"')
         normal = delivery.unit_preset(MOOD_NORMAL, APPROVED_BASELINE, '"Stop!"')
+        medium = delivery.unit_preset(MOOD_EXCITED, APPROVED_BASELINE, "An urgent reply.")
         full = delivery.unit_preset(MOOD_EXCITED, APPROVED_BASELINE, "A much longer expressive line." * 2)
 
-        self.assertGreater(short[0], APPROVED_BASELINE.exaggeration)
-        self.assertLess(short[0], preset(MOOD_EXCITED, APPROVED_BASELINE)[0])
+        self.assertEqual(short, preset(MOOD_NORMAL, APPROVED_BASELINE))
         self.assertEqual(normal, preset(MOOD_NORMAL, APPROVED_BASELINE))
+        self.assertGreater(medium[0], APPROVED_BASELINE.exaggeration)
+        self.assertLess(medium[0], preset(MOOD_EXCITED, APPROVED_BASELINE)[0])
+        self.assertGreater(medium[1], APPROVED_BASELINE.cfg_weight - 0.1)
+        self.assertLess(medium[1], APPROVED_BASELINE.cfg_weight)
+        self.assertGreater(medium[2], APPROVED_BASELINE.temperature)
+        self.assertLess(medium[2], preset(MOOD_EXCITED, APPROVED_BASELINE)[2])
+        self.assertGreater(medium[3], 0.0)
+        self.assertLess(medium[3], preset(MOOD_EXCITED, APPROVED_BASELINE)[3])
         self.assertEqual(full, preset(MOOD_EXCITED, APPROVED_BASELINE))
 
 

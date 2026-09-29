@@ -896,3 +896,42 @@ for the final separate repair; the improved later line was kept.
 
 The audiobook test suite passed all 580 tests after the provider changes. The running app loaded
 the updated code, and the repaired M4Bs retained their chapter markers, cover art and metadata.
+
+## 20. Short-line delivery and clip diagnostics (2026-09-29)
+
+The remaining brief phonetic defects sometimes occupy normally timed clips, so a waveform-only
+rule cannot reliably choose the better of two plausible takes. A previous controlled comparison
+had two plausible durations for the same short line; listening selected one that a duration check
+could not distinguish reliably. The existing sentence packer already joins short sentences within
+one uninterrupted voice span. Narration, dialogue, and attributed speaker boundaries stay separate.
+
+Adaptive delivery now uses the book baseline for lines of at most 12 characters, including mood
+settings, gain, and character delivery offsets. From 13 through 40 characters, those changes ease
+in to the full preset. Longer lines retain their existing expression. Short Chatterbox requests
+(up to 25 characters) now start with an independent, recorded seed. The existing bad-take retries
+continue to use a different seed, and an implausibly long short narration tag now triggers one.
+These changes do not assert that every normally timed phonetic defect can be detected.
+
+Each completed Chatterbox chapter now gets a local clip map with a text hash and length, voice,
+mood, settings, selected seed, attempts, and chapter-relative times. The map does not copy the
+book's text into the audiobook library. The finished M4B gets a companion
+`.clips.json` map with book-relative times adjusted to the measured chapter packet durations.
+This supports targeted investigation of a reported timestamp while preserving skipped chapters'
+maps. A failed map write does not fail audiobook generation. Map files receive the same output
+ownership adjustment as the M4B so library deletion remains possible.
+
+The full app suite passes 595 tests against the edited source in an isolated container.
+
+A live, synthetic five-character line exposed a missed case: with the same voice and delivery
+settings, one seed produced 37.42 seconds, while another produced 1.06 seconds. A matched-seed
+expressive variant was also overlong. The short-dialogue and narration duration guards now include
+one-word lines (previously they started at eight characters), so these takes are retried before
+entering a book. This demonstrates a seed-dependent gross defect; it does not establish that
+changing expression causes or cures the brief, normally timed defects.
+
+Live provider verification repeated that synthetic first take through the edited app code: the
+37.42-second output was rejected, a new seed produced 1.06 seconds, and the clip map recorded
+the second seed, two attempts, and the baseline settings. The app container was rebuilt and
+restarted with an empty queue; the page returned HTTP 200 and the running image contained the
+one-word guard. The final full suite passes 595 tests. Book clip offsets also follow the
+M4B's cumulative chapter rounding, avoiding drift over many chapters.

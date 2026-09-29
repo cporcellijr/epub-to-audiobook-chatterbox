@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import subprocess
@@ -329,11 +330,12 @@ class TestPacedSpeech(unittest.TestCase):
             self._speak(provider, "“She’s…”")
         self.assertEqual(provider.client.audio.speech.create.call_count, 2)
         first, second = [call.kwargs for call in provider.client.audio.speech.create.call_args_list]
-        self.assertNotIn("seed", first.get("extra_body", {}))
-        self.assertEqual(second["extra_body"]["seed"], 124)
+        self.assertEqual(first["extra_body"]["seed"], 124)
+        self.assertEqual(second["extra_body"]["seed"], 125)
 
     def test_retries_dialogue_that_loops_or_cuts_off(self):
         cases = [
+            ("“Stop!”", 8000, 1060),
             ("“I know, isn’t it?”", 7130, 1220),
             ("“Also, I know everything. I know about you and your affair.”", 1200, 3660),
         ]
@@ -348,8 +350,48 @@ class TestPacedSpeech(unittest.TestCase):
                            return_value=123):
                     self._speak(provider, line)
                 self.assertEqual(provider.client.audio.speech.create.call_count, 2)
-                self.assertEqual(provider.client.audio.speech.create.call_args_list[1].kwargs["extra_body"]["seed"],
-                                 124)
+                requests = [call.kwargs for call in provider.client.audio.speech.create.call_args_list]
+                if len(line.strip()) <= 25:
+                    self.assertEqual(requests[0]["extra_body"]["seed"], 124)
+                    self.assertEqual(requests[1]["extra_body"]["seed"], 125)
+                else:
+                    self.assertNotIn("seed", requests[0].get("extra_body", {}))
+                    self.assertEqual(requests[1]["extra_body"]["seed"], 124)
+
+    def test_retries_an_overlong_short_narration_tag(self):
+        provider = self._provider(400, 1000)
+        provider.client.audio.speech.create.side_effect = [
+            SimpleNamespace(content=_wav_from_segment(_tone(7000))),
+            SimpleNamespace(content=_wav_from_segment(_tone(1200))),
+        ]
+        with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow", return_value=123):
+            self._speak(provider, "she whispered.")
+        self.assertEqual(provider.client.audio.speech.create.call_count, 2)
+        requests = [call.kwargs for call in provider.client.audio.speech.create.call_args_list]
+        self.assertEqual(requests[0]["extra_body"]["seed"], 124)
+        self.assertEqual(requests[1]["extra_body"]["seed"], 125)
+
+    def test_clip_map_records_short_seed_settings_and_chapter_times(self):
+        provider = self._provider(400, 1000)
+        tags = SimpleNamespace(title="Ch", author="A", book_title="B", idx=1, cover=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.mp3")
+            with patch("audiobook_generator.tts_providers.openai_tts_provider.set_audio_tags"), patch(
+                "audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow", return_value=123
+            ):
+                provider.text_to_speech(f'The door opened.{PARAGRAPH_MARK}She spoke.', path, tags)
+            with open(path + ".clips.json", encoding="utf-8") as file:
+                clip_map = json.load(file)
+        self.assertEqual(clip_map["version"], 1)
+        self.assertEqual(len(clip_map["clips"]), 2)
+        self.assertEqual([(entry["start_ms"], entry["end_ms"]) for entry in clip_map["clips"]],
+                         [(0, 1000), (2000, 3000)])
+        self.assertEqual([entry["seed"] for entry in clip_map["clips"]], [124, 124])
+        self.assertEqual(clip_map["clips"][0]["voice"], "Elena.wav")
+        self.assertEqual(clip_map["clips"][0]["settings"], {})
+        self.assertEqual(clip_map["clips"][0]["text_sha1"], hashlib.sha1(
+            b"The door opened.").hexdigest())
+        self.assertNotIn("text", clip_map["clips"][0])
 
     def test_repairs_a_mismatched_quote_on_interrupted_dialogue(self):
         provider = self._provider(400, 1000)
