@@ -92,6 +92,29 @@ def _truncated_ellipsis(audio: AudioSegment, text: str) -> bool:
             and len(spoken.rstrip("….")) >= 4 and len(audio) < 950)
 
 
+def _implausible_quote_duration(audio: AudioSegment, text: str) -> Optional[str]:
+    """Catch short dialogue loops and longer dialogue cut off before it is spoken."""
+    quoted = text.strip()
+    if not quoted.startswith(('“', '"', '‘', "'")):
+        return None
+    spoken = quoted.strip('"“”\'‘’').strip()
+    chars = len(spoken)
+    if 8 <= chars <= 35 and len(audio) > max(6000, chars * 300):
+        return "overlong short dialogue"
+    if chars >= 45 and len(audio) < chars * 40:
+        return "truncated dialogue"
+    return None
+
+
+def _chatterbox_input(text: str) -> str:
+    """Remove a mismatched end quote from an interrupted line in the EPUB."""
+    quoted = text.strip()
+    if quoted.startswith(('“', '"')) and quoted.endswith(('-“', '-"')):
+        inner = quoted[1:-2].replace("…", "...").replace("...", "... ")
+        return " ".join(inner.split()) + "—"
+    return text
+
+
 def _split_oversized_unit(unit: str) -> List[str]:
     """Break a unit over MAX_REQUEST_CHARS into pieces (F-07), so none can reach the server's
     token cap. Pieces are meant to be sent as separate requests joined with NO pause: the cut
@@ -845,7 +868,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                 voice=voice,
                 speed=1.0,
                 instructions=self.config.instructions,
-                input=unit,
+                input=_chatterbox_input(unit) if self._is_chatterbox_engine() else unit,
                 response_format="wav",
             )
             extra_body = self._delivery_extra_body(mood, voice, speaker=speaker, text=unit)
@@ -869,6 +892,10 @@ class OpenAITTSProvider(BaseTTSProvider):
                     bad_reason = "too-short ellipsis audio"
                     logger.warning("Chatterbox returned %.2fs for the trailing ellipsis in %s (attempt %d/%d)",
                                    len(audio) / 1000, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
+                elif self._is_chatterbox_engine() and (reason := _implausible_quote_duration(audio, unit)):
+                    bad_reason = reason
+                    logger.warning("Chatterbox returned %.2fs of %s for %s (attempt %d/%d)",
+                                   len(audio) / 1000, reason, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
                 else:
                     break
             else:

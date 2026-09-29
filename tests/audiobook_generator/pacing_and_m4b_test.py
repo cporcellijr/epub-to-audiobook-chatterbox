@@ -332,6 +332,31 @@ class TestPacedSpeech(unittest.TestCase):
         self.assertNotIn("seed", first.get("extra_body", {}))
         self.assertEqual(second["extra_body"]["seed"], 124)
 
+    def test_retries_dialogue_that_loops_or_cuts_off(self):
+        cases = [
+            ("“I know, isn’t it?”", 7130, 1220),
+            ("“Also, I know everything. I know about you and your affair.”", 1200, 3660),
+        ]
+        for line, bad_ms, good_ms in cases:
+            with self.subTest(line=line):
+                provider = self._provider(400, 1000)
+                provider.client.audio.speech.create.side_effect = [
+                    SimpleNamespace(content=_wav_from_segment(_tone(bad_ms))),
+                    SimpleNamespace(content=_wav_from_segment(_tone(good_ms))),
+                ]
+                with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow",
+                           return_value=123):
+                    self._speak(provider, line)
+                self.assertEqual(provider.client.audio.speech.create.call_count, 2)
+                self.assertEqual(provider.client.audio.speech.create.call_args_list[1].kwargs["extra_body"]["seed"],
+                                 124)
+
+    def test_repairs_a_mismatched_quote_on_interrupted_dialogue(self):
+        provider = self._provider(400, 1000)
+        self._speak(provider, "“What…what are you-“")
+        request = provider.client.audio.speech.create.call_args.kwargs
+        self.assertEqual(request["input"], "What... what are you—")
+
     def test_without_pauses_marks_are_never_spoken(self):
         provider = self._provider(None, None)
         provider.client.audio.speech.create.return_value = SimpleNamespace(content=b"ID3", response=MagicMock())

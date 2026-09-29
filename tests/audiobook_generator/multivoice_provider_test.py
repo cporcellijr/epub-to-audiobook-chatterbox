@@ -124,6 +124,14 @@ class TestVoicedUnits(unittest.TestCase):
 
 class TestProviderVoices(unittest.TestCase):
 
+    def setUp(self):
+        # Voice-routing fixtures return the same 0.5-second clip for every line,
+        # including long quotes; duration validation is tested separately.
+        check = patch("audiobook_generator.tts_providers.openai_tts_provider._implausible_quote_duration",
+                      return_value=None)
+        check.start()
+        self.addCleanup(check.stop)
+
     def _provider(self, **extra):
         fields = dict(tts="openai", model_name="chatterbox", voice_name="Narrator.wav", output_format="mp3",
                       speed=1.0, instructions=None, language="en", sentence_pause_ms=100, paragraph_pause_ms=300,
