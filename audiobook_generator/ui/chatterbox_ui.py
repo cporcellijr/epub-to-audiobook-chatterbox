@@ -1494,6 +1494,24 @@ def save_voice_gender(voice: Optional[str], gender: str) -> str:
     return f"**{os.path.splitext(voice)[0]}**: {label}. Cast suggestions use this."
 
 
+def stats_for_estimate(table, stats: list, settings: dict) -> list:
+    """The chapter stats a queued job's time estimate needs. They live in the page's session, which
+    an app restart empties while the open page still shows its chapter table (every estimate then
+    came out 0, 2026-09-30), so they are read from the book again when they don't cover the ticked
+    chapters. `settings` are the job's (book and parsing options)."""
+    stats = stats or []
+    if all(0 < n <= len(stats) for n in selected_chapter_numbers(table)):
+        return stats
+    try:
+        chapters = book_chapters(settings["input_file"], settings["title_mode"], settings["newline_mode"],
+                                 settings["remove_endnotes"], settings["remove_reference_numbers"],
+                                 settings.get("search_and_replace_file"))
+    except Exception as error:
+        logger.warning(f"Could not read the chapters again for the time estimate: {error}")
+        return stats
+    return [chapter_stats(text) for _, text in chapters]
+
+
 def generation_estimate(table, stats: list, engine: str = "chatterbox") -> float:
     """Seconds the engine needs for the ticked chapters."""
     stats = stats or []
@@ -1794,6 +1812,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
 
     def enqueue(library_book, input_file, chapter_table, stats, *settings) -> tuple:
         job_settings = queue_settings(library_book, input_file, chapter_table, *settings, active_jobs=queue.jobs())
+        stats = stats_for_estimate(chapter_table, stats, job_settings)
         title = os.path.basename(job_settings["output_dir"].rstrip("/\\")) or "Book"
         position = queue.add(title, job_settings, len(job_settings["chapter_selection"]),
                              generation_estimate(chapter_table, stats, job_settings["engine"]),
@@ -1818,6 +1837,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             if (job_kind(job) == CAST and job["status"] in (QUEUED, RUNNING)
                     and job["settings"].get("cast_key") == job_settings["cast_key"]):
                 raise gr.Error("This book's cast analysis is already in the queue.")
+        stats = stats_for_estimate(chapter_table, stats, job_settings)
         if auto_pick_voices:
             job_settings["then_queue"] = book_options_for_later(
                 library_book, chapter_table, stats, output_dir, voice, speed, sentence_pause, paragraph_pause,

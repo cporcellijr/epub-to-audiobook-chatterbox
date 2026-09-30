@@ -459,6 +459,20 @@ class TestQueueSettings(unittest.TestCase):
         with self.assertRaises(gr.Error):
             self._settings(None, None)
 
+    def test_estimate_stats_are_read_again_when_a_restart_emptied_the_page_session(self):
+        settings = self._settings("/library/book.epub", None)
+        stats = [[20, 1, 1, 0], [36360, 1, 1, 9], [36360, 1, 1, 9]]
+        chapters = [("Title page", "Title"), ("One", "It was a dark night."), ("Two", "“Hi,” she said.")]
+        with patch.object(chatterbox_ui, "book_chapters", return_value=chapters) as read:
+            self.assertIs(chatterbox_ui.stats_for_estimate(TABLE, stats, settings), stats)
+            read.assert_not_called()
+            fresh = chatterbox_ui.stats_for_estimate(TABLE, [], settings)
+        read.assert_called_once_with("/library/book.epub", "auto", "double", False, False, None)
+        self.assertEqual(fresh, [chatterbox_ui.chapter_stats(text) for _, text in chapters])
+        self.assertGreater(chatterbox_ui.generation_estimate(TABLE, fresh), 0)
+        with patch.object(chatterbox_ui, "book_chapters", side_effect=OSError("gone")):
+            self.assertEqual(chatterbox_ui.stats_for_estimate(TABLE, [], settings), [])  # never blocks queuing
+
     def test_generation_estimate_counts_ticked_chapters_only(self):
         stats = [[20, 1, 1], [36360, 1, 1], [36360, 1, 1]]  # 36,360 chars = 30 min of speech
         seconds = chatterbox_ui.generation_estimate(TABLE, stats)
