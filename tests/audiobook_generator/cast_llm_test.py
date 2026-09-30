@@ -298,6 +298,15 @@ class TestTaggedLines(unittest.TestCase):
         self.assertIn('[Tom] "I did not,"', windows[0].passage)
         self.assertNotIn("[#2]", windows[0].passage)
 
+    def test_a_question_before_an_introduced_answer_is_asked_not_locked(self):
+        # Sanitised from a real book: "X answered ...:" had locked the question to X as well.
+        from audiobook_generator.core.speech_tags import tagged_speakers
+        paragraphs = chapter_segments('Then I heard Jon\'s voice: "When can we meet?" '
+                                      'Ann answered without a pause: "Monday."')
+        windows = build_windows(paragraphs, known=tagged_speakers(paragraphs))
+        self.assertEqual((windows[0].ids, windows[0].anchored), ([1], [2]))
+        self.assertIn('[Ann] "Monday."', windows[0].passage)
+
     def test_the_model_is_not_asked_about_tagged_lines_and_their_answers_are_ignored(self):
         chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "Somebody Else", 3: "Ada Marsh", 4: "Tom", 5: "Mrs. Marsh",
                                     6: "Somebody Else"}))

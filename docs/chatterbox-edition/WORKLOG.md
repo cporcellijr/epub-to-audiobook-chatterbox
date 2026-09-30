@@ -1687,3 +1687,73 @@ and "sobbed" are missing too. This list also feeds cast attribution, so any chan
 piece of work.
 
 649 tests pass. Deployed with the queue idle; the deployed source hashes match.
+
+## 27. Speech tags point one way; present-tense tags (2026-09-30)
+
+An outside review of the first chapter's saved cast found four misattributed spots in its first 26
+minutes. The owner asked to take on its first recommendation, the speech-tag rules, together with §26.5's
+side finding (a verb list that was almost all past tense), since both live in `core/speech_tags.py`.
+
+### 27.1 What went wrong
+
+At 1:29 the husband's brother asks a question, and the narration after it reads "<the wife> answered
+without any hesitation:", introducing her answer. The after-tag rule read that narration as the
+question's own tag. Even without that, the paragraph rule would have lent her to the question, as the
+paragraph's only named speaker. Tagged lines are *anchors*: they are never asked, so the model could not
+correct it. The review's other spots are the model's own errors, and are not addressed here.
+
+`SPEECH_VERBS` knew only "says" and "asks" in the present tense, so a present-tense book lost its named
+tags, the short-tag exaggeration cap (§23.1) and its "I ask" narrator votes (§22.3).
+
+### 27.2 Changes
+
+- **Direction.** Narration whose first sentence runs on to a colon introduces the next quotation and is
+  never the previous one's tag. A before-tag may carry a short phrase that names no one else before its
+  colon or comma ("answered without any hesitation:").
+- **Contradictions.** A quotation named one way before it and another way after it gets no anchor; the
+  model decides.
+- **Lending.** An untagged quotation now inherits a speaker only by going forward: after that speaker's
+  line in the same paragraph, when nothing between them ends in a colon or names anyone else. "She
+  smiled." keeps the speaker; "Tom smiled." and "Ada looked up:" don't. As before, the
+  paragraph's tags must name only one person. A first, stricter version, which broke the run at any
+  narration, released 18 correct anchors in the real chapter; this one releases 13. All 13 are cases
+  where the narration names someone else or a pronoun tag is now recognised.
+- **Verbs.**
+  - The present tense of every verb, plus voiced tags (murmurs/murmured, sobs, panted, gasped, snarls…).
+  - Base forms ("I ask", "they whisper") count for "I" and pronoun tags only, because after a name,
+    "tell" or "call" is rarely a tag.
+  - `has_speech_tag` still reports a tag whichever quotation it belongs to (delivery cues, quote
+    packing).
+
+### 27.3 Evidence
+
+- **Anchors on the benchmark.** Two invented passages were added to the labelled benchmark
+  (`experiments/multivoice/fixture/05, 06`) with the real book's patterns. Across all six passages the old
+  rules locked 39 lines, 3 of them wrongly, all the 1:29 pattern. The new rules lock 41 with none wrong.
+  Passages 01–04 are unchanged.
+- **Benchmark accuracy** (qwen2.5:14b, 329 lines, before → after):
+  - Overall: 82.4% → 83.3%.
+  - Passage 05: 81.1% → 91.9%. All three formerly locked lines went to the right speaker once asked, and
+    a character the model had split off merged back.
+  - Passage 06: 90.9% → 86.4%, one line: the model gave a vocative "Dom." to Dom.
+  - Passages 01–04: identical.
+  - Requests: 17 windows either way, with no unusable replies.
+- **The real chapter**, run on a fresh roster; the owner's saved cast was only read.
+  - Anchors fell from 79 to 70.
+  - The 1:29 question now goes to the brother (saved: the wife).
+  - An "Um..." now goes to the wife (saved: her father); the next sentence is hers.
+  - Two "I said" lines came back unknown in this chapter-only run. They are never anchored under either
+    rule set, and the full cast job resolves the narrator.
+  - Every other line matches the saved cast.
+- **The second book's chapter:** anchors went from 3 to 5, both new ones present-tense tags and correct.
+
+Tests: 659 pass. They include the review's cases sanitised (a colon introduction, two speakers introduced
+in one paragraph, interrupted speech, continuation through the speaker's own action, an earlier
+quotation, narration naming someone else, contradictions, present and base-form tags) and an
+attribution-flow check: the question is asked, and the introduced answer stays anchored.
+
+Not addressed: the review's second recommendation (a targeted review pass for the model's own errors at
+17:32 and 21:34 and the three unknowns at 12:52), stricter character merging, and a stray opening quote
+at 15:47. The saved cast keeps its old attribution until the book is re-analysed. Private evidence is in
+`data/diagnostics/tag_direction_2026-09-30/`.
+

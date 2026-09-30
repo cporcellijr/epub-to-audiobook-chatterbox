@@ -5,11 +5,15 @@ Behind `WORKLOG.md` section 13. `validate_multivoice.py` runs the production spe
 `fixture/`, prints accuracy, confusion, reply-failure rates, speed and whether Chatterbox was unloaded
 and reloaded around the pass, then narrates a two-minute multi-voice sample through the real pipeline.
 
-The fixture is four **invented** passages (no real book text) of 59-77 dialogue lines each, 270 lines
+The fixture is six **invented** passages (no real book text) of 22-77 dialogue lines each, 329 lines
 in all, written in the usual novel styles: tagged and untagged exchanges, action beats, a speech that
-runs over paragraphs, titles and first names for the same person, and one never-named speaker whose
-lines are labelled `unknown`. Each quotation is preceded by its true speaker in `«...»`; the script
-strips the tags and checks that `core.dialogue` finds exactly as many lines as there are labels.
+runs over paragraphs, titles and first names for the same person, and never-named speakers whose
+lines are labelled `unknown`. Passages 05 and 06 (added 2026-09-30, WORKLOG §27) hold the cases a real
+book got wrong: a speech tag ending in a colon that introduces the *next* quotation ("Pell answered
+without looking up: ..."), an untagged quotation before another speaker's tagged one in the same
+paragraph, interrupted speech, and present-tense tags ("Dom murmurs"). Each quotation is preceded by
+its true speaker in `«...»`; the script strips the tags and checks that `core.dialogue` finds exactly
+as many lines as there are labels.
 
 ```
 docker run --rm --network tts -e PYTHONPATH=/app_src \
