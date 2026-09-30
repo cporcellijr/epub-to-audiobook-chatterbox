@@ -1757,3 +1757,75 @@ Not addressed: the review's second recommendation (a targeted review pass for th
 at 15:47. The saved cast keeps its old attribution until the book is re-analysed. Private evidence is in
 `data/diagnostics/tag_direction_2026-09-30/`.
 
+## 28. A second look at the lines the text contradicts (2026-09-30)
+
+The outside review's second recommendation: attribution asks each window once and keeps any well-formed
+answer, even one the text contradicts. The owner asked for it after §27.
+
+### 28.1 What the errors had in common
+
+The review's remaining spots in the first chapter, mapped to lines:
+- **12:52.** The narrator's "Damn!" I said. / "You mean he wasn't…?" and the wife's reply were all unknown.
+  The model had answered "Narrator", which names no one, because it was never told who the "I" is. So
+  they got the fallback dialogue voice.
+- **17:32.** "So, Dad," she said after a sip, "…knows about us." The first half went to the narrator: a
+  "she said" tag on a man, and one sentence split between two speakers.
+- **21:34.** Midway through the wife's story, "<the wife> looked at me." and then "Isn't that sweet?". The
+  line went to the narrator ("me"), though the narration names only her.
+
+These are things the text itself shows without understanding the story.
+
+### 28.2 Design
+
+`core/cast_review.py` (new, no LLM) flags lines on five signals:
+- no speaker;
+- a he/she tag against the assigned character's gender;
+- an "I"-tagged line not given to the chapter's clear narrator (at least 2 "I said" votes and a majority,
+  as `chapter_narrators` decides);
+- a speaker change between two quotations of one paragraph where the narration between ends in no colon
+  and names no one else, and the second quotation has no tag of its own; or where one sentence is split
+  by a tag ("…a good girl," he said, "but…");
+- contradictory tags (§27).
+
+Tag-anchored and continued lines are never asked.
+
+`cast_llm.review_lines` runs once per chapter, after the windows and before lines are counted, so
+profiles, narrator detection and voice matching see the corrections.
+- **Grouping.** Flagged lines within 3 paragraphs share one request, up to 12 lines. Each request shows 4
+  paragraphs before and 2 after.
+- **What the model sees.** Tag-named lines are shown as [Name] (certain), the first pass's other answers
+  as [Name?] (a guess that may be wrong), and the asked lines as [#N].
+- **Narrator.** It is named when the "I said" votes establish one, and described when their character is
+  only "I".
+- **Rules in the prompt:** "she said" is a woman; a quotation split by a tag is one speaker's; a paragraph
+  usually holds one speaker; someone addressed by name is usually not the speaker.
+- **Answers.** A named answer replaces the first one, "unknown" keeps it, and an unusable reply changes
+  nothing and is counted. Continued lines follow their corrected first part.
+- **Reporting.** Stats go into the cast and the analysis log.
+
+### 28.3 Evidence
+
+- **Labelled benchmark.** 83.3% (after §27) became 83.9%: 276/329 lines from 2 review requests for 4
+  flagged lines, both corrected. No passage got worse, and the first-pass windows stayed at 17.
+- **The first real chapter**, attributed with §27 and §28 on a fresh roster (the saved cast was only read):
+  - 5 review requests for 11 lines, 8 changed, 0 unknown lines (the §27-only run had 5 unknown).
+  - Fixed: the 12:52 narrator lines, 17:32 and 21:34.
+  - Also fixed, beyond the review's list: the sentence split by "he said" (its second half had gone to the
+    wife), and the two "I said" lines §27's run left unknown.
+  - Still wrong: the wife's 12:52 reply went to her mother, who only appears later, where it had been
+    unknown. A second run gave identical results.
+- **The second book's chapter** (first-person, present tense): 2 requests for 2 lines, 0 unknown. Both
+  changed lines were "I"-tagged and moved to the chapter's narrator entry (a chapter-only run had split
+  the narrator into "I" and their name). Nothing else differed from the saved cast.
+- **Tried and dropped: a line calling its own speaker by name** (the benchmark's "Dom." given to Dom).
+  It flagged 2 more benchmark lines, but asked again the model kept its answers: no gain for one more
+  request.
+
+Limits: the same model reviews its own answers. The gain comes from wider context, the narrator's name
+and the explicit contradictions, and a second answer is no guarantee. Merging (the review's fourth
+recommendation) and the stray-quote paragraph are still open.
+
+Tests: 673 pass. They cover each signal, grouping and rendering, the narrator vote, the review flow on
+the three sanitised cases (asked, corrected, counted), an "unknown" review keeping the first answer, an
+unusable review changing nothing, and a consistent chapter asking nothing more. Private evidence is in
+`data/diagnostics/tag_direction_2026-09-30/`.

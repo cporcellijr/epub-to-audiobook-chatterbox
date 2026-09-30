@@ -260,15 +260,18 @@ class TestAttributeChapter(unittest.TestCase):
         self.assertEqual((stats["invalid_json"], stats.get("invalid_after_retry", 0), len(chat.prompts)), (1, 0, 2))
 
     def test_two_bad_replies_leave_the_window_unknown(self):
-        chat = ScriptedChat(_reply({1: "Ada"}), _reply({n: "Ada" for n in range(1, 8)}))  # missing ids, then an invented id
+        # Missing ids, then an invented id; the review of the four unknown lines is unusable too.
+        chat = ScriptedChat(_reply({1: "Ada"}), _reply({n: "Ada" for n in range(1, 8)}), "no JSON here")
         stats = {}
         lines, moods = attribute_chapter(self.paragraphs, Roster(), chat, stats, self.log)
         # The tagged lines ("said Tom") never depended on the model.
         self.assertEqual(lines, {1: None, 2: "tom", 3: None, 4: None, 5: None, 6: "tom"})
         self.assertEqual((stats["invalid_json"], stats["invalid_after_retry"], stats["unknown_lines"]), (1, 1, 4))
+        self.assertEqual((stats["review_requests"], stats["review_lines"], stats["review_unusable"]), (1, 4, 1))
 
     def test_unknown_speakers_stay_unknown_and_known_names_reach_the_next_prompt(self):
-        chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "unknown", 3: "Ada Marsh", 4: "", 5: "narrator", 6: "Tom"}))
+        chat = ScriptedChat(_reply({1: "Ada Marsh", 2: "unknown", 3: "Ada Marsh", 4: "", 5: "narrator", 6: "Tom"}),
+                            _reply({4: "unknown", 5: "unknown"}))  # the review can't tell either
         roster = Roster()
         lines, moods = attribute_chapter(self.paragraphs, roster, chat, {}, self.log)
         # Line 2 is tagged "said Tom", so the model's "unknown" for it is not even asked for.
@@ -284,6 +287,62 @@ class TestAttributeChapter(unittest.TestCase):
         lines, moods = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)
         self.assertEqual(lines, {1: "ada", 2: "ada", 3: "tom"})
         self.assertEqual(roster.characters["ada"]["lines"], 2)
+
+
+class TestReview(unittest.TestCase):
+    """The review pass (core.cast_review + review_lines), on the three kinds of error a real book's
+    first chapter showed, sanitised (WORKLOG §28)."""
+
+    # A first-person chapter: the narrator's own "I said" lines, one left unknown; a "she said" line
+    # given to the narrator; a line after "Ann looked at me." given to the narrator.
+    CHAPTER = (f'"Morning," I said.{M}"Coffee?" I said.{M}'
+               f'"Damn!" I said. "You mean he was too young?"{M}'
+               f'"Yes, at first." Ann smiled.{M}'
+               f'I poured her a drink. "So, Dad," she said after a sip, "Sam knows about us."{M}'
+               f'"And the best part was the end." Ann looked at me. "Isn\'t that sweet?"')
+    FIRST = {1: "Sam", 2: "Sam", 3: "Narrator", 4: "Narrator", 5: "unknown", 6: "Sam", 7: "Ann",
+             8: "Ann", 9: "Sam"}
+    PEOPLE = [{"name": "Sam", "gender": "male"}, {"name": "Ann", "gender": "female"}]
+
+    def setUp(self):
+        self.log = logging.getLogger("test-cast")
+
+    def test_flagged_lines_are_asked_again_and_corrected_before_counting(self):
+        chat = ScriptedChat(_reply(self.FIRST, self.PEOPLE),
+                            _reply({3: "Sam", 4: "Sam", 5: "Ann", 6: "Ann", 7: "Ann", 8: "Ann", 9: "Ann"}))
+        roster, stats = Roster(), {}
+        lines, _ = attribute_chapter(chapter_segments(self.CHAPTER), roster, chat, stats, self.log)
+        self.assertEqual(lines, {1: "sam", 2: "sam", 3: "sam", 4: "sam", 5: "ann", 6: "ann", 7: "ann",
+                                 8: "ann", 9: "ann"})
+        self.assertEqual((roster.characters["sam"]["lines"], roster.characters["ann"]["lines"]), (4, 5))
+        self.assertEqual((stats["review_requests"], stats["review_changed"], stats["unknown_lines"]), (1, 5, 0))
+        prompt = chat.prompts[1][1]["content"]
+        self.assertIn('The narrator, who says "I" in the narration, is Sam', prompt)
+        self.assertIn('[#6] "So, Dad,"', prompt)
+        self.assertIn('[Sam?] "Morning,"', prompt)  # an earlier guess, shown as one
+        self.assertIn("Ids to answer: 3, 4, 5, 6, 7, 8, 9", prompt)
+
+    def test_an_unknown_review_answer_keeps_the_first_answer(self):
+        chat = ScriptedChat(_reply(self.FIRST, self.PEOPLE),
+                            _reply({3: "unknown", 4: "unknown", 5: "unknown", 6: "unknown", 7: "unknown",
+                                    8: "unknown", 9: "unknown"}))
+        stats = {}
+        lines, _ = attribute_chapter(chapter_segments(self.CHAPTER), Roster(), chat, stats, self.log)
+        self.assertEqual((lines[6], lines[9], lines[3]), ("sam", "sam", None))
+        self.assertEqual(stats["review_changed"], 0)
+
+    def test_an_unnamed_narrator_is_described_not_named_i(self):
+        text = f'"Morning," I said.{M}"Coffee?" I said.{M}"Now?" I said.'
+        chat = ScriptedChat(_reply({1: "I", 2: "I", 3: "unknown"}), _reply({3: "I"}))
+        lines, _ = attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
+        self.assertIn('is never named: answer "I"', chat.prompts[1][1]["content"])
+        self.assertEqual(lines[3], lines[1])
+
+    def test_a_consistent_chapter_asks_nothing_more(self):
+        chat = ScriptedChat(_reply({1: "Ada"}))
+        stats = {}
+        attribute_chapter(chapter_segments('"Hello," Ada smiled.'), Roster(), chat, stats, self.log)
+        self.assertEqual((len(chat.prompts), stats.get("review_requests", 0)), (1, 0))
 
 
 class TestTaggedLines(unittest.TestCase):

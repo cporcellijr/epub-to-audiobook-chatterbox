@@ -7,7 +7,9 @@ asked; they, and every line decided in earlier windows, are shown to the model a
 it can follow the turn-taking of the untagged lines. The model answers with JSON mapping each line id to a speaker and
 listing new characters (gender, rough age, aliases). Every reply is validated strictly; a window
 whose reply is unusable is asked once more, then its lines are left unknown (they get the
-dialogue voice).
+dialogue voice). Lines the text says need another look (core.cast_review: no speaker, "she said"
+given to a man, a speaker change mid-paragraph, ...) are then asked once more in small groups with
+wider context and the narrator named, before anything is counted.
 
 Everything the model is told lives in PROMPTS so it can be tuned in one place. Nothing in here
 touches the network except ChatClient, which talks to LLM_BASE_URL only.
@@ -19,6 +21,7 @@ import re
 import time
 from typing import Callable, Collection, Dict, List, NamedTuple, Optional, Tuple
 
+from audiobook_generator.core import cast_review
 from audiobook_generator.core.cast import AGES, GENDERS, display_name, normalize_name
 from audiobook_generator.core.delivery import MOOD_NORMAL, MOODS, segment_moods
 from audiobook_generator.core.dialogue import DIALOGUE, Segment
@@ -38,6 +41,9 @@ LLM_TEMPERATURE = 0.0
 # 219/270 floor, so this stays False (rules-only moods) until a differently-worded prompt is
 # measured not to cost accuracy.
 ASK_LLM_FOR_MOODS = False
+
+# Ask again about the lines core.cast_review flags (WORKLOG §28). Off only to measure without it.
+REVIEW_FLAGGED_LINES = True
 
 # A pronoun names no one: "he" as a speaker is an unknown speaker ("I" stays a speaker: in a
 # first-person book the model uses it for the narrator, whom the attribution then keeps apart).
@@ -105,6 +111,32 @@ PROMPTS = {
         "{moods_rule}"
         "Ids to answer: {ids}"
     ),
+    "review": (
+        "Known characters (use these exact names when the speaker is one of them):\n"
+        "{roster}\n"
+        "{narrator}\n"
+        "Passage. An earlier pass could not settle the lines marked [#N] (N is the line's id): it left them "
+        "without a speaker, or its answer disagrees with the text around them. [Name] in front of a quotation "
+        "is certain, from a speech tag. [Name?] is the earlier pass's guess and may be wrong. Quotations "
+        "without a mark need no answer:\n\n"
+        "{passage}\n\n"
+        "Reply with exactly this shape, one entry per id:\n"
+        "{{\"speakers\": {{\"N\": \"Full Name\"}}, \"characters\": [{{\"name\": \"Full Name\", "
+        "\"gender\": \"female|male|unknown\", \"age\": \"child|adult|elderly|unknown\", "
+        "\"aliases\": [\"other names used for this person\"]}}]}}\n"
+        "Rules:\n"
+        "- give every marked id exactly one speaker, using the ids from the passage and no others;\n"
+        "- follow the text: \"she said\" is a woman speaking and \"he said\" a man; a quotation split by a "
+        "tag (\"...,\" she said, \"...\") is one speaker's; a paragraph usually holds one speaker's words;\n"
+        "- someone addressed by name in a line is usually not the one speaking it;\n"
+        "- write \"unknown\" only when the passage gives no clue who is speaking;\n"
+        "- \"characters\" lists only speakers who are not in the known list.\n"
+        "Ids to answer: {ids}"
+    ),
+    "narrator": "The narrator, who says \"I\" in the narration, is {name}: answer \"{name}\" for their lines, "
+                "never \"I\" or \"Narrator\".\n",
+    "narrator_unnamed": "The narrator, who says \"I\" in the narration, is never named: answer \"I\" for their "
+                        "lines.\n",
     "roster_empty": "(none yet)",
     "moods_shape": ', "moods": {"N": "soft|normal|excited"}',
     "moods_rule": ("- moods is your best guess how each marked line sounds: \"soft\" (whispered or quiet), "
@@ -498,6 +530,55 @@ def _messages(window: Window, roster: Roster) -> List[dict]:
     ]
 
 
+def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]], anchors: Dict[int, str],
+                 roster: Roster, chat: Chat, stats: dict, log: logging.Logger = logger, label: str = "") -> None:
+    """Ask once more, with wider context, about the lines core.cast_review flags. A reply that names
+    someone replaces the first pass's answer; "unknown" keeps it; an unusable reply changes nothing
+    (logged, counted in stats["review_unusable"]). result is updated in place."""
+    flags = cast_review.flag_lines(paragraphs, result, anchors, roster.characters)
+    if not flags:
+        return
+    narrator = cast_review.narrator_by_tags(paragraphs, result)
+    narrator_line = ""
+    if narrator:
+        name = roster.characters[narrator]["name"]
+        narrator_line = (PROMPTS["narrator_unnamed"] if normalize_name(name) == "i"
+                         else PROMPTS["narrator"].format(name=name))
+    names = roster.names_for_prompt()
+    for start, end, ids in cast_review.groups(paragraphs, list(flags)):
+        certain = {i: roster.characters[result[i]]["name"] if result.get(i) else anchors[i] for i in anchors}
+        guessed = {i: roster.characters[key]["name"] for i, key in result.items()
+                   if key and i not in anchors and i not in ids}
+        passage = cast_review.render(paragraphs, start, end, ids, certain, guessed)
+        messages = [
+            {"role": "system", "content": PROMPTS["system"]},
+            {"role": "user", "content": PROMPTS["review"].format(
+                roster=", ".join(names) if names else PROMPTS["roster_empty"],
+                narrator=narrator_line,
+                passage=passage, ids=", ".join(str(i) for i in ids))},
+        ]
+        stats["review_requests"] = stats.get("review_requests", 0) + 1
+        stats["review_lines"] = stats.get("review_lines", 0) + len(ids)
+        try:
+            speakers, characters, _ = parse_reply(chat(messages), ids, ignore_ids=anchors)
+        except AttributionError as e:
+            stats["review_unusable"] = stats.get("review_unusable", 0) + 1
+            log.warning(f"Cast{label}: review of lines {ids} unusable ({e}); first answers kept")
+            continue
+        for character in characters:
+            roster.add(character["name"], character["gender"], character["age"], character["aliases"])
+        changed = []
+        for line_id in ids:
+            if speakers.get(line_id):
+                key = roster.add(speakers[line_id])
+                if key != result.get(line_id):
+                    result[line_id] = key
+                    changed.append(line_id)
+        stats["review_changed"] = stats.get("review_changed", 0) + len(changed)
+        log.info(f"Cast{label}: reviewed lines {ids} ({', '.join(sorted({r for i in ids for r in flags[i]}))}); "
+                 f"{len(changed)} changed")
+
+
 def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Chat, stats: dict,
                       log: logging.Logger = logger, label: str = "") -> Tuple[Dict[int, Optional[str]], Dict[int, str]]:
     """Attribute every dialogue line of one chapter: ({line id: character key or None},
@@ -573,8 +654,13 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
     for line_id, name in anchors.items():  # tagged lines in stretches that needed no window
         if line_id not in result:
             result[line_id] = roster.add(name)
-    # Lines the windows never covered (none expected) and continued lines' counts
     all_lines = [s for p in paragraphs for s in p if s.kind == DIALOGUE]
+    if REVIEW_FLAGGED_LINES:
+        review_lines(paragraphs, result, anchors, roster, chat, stats, log, label)
+        for line in all_lines:  # a continued line follows its (possibly corrected) first part
+            if line.continues and line.line_id - 1 in result:
+                result[line.line_id] = result[line.line_id - 1]
+    # Lines the windows never covered (none expected) and continued lines' counts
     moods: Dict[int, str] = {}
     for line in all_lines:
         result.setdefault(line.line_id, result.get(line.line_id - 1) if line.continues else None)

@@ -184,7 +184,40 @@ def first_person_tagged(paragraphs: List[List[Segment]]) -> List[int]:
     return found
 
 
-def _keeps_speaker(narration: str, speaker: str) -> bool:
+_PRONOUN_WORD = re.compile(r"\b(he|she|they|I|we|you)\b", re.I)
+
+
+def tag_pronoun(before: str, after: str) -> Optional[str]:
+    """The pronoun of a quotation's own pronoun tag ('"...," she said.' -> "she"), lower-cased; None
+    when it has none. Narration that introduces the next quotation is not this one's tag."""
+    match = (None if _introduces(after) else _AFTER_PRONOUN.match(after)) or _BEFORE_PRONOUN.search(before)
+    word = _PRONOUN_WORD.search(match.group(0)) if match else None
+    return word.group(1).lower() if word else None
+
+
+def has_own_tag(before: str, after: str) -> bool:
+    """Whether anything tags this quotation itself: a name, a pronoun or "I", after it (unless that
+    narration introduces the next quotation) or right before it."""
+    return bool(_tag_after(after) or _tag_before(before) or tag_pronoun(before, after)
+                or (_AFTER_I.match(after) and not _introduces(after)) or _BEFORE_I.search(before))
+
+
+def contradicted(paragraphs: List[List[Segment]]) -> List[int]:
+    """Ids of the lines named one way right before them and another right after (left unanchored)."""
+    found = []
+    for segments in paragraphs:
+        for i, piece in enumerate(segments):
+            if piece.kind != DIALOGUE or piece.continues:
+                continue
+            before = segments[i - 1].text if i > 0 and segments[i - 1].kind == NARRATION else ""
+            after = segments[i + 1].text if i + 1 < len(segments) and segments[i + 1].kind == NARRATION else ""
+            after_name, before_name = _tag_after(after), _tag_before(before)
+            if after_name and before_name and after_name.lower() != before_name.lower():
+                found.append(piece.line_id)
+    return found
+
+
+def keeps_speaker(narration: str, speaker: str) -> bool:
     """Whether narration between two quotations lets the first one's speaker run on: it introduces
     nobody (no colon at the end) and names nobody else ("She smiled." keeps them; "Tom smiled." and
     "Ada looked up:" don't)."""
@@ -224,7 +257,7 @@ def tagged_speakers(paragraphs: List[List[Segment]]) -> Dict[int, str]:
                 speaker = named[piece.line_id] = after_name or before_name
             elif _has_pronoun_tag(before, after):
                 speaker = None
-            elif speaker and all(_keeps_speaker(narration, speaker) for narration in between):
+            elif speaker and all(keeps_speaker(narration, speaker) for narration in between):
                 continuing.append(piece.line_id)  # "...," said Ada. She smiled. "..." -- still Ada
             else:
                 speaker = None

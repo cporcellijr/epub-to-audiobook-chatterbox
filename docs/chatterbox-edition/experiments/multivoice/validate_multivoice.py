@@ -28,6 +28,7 @@ What it prints:
     left it unknown);
   - the confusion between the most frequent characters;
   - the rate of unusable replies before and after the one retry;
+  - how many flagged lines the review pass (core.cast_review) asked again, and how many it changed;
   - seconds per 1,000 dialogue lines;
   - whether Chatterbox reported its model unloaded during the pass and loaded again after it.
 """
@@ -197,6 +198,9 @@ def print_report(stats: dict, results: List[dict], unloaded_during: Optional[boo
           f"({100.0 * stats.get('invalid_json', 0) / windows:.1f}% of windows)")
     print(f"  windows still unusable after the retry: {stats.get('invalid_after_retry', 0)} "
           f"({100.0 * stats.get('invalid_after_retry', 0) / windows:.1f}% of windows)")
+    print(f"  review requests (core.cast_review): {stats.get('review_requests', 0)} for "
+          f"{stats.get('review_lines', 0)} flagged lines; {stats.get('review_changed', 0)} changed, "
+          f"{stats.get('review_unusable', 0)} unusable replies")
     seconds = sum(r["seconds"] for r in results)
     print(f"\n=== Speed ===\n  {seconds:.1f}s for {total_lines} lines = {1000.0 * seconds / max(1, total_lines):.0f}s per 1,000 lines")
 
