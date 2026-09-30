@@ -1,6 +1,6 @@
 # Chatterbox edition: work log and findings
 
-Covers 2026-09-25 to 2026-09-28. Written for the owner and for any agent reviewing or continuing
+Covers 2026-09-25 to 2026-09-30. Written for the owner and for any agent reviewing or continuing
 this project. Personal library details (book titles, authors) are deliberately left out.
 
 Since 2026-09-27 this repo holds the whole stack: the audiobook app at the root and the Chatterbox
@@ -1095,3 +1095,533 @@ Home Temptation 4), with no LLM, gave the same narrators as saved.
   fallback and the book-level override;
 - the chapter narrator and teller voice in the provider;
 - alias filtering and chapter-scoped family words.
+
+## 23. Bookmark investigation: brief artifacts between voices (2026-09-30)
+
+Read the host's `AGENTS.md` and this log, then queried BookOrbit's database read-only. One finished
+collection had 27 active bookmarks over its first 20m15s: 25 apparent artifact markers and two
+explicit casting notes. The owner estimates clicking about half a second after the defect, so each
+marker was investigated from 1.5 seconds before to 0.5 seconds after. The source's 677 first-chapter
+units were reconstructed using the deployed provider and checked against every map text hash and
+voice. Their logs identify the actual run starting at 01:18 UTC, rather than an earlier failed run.
+
+Findings:
+- 24 of 25 artifact windows contain a unit of at most 25 characters; 19 of 25 likely units, selected
+  at bookmark minus 0.5 seconds, are that short. The heard portion contains 106 such units out of
+  328 (32%). These are correlations and timestamp candidates, not exact word-level localization.
+- 11 windows include short narrator fragments, eight between quotations. At 7m59s the sequence is
+  Gianna -> a nine-character Thomas narration tag -> Jeremiah. Other marked tags sit between two
+  Gianna quotations (10m52s, 15m38s, 20m15s). Different dialogue speakers are therefore not necessary;
+  isolated tiny requests are the shared risk. Do not combine a tag into another performer's line.
+- All 49 nearby candidate units were accepted on attempt one, with no quality flag. Their ordinary
+  durations evade the existing silence/length checks. An unrelated nearby long quote did retry,
+  confirming those checks were active. Most candidates use baseline 0.78 exaggeration, 0.45 CFG,
+  0.6 temperature: the short-line easing removes mood/character offsets but retains the high baseline.
+- Measured candidate boundary sample jumps are small (maximum 0.00263 full scale), so the data does
+  not support a splice click as the common cause. AAC decoding has two isolated samples above full
+  scale, which does not establish clipping in generation. A few late sound islands after silence
+  warrant listening; waveform rules cannot label them reliably as unwanted speech.
+- Two reference-mel/token-length warnings during the passage are away from the bookmarked units;
+  the installed model already truncates reference tokens for that warning. No generation error or
+  compiled-path fallback was found in the investigated interval.
+
+Created five-second original-audio windows and three same-seed A/B pairs for harmless narrator tags
+at 10m52s, 15m38s and 20m15s. All three baseline replays exactly reproduced the recorded raw
+durations (1.20, 0.68 and 1.32 s). Only exaggeration changes in the second take, from 0.78 to 0.5;
+CFG, temperature, voice and seed are held. At this stage the comparisons had not been judged by
+ear and no production preset was changed; the listening result and subsequent fix are below.
+
+Recommended next steps: audition a lower expression cap specifically for isolated narration tags;
+reuse the existing sentence packer across adjacent spans only when paragraph, voice, mood and
+speaker match; investigate a conservative suspicious-tail retry using the saved windows, rather
+than blindly trimming tails or retrying every clip. Neither packing nor a tail rule covers all
+normally timed phonetic defects. Production code was unchanged at this stage; the original book
+remains unchanged. Preserve the existing unrelated UI edit.
+
+Private report, CSV, timestamp windows, source reconstruction and A/B WAVs are under the host's
+`data/diagnostics/volume2_bookmarks_2026-09-30/`. They contain personal library material and stay
+outside the repository. No software tests were needed for the documentation change; the diagnostic
+scripts include source/map/log consistency assertions and completed successfully.
+
+### 23.1 Listening result and deployed short-tag cap
+
+The owner clarified the combined comparison: the first two pairs were garble followed by a clear
+"she said"; the last pair was clear both times. Exact PCM verification confirmed the file's order
+is baseline/calm, baseline/calm, baseline/calm, with only digital silence inserted. This supports
+the lower expression setting on two marked tags, not a universal cure for short-clip artifacts.
+
+`OpenAITTSProvider._delivery_extra_body` now caps exaggeration at 0.5 for recognized narration tags
+of at most 25 characters when adaptive delivery is on. It reuses `has_speech_tag`; quoted dialogue,
+longer narration, lower existing exaggeration, CFG, temperature, adaptive-off jobs and other engines
+keep their existing behavior. The shared method covers both sentence and paragraph generation.
+No additional retry or packing change was added.
+
+125 relevant tests pass. One new provider test exercises both packing modes and checks short tags,
+quoted tags, ordinary prose and an already lower baseline. Existing assertions were updated to
+select dialogue explicitly and to expect the cap on a short named narration tag. A live provider
+run using all three recorded seeds produced PCM byte-for-byte identical to the calmer comparison
+takes; clip maps recorded 0.5/0.45/0.6, the correct seeds and one attempt each.
+
+With the queue empty and paused, rebuilt and recreated only the app container. The page returned
+HTTP 200 and a check inside the running container confirmed the short tag receives 0.5 while longer
+prose retains 0.78. This applies to future generation; the existing audiobook was not regenerated.
+The original unrelated Voice lab slider edit remains intact. Private evidence includes
+`comparison_order.json`, `listening_feedback.json` and `provider_fix_validation.json`.
+
+## 24. First short-book regeneration after the tag cap (2026-09-30)
+
+Reviewed the owner's next run to completion (app log 09:05–09:25 Eastern; Chatterbox logs are UTC,
+four hours ahead). Four chapters, 726 clips, final duration 3596.828 seconds. Reconstructed all
+source units and verified every finished clip hash and voice, four chapter markers and agreement
+between the M4B duration and its map. The chapter working folder is removed after completion;
+the final companion map is the durable record. BookOrbit indexed the M4B.
+
+12 units needed retries: 10 succeeded on attempt two, two on attempt three. The 14 discarded takes
+comprised 11 near-silent takes, one too-short ellipsis, one overlong short narration and one
+truncated dialogue. No retained unit has a quality flag, and no repeated near-silence failed the
+book. One backend 1000-token-cap warning belongs to a rejected near-silent take. There were no
+reported server errors or compiled-path fallbacks. The 38 reference mel/token-length warnings
+are the existing model's reference adjustment; the local model's price warning is also expected.
+
+All 76 recognized short narration tags have exaggeration at most 0.5, confirming the new cap in
+real generation. Eleven clips of at most 25 characters still last over three seconds: nine are
+recognized narration tags in the custom narrator voice, two are short dialogue clips in Gabriel.
+They are listening candidates, not confirmed phonetic defects; the duration guard deliberately
+allows at least six seconds before labelling a short take overlong. Leave that guard and the voice
+reference unchanged until the owner's listening/bookmarks identify whether these takes are bad.
+
+Private evidence and timestamp shortlist: `data/diagnostics/short_book_2026-09-30/`, including
+`FINDINGS.md`, `run_review.json`, `book_metadata.json`, the job snapshot and source reconstruction.
+No production code or settings changed in this review.
+
+## 25. Original first-chapter regeneration and remaining tiny-quote artifacts (2026-09-30)
+
+The owner selected the first chapter of the original collection as a more representative check.
+Reviewed the 09:32–09:46 Eastern run to completion: 677 clips, 2701.674 seconds, one M4B chapter.
+All source text hashes match the original chapter. The original 0.78/0.45/0.6 baseline is retained,
+and all 59 recognized short narration tags receive the new exaggeration cap of 0.5. Two rejected
+first takes (truncated dialogue and too-short ellipsis) succeeded on attempt two; no retained clip
+is flagged. No server error, token cap or compiled-path fallback was reported. Twenty reference
+mel/token-length warnings are the existing automatic reference adjustment.
+
+The newly analysed cast changes 508 voices, including the narrator from Thomas to Michael, and
+short clips have new randomized seeds. Identical text makes this useful for listening, but it is
+not a controlled comparison of the production change alone. The original audiobook/database
+bookmarks were removed by the owner's regeneration workflow. Their private bookmark snapshots,
+candidate maps, original audio windows and source reconstruction remain available; recovered the
+complete original first-chapter timing/settings records from logs and remapped all 25 original
+artifact passages to new times using clip numbers and text hashes.
+
+The owner then listened while watching the text and reported mostly single-word quotations. Read
+20 new BookOrbit bookmarks: 19 artifact markers, one explicit wrong-speaker note. Using the same
+1.5-seconds-before/0.5-seconds-after windows, every artifact window contains one tiny quote of
+1–3 words and 5–17 characters: twelve single-word, five two-word, two three-word. There are only
+24 single-word quote clips among the 363 clips in the heard portion. All 19 tiny quotes were kept
+on attempt one, use 0.78/0.45/0.6, and last 0.68–2.28 seconds, escaping the silence/length checks.
+Eighteen use Gianna, one Michael. No representative marker is a recognized short narration tag;
+three windows contain a neighboring tag. Eight quote chunks were also original artifact candidates.
+
+The first cap deliberately targeted narrator tags, leaving these quotes at the higher baseline.
+Prepared three same-seed pairs for harmless bookmarked single-word quotes ("Oh!", "Nothing!",
+"Oh,"): same input, Gianna voice, recorded seed, CFG and temperature; exaggeration alone changes
+from 0.78 to 0.5. Baseline replay durations match the recorded raw durations within 1 ms. Verified
+the six PCM segments and their order exactly. Asked the owner to judge clarity before extending
+the cap; do not infer improvement from duration or combine a quote with another speaker's prose.
+The wrong-speaker note maps to a saved cast attribution assigning the wife's voice to a line the
+owner identifies as the husband's; record this separately from synthesis artifacts.
+
+Private evidence, timestamp tables, final map snapshot and listening pairs are under
+`data/diagnostics/volume2_first_chapter_2026-09-30/`. Read-only diagnostic assertions passed. No
+additional production code, settings, voice assignments or audiobook changed during this review.
+
+### 25.1 Short-quote exaggeration trial rejected; quotation delimiters tested next
+
+The owner reports that all six takes in the short-quote comparison were garbled, with nothing
+clear. Lowering exaggeration from 0.78 to 0.5 did not solve these three quoted words; do not extend
+the narration-tag cap to dialogue on this evidence. The earlier tag cap retains its separate
+positive listening evidence.
+
+Traced the deployed API's chunker, synthesis wrapper and installed `chatterbox.tts.punc_norm`.
+The local API/engine/fast-loop/utils sources match the running container byte-for-byte. Tiny quotes
+reach the model intact; punctuation normalization converts curly quotes to straight quotes, then
+adds a full stop because the closing quote is not considered an ending punctuation character.
+For example, the quoted exclamation becomes `"Oh!".`; without delimiters it remains `Oh!`.
+This is a concrete difference, not proof that the added punctuation causes garble.
+
+Prepared a second controlled comparison of the same three marked words. Reused the exact original
+baseline WAVs and made only three new requests with the outer quote delimiters removed. Word,
+punctuation inside the quote, voice, recorded seed, exaggeration 0.78, CFG 0.45 and temperature 0.6
+stay fixed. `quote_delimiter_comparisons.wav` plays original/quotes-removed in each pair. Audition
+before choosing a production fix; duration changes alone do not establish clarity. Feedback and
+request metadata remain in the private diagnostic folder. No production change was made.
+
+### 25.2 Separate listening files after ambiguous paired playback
+
+The owner found the paired takes too close to decipher: possibly clearer "Oh" and "Nothing"
+after quotation delimiters were removed, but each seemed merged with its original garbled take.
+Both third takes remained garbled and possibly sounded like "money". Verified the third input is
+exactly `Oh,`; that perceived extra word was not in the request. The first two are tentative
+positive listening evidence, and the third remains unresolved. Do not call the trial a general fix.
+
+Repackaged the existing samples into separate original-only and quotes-removed-only WAVs, with
+four seconds of exact digital silence between words and two seconds before/after the sequence.
+Also saved individually padded modified takes. No new synthesis or production change. A small
+standard-library script verifies exact PCM preservation, exported file contents and silent gaps;
+all assertions pass. Feedback and the spacing manifest remain in the private diagnostic folder.
+
+### 25.3 Quotation removal remains unreliable; decoder/precision controls
+
+On separated playback, the owner reports that the original three takes are all garbled (the last
+still suggests an unwanted "money" sound). Removing delimiters gives a slight leading artifact
+then clear "Oh" in the first take, a garbled onset and unclear remainder in "Nothing", and an
+unrecognizable final word. Do not treat punctuation removal as a complete fix or deploy it alone.
+
+Reviewed the compiled T3 sampling flow against the installed stock decoder. Both follow the same
+CFG/repetition/temperature/min-p/top-p/EOS sequence; no obvious short-input control-flow omission
+was found. Ran a separate process inside the Chatterbox container, leaving the live service's
+model and configuration intact. Loaded Original with compilation and BF16 off, generated the
+three original quoted inputs with their recorded seeds and 0.78/0.45/0.6, plus an invented longer
+control sentence in Gianna. Then converted that isolated T3 to BF16 and repeated the same four
+cases on the stock decoder. FP32 runs precede conversion to preserve the full original weights.
+
+All eight takes completed with finite audio and no synthesis error. Ran the matching longer
+control through the existing compiled API as well. Saved original/compiled, stock BF16 and stock
+FP32 listening files, each containing the three tiny quotes followed by the control, separated by
+four seconds of exact digital silence. Verified exact PCM preservation and file contents. Stock
+and compiled samples differ, but waveform differences/durations do not establish improved clarity;
+owner listening is required. The live model-info endpoint confirms Original remains loaded with
+the compiled decoder, and the isolated process released its GPU memory after completion.
+
+Private evidence includes `spaced_quote_listening_feedback.json`, `decoder_trial.py`, its log and
+metadata, `decoder_waveform_comparisons.json` and `decoder_spacing_manifest.json`. No production
+change or new dependency. The full-precision listening control is the next audition.
+
+### 25.4 Full precision does not fix tiny quotes; context trial and prior quote repair audit
+
+The owner reports garble before the first and second words in the stock FP32 trial; the third
+still resembles an unwanted "money" sound. The longer control sentence is perfectly clear.
+Turning off compilation and BF16 is therefore insufficient for these samples. Preserve the live
+decoder settings; this supports testing short-input context, without establishing a single cause.
+
+At the owner's reminder, checked the earlier quotation fixes and all 19 new artifact candidates.
+The prior misplaced closing-quote repair and quoted-term narration packing remain in place.
+All 19 current quotes have balanced curly opening/closing marks and none matches the prior
+malformed interrupted-quote pattern. Closing delimiters still affect the installed model's
+punctuation normalization, but the preceding delimiter-removal trial remains only partly helpful.
+
+Prepared three bounded live-API requests with the same quoted words, voices, recorded seeds and
+0.78/0.45/0.6 settings, adding the harmless same-voice lead-in "The room was quiet, and the window
+was open." These are diagnostic sentences only: do not insert the carrier into a book or trim it
+into production without establishing clear target speech and a safe extraction boundary. Saved
+`quotes_with_context_spaced.wav`, with four seconds of digital silence between sentences. All
+three requests completed; exact PCM preservation, exported content and silent-gap assertions
+passed. Owner listening is pending. No production code or settings changed.
+
+Private evidence includes `fp32_decoder_listening_feedback.json`,
+`short_quote_punctuation_audit.json`, `compare_quote_context.py` and `quote_context_trial.json`.
+
+### 25.5 BookOrbit direct-stream control sounds clean so far
+
+The owner streamed the same EPUB directly through BookOrbit/Chatterbox and reported no audible
+artifacts so far; listening to the previously marked passage is still in progress. Read the live
+logs, BookOrbit's runtime provider and saved preferences, Chatterbox's saved generation getters
+and live model-info. BookOrbit reaches the same Original/compiled service and the same OpenAI
+speech endpoint as book generation, using Abigail throughout and speed 1, with AAC responses.
+Its provider sends no seed or delivery overrides, so requests use the server defaults:
+exaggeration 0.68, CFG 0.4, temperature 0.6 and seed 888 (incremented for internal chunks).
+Bookmarked generated quotes used mostly Gianna, 0.78/0.45/0.6 and randomized short-unit seeds.
+
+The 11:28–11:38 Eastern snapshot contains 54 Chatterbox requests from BookOrbit, all completed,
+with matching request IDs and no synthesis failure. Request lengths range from 9 to 692 characters,
+median 164; only two are at most 25 characters. The backend request-length multiset matches after
+excluding the three separately identified diagnostic context requests. No backend error, token
+cap or compiled-path fallback was logged; one reference mel/token adjustment is the known model
+warning. An earlier failed request to a different provider is excluded from this Chatterbox test.
+
+This is useful evidence that the same service can produce clear speech for this book, but input
+length, voice, expression/CFG and seeds differ together. Do not claim a proven short-input cause
+or deploy a new packing/voice/settings change from this comparison. The pending same-voice,
+same-seed context trial isolates text context more directly. No production change or new synthesis
+was performed during this read-only streaming review. Private snapshots and the structured review
+are `bookorbit_stream_*.log` and `bookorbit_stream_log_review.json` in the first-chapter folder.
+
+### 25.6 Same-seed context trial confirmed clear; word-only extraction audition
+
+The owner listened to `quotes_with_context_spaced.wav` and reports every word clear with no
+garble or artifact. This confirms an improvement for these three samples when only text context
+changes; voice, recorded seed, quote delimiters and delivery parameters remain fixed. It does not
+establish a universal cause or validate an arbitrary trimming rule for other inputs.
+
+Reused the existing `_silence_runs` and `_silent_core` helpers on these saved WAVs. Each has exactly
+one true-silence core of at least 80 ms in its latter half: 160, 120 and 290 ms, respectively.
+Cut within those cores, preserving all following PCM without fades or other speech edits. The
+resulting target-word samples are 950, 930 and 870 ms. Core levels are below -59 dBFS; boundaries,
+PCM preservation, exports and four-second silent gaps all pass assertions. This is an audition
+of three diagnostic crops, not a general production extractor. No new synthesis or production
+change. `context_words_only_spaced.wav` is awaiting the owner's clarity and word-boundary check.
+
+Private evidence: `context_listening_feedback.json`, `extract_context_words.py` and
+`context_word_extraction.json`. Preserve character voice assignments and original book text when
+developing any eventual context optimization; the diagnostic carrier must not reach an audiobook.
+
+### 25.7 Word-only listening confirmed; narrow context fix deployed
+
+The owner confirms the extracted three-word file is clear all the way through. Implemented the
+confirmed technique in the shared `_speak_take` path used by sentence and paragraph packing:
+Chatterbox English single-word double-quoted units of at most 25 characters receive the tested
+same-voice lead-in during synthesis. The selection permits one alphabetic word/contraction with
+optional terminal comma, period, question mark or exclamation mark. Multi-word phrases, ellipses,
+interrupted lines, ordinary prose, other languages and other engines retain their existing path.
+Voice routing, quote repairs and delivery calculations continue to use the original book unit.
+
+Reused the existing silence helpers. Accept only one true-silence core of at least 80 ms in the
+audio's latter half, cutting inside it and retaining 250–2000 ms afterward. Preserve the remaining
+PCM, including quiet word onsets. Missing/ambiguous boundaries use the existing three-attempt
+new-seed retry loop. Such unseparated takes never enter the retained-take list; if no safe take is
+available the chapter fails with an explicit context-separation error. This remains a narrowly
+validated silence heuristic, not word alignment; do not broaden it to phrases without evidence.
+Record `context_trim_ms` in the chapter map and log each cut/seed; the existing M4B map merger
+copies that field through. Source hashes, lengths and clip times refer to the intended book text
+and extracted audio, not the lead-in. The earlier short-narration-tag cap remains in place.
+
+99 relevant tests pass, including new checks for both packing modes, unchanged character voice,
+original text hashes and output timing, exact target PCM/quiet-onset preservation, scope limits,
+new-seed retries and refusal to export inseparable context. Uniform voice/delivery test fixtures
+explicitly isolate routing/settings; the new integration checks exercise the real context path.
+Git whitespace validation passes. Replayed all 11 bookmarked single-word quotes matching the new
+selection against the live backend: every extraction succeeded on attempt one, with 660–970 ms
+target audio and exact raw PCM suffix verification. The original three reproduce the approved
+speech PCM exactly when applying their original whole-sample gain. The other eight have boundary
+validation, not a new owner listening verdict; gain is still applied normally after extraction.
+
+With no queued or running jobs, rebuilt/recreated only the audiobook app. Its page returns HTTP
+200; deployed provider SHA-256 matches the working source, and its boundary helper reproduces the
+three approved cut points. Chatterbox remains healthy, Original loaded and compiled, without a
+restart or model/config change. BookOrbit streaming is unaffected. This applies to fresh generation;
+no existing audiobook was overwritten or automatically regenerated. Preserve the owner's unrelated
+Voice lab slider step edit. No dependency was added and no commit/push was requested.
+
+Private evidence: `context_fix_tests.log`, `validate_context_provider.py`,
+`context_provider_validation.json`, its log, eleven extracted WAVs, `context_fix_build.log` and
+`context_fix_deployment.json`. Next listening check is a freshly generated first chapter.
+
+### 25.8 Owner's next first-chapter generation is using the fix
+
+The owner started a fresh run after deployment. Read the new queue/log snapshot: cast preparation
+finished and audiobook job `acc4e597638e` is running, with 677 units, cast/sentence mode,
+adaptive delivery and the original 0.78/0.45/0.6 baseline. The log confirms context removal on
+eligible quotes. At the later snapshot the run reached unit 471. Two ambiguous context cuts
+(units 129 and 258) were discarded and successfully separated on subsequent attempts. The
+existing dialogue-length guard also discarded two truncated takes for unit 260. No error was
+logged in the reviewed portion. Generation/listening are still pending; do not present this as
+a completed quality verdict. No further production change. Private early-run summary is
+`regeneration_context_early_check.json` in the first-chapter diagnostic folder.
+
+## 26. After the context fix: remaining marks are two-word quotes; Whisper as a garble check (2026-09-30)
+
+Reviewed the run from §25.8 to completion: 677 clips, 2692.458 s. 26 single-word quotes used the carrier,
+21 of them in the heard part. Attempts: 673 once, 3 twice, 1 three times. The owner bookmarked the first ~19
+minutes as before (9 active marks) and said a mark may trail the defect by about a second, so each window runs
+from 3.5 s before to 0.7 s after.
+
+**The single-word fix works; the gap is its scope.** Every window contains a tiny quote. In 8 of 9 it is a
+two-word quote the fix excludes by design ("Kiss me!", "Love you!", "Oh god!", "Mm-hmm.", "Okay, okay!",
+"Mmm, yummy,", "About us.", "I do,"). The ninth is a carrier-trimmed "Oof!", which stays unexplained. In the
+heard part, 2 of 21 single-word quotes with the carrier were marked; in the previous run, 12 of 24 single-word
+quotes were marked without it. Two-word quotes: 8 of 17 marked. Three or more words: 1 of 26 (ambiguous).
+Longer clips: 0 of 213. Seven of the nine are Gianna, but Michael's "I do," failed the same way, and Gianna
+simply speaks most of this book's interjections.
+
+**Ruled out.** Chatterbox 0.1.6 creates `AlignmentStreamAnalyzer` only for the multilingual model, so the
+English model runs without it. Even when enabled, it detects a false start but only forces an end on long tails
+and repetition, so enabling it would not fix these onsets. Reference-clip endings are not the cause: Gianna's
+ends the cleanest of the voices checked.
+
+**Whisper hears the defect.** faster-whisper (already installed in the BookBridge container with cached models)
+transcribed 113 clips from the M4B, read-only on CPU. The transcripts show invented syllables, mostly before
+the words: "Kiss me!" became "Isn't it, Lee?", and "Mm-hmm." became "Do not tell!". Unmarked short tags show
+it too: "I said." became "If I said.", and "she asked." became "But she asked.". Seven of the 8 clearly marked
+clips rank among the 11 worst matches. Checked against the 17 takes the owner judged by ear in §25, Whisper
+*small* matches every verdict. It flags all 9 garbled takes and hears "going in the money" in the "Oh," take
+where the owner heard "money". The 3 clear context words and 2 clear controls pass. *Medium* passed two
+garbled takes as "Oh" and "Nothing", so small is the better detector. It took 0.6 s per clip on 8 CPU threads.
+
+**Same-seed trial of the 8 two-word quotes.** Replays reproduce every book take's duration exactly. With the
+carrier and nothing else changed, small and medium transcribe all 8 correctly. The deployed silence rule
+separates 7 of 8. "Oh god!" has a second gap between its words, so the rule would retry, and three ambiguous
+takes would fail the chapter. Whisper's word times put the boundary in the right gap: the carrier's "open."
+ends at 2.40 s and "Oh," starts at 2.84 s. This is machine evidence; owner listening is pending on
+`two_word_book_takes_spaced.wav` and `two_word_with_carrier_spaced.wav`.
+
+**Recommended next step, not implemented:**
+- Choose carrier units by length (quotes up to about 3 words or 16 characters), not by the one-word pattern.
+- Place the cut in the silence after the carrier's last word, as Whisper word timestamps locate it.
+- Use a Whisper small check on every Chatterbox unit of at most 25 characters. A take whose transcript doesn't
+  match the text is retried with a new seed, and the best match is kept. This is the phonetic check the
+  duration and silence guards could never provide (§19, §20).
+- Cost: roughly 100–150 short units per 45-minute chapter, at 0.6 s each for Whisper plus about 1.5 s of
+  carrier synthesis each.
+- It adds faster-whisper and a ~500 MB model to the app image: the owner's call.
+
+No production code, settings, casts or audiobooks changed. Private evidence, listening files and scripts are
+in `data/diagnostics/volume2_context_fix_run_2026-09-30/`.
+
+### 26.1 Built: the lead-in for every short unit, and Whisper checks each take
+
+The owner listened to the two-word files: the book takes were garbled and the takes with the lead-in
+"perfect". They asked for the recommended fix and said a machine listening beats bookmarking 25
+minutes by ear each time.
+
+- **`core/speech_check.py` (new).** It loads Whisper small once per job process (faster-whisper, CPU, int8,
+  up to 8 threads) from `SPEECH_CHECK_MODEL`. The compose default is `/app/models/faster-whisper-small`,
+  and a missing model is downloaded there once. On this host the model was copied from BookBridge's
+  cache (same SHA-256), so nothing was downloaded. `match` scores a transcript against the text,
+  0-1. `PASS_SCORE` is 0.70, chosen from §26's data: it caught all 25 known-bad takes and passed all
+  known-clear ones except "Mm-hmm." heard as "Hmm", which the filler rule below fixes.
+- **Filler words.** Whisper leaves out or respells hesitation sounds. A filler-only text ("Um...",
+  "Mm-hmm.") heard as nothing can't be judged; heard as any filler, it matches. A garbled take comes
+  out as real words instead ("Do not tell!", "Oh, did you get gum?"). Text with digits isn't judged,
+  because Whisper may spell numbers out.
+- **Scope.** With the check on, every Chatterbox English unit of at most 25 characters (quotes and short
+  narration tags) gets the lead-in. The single-word rule of §25.7 still applies when the check is off
+  or unavailable.
+- **The cut.** Single-word quotes keep the proven silence rule. Everything else uses Whisper's word
+  times: the cut goes inside the true silence between the lead-in's last word and the unit's first.
+  If Whisper hears nothing after the lead-in, it goes in the first silence after it. The silence
+  rule is not used for longer units, because a quote's own pause can be the one silence it finds.
+  A wrong cut there could drop a first word and still pass the match ("me about it" for "Tell me
+  about it").
+- **The check.** The cut take is transcribed. Below 0.70 it is retried with a new seed within the
+  existing three attempts. If none passes, the best match is kept and flagged "speech mismatch". A
+  plausible length that Whisper doubts ranks above a length that is surely wrong. A checker error
+  costs only the check.
+- **Changed: no more chapter failure over one unseparable unit.** Before, three takes with no clear
+  boundary failed the chapter. At the ~7% per-attempt rate seen in the context-fix run, that risked
+  about one book in four. Now the unit is spoken without the lead-in, up to three more times while the
+  check doubts it, and is flagged unless a take passes. The lead-in still never reaches the book.
+  Three near-silent plain takes still fail the chapter.
+- **Clip map.** Each checked clip records `match`. The map still holds no book text; the heard text is
+  logged at DEBUG only.
+- **Tests.** 641 pass (14 new, 1 changed). The suite pops `SPEECH_CHECK_MODEL` in `tests/__init__.py`,
+  so it never loads Whisper inside the live image. `faster-whisper==1.2.1` was added to requirements.
+
+**Live check.** Run through the real provider with real Whisper and the live Chatterbox, starting from
+each unit's recorded book seed:
+- The first build got 17 of 18 units right.
+- "Um..." failed to separate: Whisper had left the word out, so there was no boundary to find. The plain
+  fallback it fell back to was garbled. That led to the no-following-word cut and the retried plain
+  fallback.
+- "Mm-hmm." was heard as "Hmm", which led to the filler match.
+- After both fixes, all 18 pass on the first attempt with match 1.0: the 9 marked windows plus 7
+  unmarked units Whisper had flagged.
+- Whisper took 0.65 s per transcription. A short unit now takes about 3.3 s instead of about 1.5 s:
+  roughly 5 more minutes on this dialogue-heavy 45-minute chapter (~170 short units).
+- The owner deleted the book in BookOrbit for the next test, which also removed its bookmarks. Seeds and
+  voices were rebuilt from the run's log and matched the saved map exactly.
+
+The app container was rebuilt and recreated three times, each after checking that the queue was idle.
+The page returns HTTP 200, the deployed source hashes match, and Chatterbox was not restarted. The next
+check is the owner's fresh first-chapter run. The clip map now doubles as the machine listening report:
+clips with `flagged` or a low `match` are the ones to hear.
+
+### 26.2 Review fixes
+
+An outside review of §26.1 found three problems. All three were confirmed and fixed.
+
+- **P1: the cut could keep lead-in speech.** `_carrier_cut` accepted any silence that merely overlapped
+  Whisper's rough boundary window, and chose the one nearest its middle. If Whisper ended "open." early,
+  a pause *before* "open" could win, and the book would start with "open.". The match would not catch it:
+  "Open. Kiss me!" scores 0.71 against "Kiss me!".
+  - Measured on the 8 saved lead-in takes: Whisper small ends "open." 100–170 ms *before* the real
+    silence starts on every one. The unit's first word lands within about ±80 ms of where the silence ends.
+  - Now the silence must *start* after Whisper's end of "open." and before the unit's first word plus
+    150 ms, and the earliest such silence is used. A pause before "open" (about 300 ms earlier) can't
+    qualify. A late word time finds no silence, and the take is retried.
+  - Added `speech_check.leaked`: a cut take whose transcript starts with a lead-in word the text doesn't
+    start with counts as unseparated and is retried. The take is heard before the length checks, so a
+    take kept for the least-wrong length is leak-checked too.
+- **P2: the plain fallback skipped the length guards.** Takes spoken without the lead-in now go through the
+  same verdict as any take (`_verdict`: length checks, then the speech check). With the check off, a
+  runaway take was kept unchecked before.
+- **P3: an exhausted fallback under-reported attempts.** It now reports every request made: 3 with the
+  lead-in plus 3 without, so 6.
+
+645 tests pass (4 new: a pause before the lead-in's last word, a leaked cut retried, the plain fallback's
+length checks and attempt count, and `leaked`). Rebuilt and recreated the app with an idle queue; the
+deployed source hashes match. The live replay of the 18 units passed each on the first attempt, with the
+same cut points as before the fix.
+
+### 26.3 First run with the speech check; the time estimate after app restarts
+
+The owner regenerated the same first chapter (14:29–14:53 Eastern): 677 clips, 44:45. There were 203
+short units: 200 got the lead-in and Whisper checked 202 of them.
+- **Attempts.** 648 units passed first time, 21 needed two attempts and 5 needed three.
+- **The lead-in could not be separated** on 27 attempts, and a leak was caught twice. All of these were
+  recovered: three units (two "she said"-type tags and "N-- no, Ma,") were spoken without it, and each
+  passed the check.
+- **The pipeline flagged 2 clips**:
+  - "Jeeesuss..." at 6:47: Whisper heard "Jesus. Jesus.", score 0.62. Two earlier takes were too short
+    for an ellipsis line.
+  - "And then..." at 24:04: too short for an ellipsis line, although Whisper hears it correctly.
+- **Independent listen.** Whisper small went over all 203 short clips of the finished M4B, the method
+  that matched the owner's marks in §26:
+  - 2 suspects: the flagged "Jeeesuss..." and "Oh," at 15:05, heard as "Ho!" in the final audio but "Oh"
+    by the pipeline's own check.
+  - No lead-in leaks.
+  - On the previous run's first 19 minutes, the same method doubted 12 of 96 short clips, 8 of them the
+    owner's marks. On this run it doubts 2 of 97.
+- **Time.** Generation took 24 minutes, against 16 without the check: every short unit is now a longer
+  request plus one or two transcriptions, and there were about 40 retries. Unseparated attempts
+  (27 of 200 units) are the main cost worth tuning later; the strict start rule of §26.2 is the likely
+  source.
+
+The owner's listening verdict is in §26.4.
+
+**Bug: the dashboard's time estimate was 0.** The chapter stats behind the estimates live in the page's
+Gradio session. The four app restarts of §26.1–26.2 emptied them while the owner's open page still showed
+its chapter table, so the next Analyse queued both the cast (normally 144 s) and the book (760 s) with an
+estimate of 0 ("less than a minute left"). Generation itself was unaffected: the job's settings matched the
+previous run's. `stats_for_estimate` now re-reads the chapters from the book at queue time whenever the
+page's stats don't cover the ticked chapters. It takes a fraction of a second, and a read failure only logs
+a warning and still queues. Tested in the live app with empty stats: 760 s and 144 s again. 646 tests pass.
+Deployed with the queue idle, after the run finished. The formula itself is unchanged and now about half
+the real time for a dialogue-heavy chapter; recalibrating it for the speech check is open.
+
+### 26.4 Listening verdict, and a second book
+
+**The owner listened through the first 19 minutes and bookmarked 2 spots.** The previous three runs of this
+chapter had 25, 19 and 9 artifact marks.
+- **6:47, "Jeeesuss..." said twice.** This is the clip the pipeline flagged. The owner judged it not an issue.
+- **10:31, one artifact.** It is clip 170, a five-word question in Gianna's voice. The text is 27
+  characters with its quote marks, just over the 25-character limit, so the clip got no lead-in and no check.
+  Whisper small hears it and the clip before it correctly, so this is a sound artifact that speech
+  recognition can't hear, like "Oof!" in §26, not wrong words. Widening the limit would not have flagged it.
+  Whether the lead-in would have prevented it is unknown.
+
+None of the three places the review pointed to ("Jeeesuss...", "Oh," at 15:05, "And then...") was a
+problem, apart from the doubled word. The owner called the result good enough to commit.
+
+**A second, different book: chapter 6 of a narration-heavy novel.**
+- **Size and time.** 1,153 clips, 90:21 of audio, 11 voices; the narrator reads 1,008 units. It took 36
+  minutes against the fixed estimate of 25.2, which was no longer 0 after §26.3.
+- **Short units.** 145 of them (13% of units, against 30% in the first chapter): 137 got the lead-in and
+  138 were checked.
+- **Attempts.** 1,121 clips passed first time, and the pipeline flagged none.
+- **Unit check.** The review rebuilt every unit with the deployed provider, with no synthesis
+  (`rebuild_units.py`), and matched all 1,153 text hashes and voices against the clip map.
+- **Independent listen.** 1 suspect of 145 short clips, a false alarm: "Three," was transcribed as "3.", and
+  `match` only declines to judge when the *text* has digits. No lead-in leaks. The owner's listening is
+  pending.
+
+**Open.**
+- **Separation failures.** The lead-in failed to separate on 27 attempts (first chapter) and 49 (second
+  book). The retries recovered them, but 3 and 8 units were then spoken without it (all passed the check).
+  The strict start rule of §26.2 is the likely cause and the main time cost to tune.
+- **Digits in transcripts.** Whisper writes "3" for "Three"; this probably caused some of the second book's
+  6 mismatch retries. Normalising numbers before `match` would fix it.
+- **The time estimate** runs 30–50% low with the check on.
+- **Sound artifacts** that a transcript can't reveal remain possible, but are now rare: one in 19 minutes of
+  dialogue-heavy audio.
+
+Private evidence is in `data/diagnostics/volume2_context_fix_run_2026-09-30/` and
+`data/diagnostics/second_book_2026-09-30/` (`rebuild_units.py`, `review_book_run.py`, `review.private.json`).

@@ -164,6 +164,7 @@ Settings the app reads (the compose file sets them):
 | `LLM_MODEL` | Chat model name for cast analysis |
 | `LLM_API_KEY` | Key for that endpoint, if it wants one |
 | `LLM_UNLOAD_CHATTERBOX` | `on` (default) frees Chatterbox's GPU memory during a cast analysis and reloads it after; `off` leaves it loaded |
+| `SPEECH_CHECK_MODEL` | Folder for the Whisper small model (compose default `/app/models/faster-whisper-small`; downloaded there once, about 480 MB). With it, every Chatterbox line of 25 characters or less is spoken after a short lead-in that is cut off again, and Whisper checks the take says its text: a mismatch is redone with a new seed. Each clip's score is `match` in the book's `.clips.json`, and a clip still in doubt is `flagged`. Set it empty to turn this off |
 
 Books are written to `audiobook_output/<title>/` inside the container; mount your audiobook library there.
 

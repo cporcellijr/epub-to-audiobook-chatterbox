@@ -131,6 +131,10 @@ class TestProviderVoices(unittest.TestCase):
                       return_value=None)
         check.start()
         self.addCleanup(check.stop)
+        # Uniform silent clips exercise routing, not spoken context extraction (tested separately).
+        context = patch("audiobook_generator.tts_providers.openai_tts_provider._tiny_quote", return_value=False)
+        context.start()
+        self.addCleanup(context.stop)
 
     def _provider(self, **extra):
         fields = dict(tts="openai", model_name="chatterbox", voice_name="Narrator.wav", output_format="mp3",

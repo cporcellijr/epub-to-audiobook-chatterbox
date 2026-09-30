@@ -90,6 +90,9 @@ services:
       - LLM_API_KEY=${LLM_API_KEY:-}
       # "off" keeps Chatterbox's model on the GPU during a cast analysis (default: unload it first).
       - LLM_UNLOAD_CHATTERBOX=${LLM_UNLOAD_CHATTERBOX:-on}
+      # Machine listening for short Chatterbox takes: Whisper small on the CPU checks that each one
+      # says its text (downloaded here once, about 480 MB). Set it empty to turn the check off.
+      - SPEECH_CHECK_MODEL=${SPEECH_CHECK_MODEL-/app/models/faster-whisper-small}
     volumes:
       - ${APP_DATA:?set APP_DATA in .env}:/app                            # queue, library index, logs
       - ${AUDIOBOOK_LIBRARY:?set AUDIOBOOK_LIBRARY in .env}:/app/audiobook_output  # finished books

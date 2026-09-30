@@ -63,7 +63,10 @@ def _speak(provider: OpenAITTSProvider, text: str, responses: _ScriptedResponses
     provider.client = MagicMock()
     provider.client.audio.speech.create.side_effect = lambda **kwargs: responses(**kwargs)
     tags = SimpleNamespace(title="Ch", author="A", book_title="B", idx=1, cover=None)
-    with patch("audiobook_generator.tts_providers.openai_tts_provider.set_audio_tags"):
+    # Uniform clips exercise delivery settings; context extraction has its own PCM/routing checks.
+    with patch("audiobook_generator.tts_providers.openai_tts_provider.set_audio_tags"), patch(
+        "audiobook_generator.tts_providers.openai_tts_provider._tiny_quote", return_value=False
+    ):
         provider.text_to_speech(text, output_file, tags)
 
 
@@ -128,6 +131,24 @@ class TestAdaptiveDeliveryOn(unittest.TestCase):
             _speak(provider, text, responses, os.path.join(tmp, "out.mp3"))
         self.assertEqual({call["voice"] for call in responses.calls}, {"Narrator.wav"})
 
+    def test_short_narration_tags_are_calmer_in_both_packing_modes(self):
+        baseline = dict(exaggeration=0.78, cfg_weight=0.45, temperature=0.6)
+        prose = "She said something long enough to remain ordinary narration."
+        for mode in ("sentence", "paragraph"):
+            provider = _provider(adaptive_delivery=True, paced_unit_mode=mode,
+                                 delivery_exaggeration=0.78, delivery_cfg_weight=0.45,
+                                 delivery_temperature=0.6, output_format="wav")
+            responses = _ScriptedResponses()
+            with tempfile.TemporaryDirectory() as tmp:
+                _speak(provider, f'"Go now," she said.{M}"She said."{M}{prose}',
+                       responses, os.path.join(tmp, "out.wav"))
+            bodies = {call["input"]: _settings(call) for call in responses.calls}
+            self.assertEqual(bodies["she said."], {**baseline, "exaggeration": 0.5})
+            for text in ('"Go now,"', '"She said."', prose):
+                self.assertEqual(bodies[text], baseline)
+        provider.config.delivery_exaggeration = 0.35
+        self.assertEqual(provider._delivery_extra_body("normal", None, "she said.")["exaggeration"], 0.35)
+
     def test_very_short_mooded_quotes_use_the_book_baseline(self):
         provider = _provider(**self._baseline_kwargs())
         responses = _ScriptedResponses()
@@ -137,7 +158,6 @@ class TestAdaptiveDeliveryOn(unittest.TestCase):
         bodies = [_settings(call) for call in responses.calls]
         baseline = {"exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61}
         self.assertGreaterEqual(bodies.count(baseline), 2)  # both short mooded quotes
-        self.assertIn(baseline, bodies)                     # normal narration
 
     def test_medium_mooded_quote_eases_parameters_toward_its_full_preset(self):
         provider = _provider(**self._baseline_kwargs())
@@ -146,8 +166,7 @@ class TestAdaptiveDeliveryOn(unittest.TestCase):
             _speak(provider, 'She whispered, "I will remember this."', responses,
                    os.path.join(tmp, "out.mp3"))
         # The medium quote receives only part of the soft preset.
-        quote_body = next(_settings(call) for call in responses.calls if _settings(call) != {
-            "exaggeration": 0.73, "cfg_weight": 0.5, "temperature": 0.61})
+        quote_body = next(_settings(call) for call in responses.calls if call["input"].startswith('"'))
         self.assertEqual(quote_body, {"exaggeration": 0.58, "cfg_weight": 0.44, "temperature": 0.57})
 
     def test_an_untagged_exclamation_uses_mild_emphasis(self):
@@ -252,7 +271,7 @@ class TestCharacterDelivery(unittest.TestCase):
         self.assertEqual(bodies['"Come here,"'], 0.73)
         self.assertEqual(bodies['"Fine,"'], 0.73)
         self.assertEqual(bodies['"Who knows,"'], 0.73)   # an unknown speaker: the book's own
-        self.assertEqual(bodies["said Ada."], 0.73)      # narration: the book's own
+        self.assertEqual(bodies["said Ada."], 0.5)       # short narration tag: calmer
 
     def test_long_character_lines_keep_their_cast_delivery(self):
         text = ('"Come here, I have something important to tell you now," said Ada. '

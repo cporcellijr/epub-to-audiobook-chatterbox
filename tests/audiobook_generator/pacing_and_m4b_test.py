@@ -19,12 +19,17 @@ from audiobook_generator.book_parsers.epub_book_parser import EpubBookParser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core.audiobook_generator import AudiobookGenerator, CHAPTER_WORK_FOLDER
 from audiobook_generator.core.m4b import BadChapterFileError, build_m4b, safe_book_file_name
+from audiobook_generator.core import speech_check
 from audiobook_generator.tts_providers.openai_tts_provider import (
     PARAGRAPH_MARK,
     OpenAITTSProvider,
     paced_units,
     paragraph_mode_units,
     _chatterbox_input,
+    _SHORT_QUOTE_CONTEXT,
+    _tiny_quote,
+    _quote_context_cut,
+    _carrier_cut,
     _silence_runs,
     _stretch_sentence_gaps,
 )
@@ -321,6 +326,243 @@ class TestPacedSpeech(unittest.TestCase):
             self._speak(provider, "The lantern burned steadily beside the window.")
         self.assertEqual(provider.client.audio.speech.create.call_count, 3)
 
+    def test_short_quote_context_preserves_voice_text_map_and_quiet_word_onset(self):
+        word = _tone(20).apply_gain(-42) + _tone(480)
+        contextual_audio = _tone(1800) + _silence(200) + word
+        expected = contextual_audio[1900:]
+        for mode in ("sentence", "paragraph"):
+            with self.subTest(mode=mode):
+                provider = self._provider(100, 300)
+                provider.config.paced_unit_mode = mode
+                provider.config.voice_mode = "dialogue"
+                provider.config.dialogue_voice = "Gianna.wav"
+                provider.config.output_format = "wav"
+                provider.client.audio.speech.create.side_effect = lambda **kw: SimpleNamespace(
+                    content=_wav_from_segment(contextual_audio if kw['input'].startswith(
+                        _SHORT_QUOTE_CONTEXT) else _tone(400)))
+                tags = SimpleNamespace(title="Ch", author="A", book_title="B", idx=1, cover=None)
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, "out.wav")
+                    with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow",
+                               return_value=123):
+                        provider.text_to_speech('“Oh!” she said.', path, tags)
+                    output = AudioSegment.from_file(path)
+                    with open(path + ".clips.json", encoding="utf8") as f:
+                        clips = json.load(f)["clips"]
+                self.assertEqual(output[:len(expected)].raw_data, expected.raw_data)
+                self.assertEqual(len(output), len(expected) + 100 + 400)
+                request = provider.client.audio.speech.create.call_args_list[0].kwargs
+                self.assertEqual(request['input'], _SHORT_QUOTE_CONTEXT + ' “Oh!”')
+                self.assertEqual(request['voice'], 'Gianna.wav')
+                self.assertEqual(request['extra_body'], {'seed': 124})
+                self.assertEqual(clips[0]['text_sha1'], hashlib.sha1('“Oh!”'.encode()).hexdigest())
+                self.assertEqual((clips[0]['text_length'], clips[0]['context_trim_ms']), (5, 1900))
+                self.assertEqual((clips[0]['end_ms'], clips[0]['attempts']), (600, 1))
+                self.assertNotIn('context_trim_ms', clips[1])
+
+    def test_uncertain_context_boundaries_retry_then_speak_without_the_lead_in(self):
+        provider = self._provider(100, 300)
+        bad = _tone(2400)
+        ambiguous = _tone(1800) + _silence(100) + _tone(200) + _silence(100) + _tone(400)
+        self.assertIsNone(_quote_context_cut(ambiguous))
+        self.assertIsNone(_quote_context_cut(_tone(1800) + _silence(40) + _tone(400)))
+        good = _tone(1800) + _silence(200) + _tone(500)
+        provider.client.audio.speech.create.side_effect = [SimpleNamespace(content=_wav_from_segment(a))
+                                                          for a in (bad, ambiguous, good)]
+        kwargs = dict(model='chatterbox', voice='Gianna.wav', input='“Oh!”', response_format='wav',
+                      extra_body={'seed': 10, 'exaggeration': .78, 'cfg_weight': .45, 'temperature': .6})
+        with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow",
+                   side_effect=[20, 30]):
+            audio, params, attempts, flagged = provider._speak_take(kwargs, '“Oh!”', 'test')
+        self.assertEqual(audio.raw_data, good[1900:].raw_data)
+        self.assertEqual((params['seed'], attempts, flagged), (31, 3, None))
+        self.assertEqual(kwargs['input'], '“Oh!”')
+        # No attempt separates: one more request without the lead-in, kept and flagged, so one
+        # short unit can't fail the chapter and the lead-in never reaches the book.
+        provider.client.audio.speech.create.side_effect = None
+        provider.client.audio.speech.create.return_value = SimpleNamespace(content=_wav_from_segment(bad))
+        with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow",
+                   side_effect=[40, 50, 60]):
+            audio, params, attempts, flagged = provider._speak_take(dict(kwargs), '“Oh!”', 'test')
+        last = provider.client.audio.speech.create.call_args.kwargs
+        self.assertEqual((last['input'], last['extra_body']['seed']), ('“Oh!”', 61))
+        self.assertEqual((audio.raw_data, attempts, flagged), (bad.raw_data, 4, 'unseparated context'))
+        self.assertNotIn('_context_trim_ms', params)
+        silent = _tone(200) + _silence(4000) + _tone(200)
+        provider.client.audio.speech.create.side_effect = [SimpleNamespace(content=_wav_from_segment(a))
+                                                          for a in (bad, bad, bad, silent, silent, silent)]
+        with patch.object(provider, '_combine_and_export') as export:
+            with self.assertRaisesRegex(RuntimeError, 'repeated unseparated short-quote context'):
+                self._speak(provider, '“Oh!”')
+            export.assert_not_called()
+
+    def test_context_scope_excludes_prose_phrases_ellipsis_and_other_engines_or_languages(self):
+        for text in ('“Oh!”', '“Nothing!”', '“Oh,”', '"Don\'t!"'):
+            self.assertTrue(_tiny_quote(text), text)
+        for text in ('Oh!', '“Of course!”', '“Well…”', '“Wait—”', '“Oh!“', '„Ja“', '“...”',
+                     '“Extraordinarilylongquotation!”'):
+            self.assertFalse(_tiny_quote(text), text)
+        for model, language in (('kokoro', 'en'), ('chatterbox', 'es')):
+            provider = self._provider(100, 300)
+            provider.config.model_name, provider.config.language = model, language
+            audio, params, _, _ = provider._speak_take(
+                dict(input='“Oh!”', model=model, voice='Elena.wav', response_format='wav'), '“Oh!”', 'test')
+            self.assertEqual(provider.client.audio.speech.create.call_args.kwargs['input'], '“Oh!”')
+            self.assertNotIn('_context_trim_ms', params)
+            self.assertEqual(len(audio), UNIT_MS)
+
+    def _checked_provider(self, *cut_transcripts):
+        """A provider whose speech check hears the lead-in end at 1790 ms and the unit start at 2010 ms
+        in a whole take, and the given transcripts, in turn, in each cut take."""
+        provider = self._provider(100, 300)
+        provider.config.output_format = "wav"
+        cut_heard = list(cut_transcripts)
+        checker = MagicMock()
+
+        def transcribe(audio):
+            if len(audio) >= 2000:
+                return speech_check.Heard("", self.HEARD_TWO_WORDS)
+            item = cut_heard.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return speech_check.Heard(item, [])
+        checker.transcribe.side_effect = transcribe
+        patcher = patch("audiobook_generator.tts_providers.openai_tts_provider.speech_check.get",
+                        return_value=checker)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return provider, checker
+
+    # The lead-in, then a two-word quote with its own pause: the only silence in the take's latter
+    # half is the quote's, so only Whisper's word times find the right gap.
+    TWO_WORDS = _tone(1800) + _silence(200) + _tone(300) + _silence(150) + _tone(400)
+    HEARD_TWO_WORDS = ([(w, i * 190, i * 190 + 170) for i, w in enumerate(_SHORT_QUOTE_CONTEXT.split()[:-1])]
+                       + [("open.", 1520, 1790), ("Oh,", 2010, 2290), ("God!", 2460, 2850)])
+
+    def test_speech_check_cuts_a_short_phrase_after_the_lead_ins_last_word(self):
+        self.assertIsNone(_quote_context_cut(self.TWO_WORDS))
+        self.assertEqual(_carrier_cut(self.TWO_WORDS, self.HEARD_TWO_WORDS), 1900)
+        self.assertIsNone(_carrier_cut(self.TWO_WORDS, self.HEARD_TWO_WORDS[-3:]))  # lead-in not heard
+        provider, checker = self._checked_provider("Oh, God!")
+        provider.client.audio.speech.create.return_value = SimpleNamespace(
+            content=_wav_from_segment(self.TWO_WORDS))
+        kwargs = dict(model='chatterbox', voice='Gianna.wav', input='“Oh god!”', response_format='wav',
+                      extra_body={'seed': 10})
+        audio, params, attempts, flagged = provider._speak_take(kwargs, '“Oh god!”', 'test')
+        self.assertEqual(provider.client.audio.speech.create.call_args.kwargs['input'],
+                         _SHORT_QUOTE_CONTEXT + ' “Oh god!”')
+        self.assertEqual(audio.raw_data, self.TWO_WORDS[1900:].raw_data)
+        self.assertEqual((params['_context_trim_ms'], params['_match'], attempts, flagged), (1900, 1.0, 1, None))
+        self.assertEqual(checker.transcribe.call_count, 2)  # the whole take, then the cut
+
+    def test_a_pause_before_the_lead_ins_last_word_is_never_the_cut(self):
+        # "...was" pause "open." gap "Um": Whisper ends "open." early (1450 ms; it runs 100-170 ms
+        # early), and nothing is heard after it. Cutting in the first pause would keep "open.".
+        audio = _tone(1300) + _silence(100) + _tone(400) + _silence(200) + _tone(500)
+        words = self.HEARD_TWO_WORDS[:-3] + [("open.", 1200, 1450)]
+        self.assertEqual(_carrier_cut(audio, words), 1900)
+        self.assertIsNone(_carrier_cut(audio, words[:-1] + [("open.", 1600, 1850)]))  # late: retry
+
+    def test_lead_in_speech_left_after_the_cut_is_retried(self):
+        provider, _ = self._checked_provider("Open. Kiss me!", "Kiss me!")
+        provider.client.audio.speech.create.return_value = SimpleNamespace(
+            content=_wav_from_segment(self.TWO_WORDS))
+        with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow", return_value=20):
+            audio, params, attempts, flagged = provider._speak_take(
+                dict(model='chatterbox', voice='Gianna.wav', response_format='wav', input='“Kiss me!”',
+                     extra_body={'seed': 10}), '“Kiss me!”', 'test')
+        self.assertEqual((params['seed'], params['_match'], attempts, flagged), (21, 1.0, 2, None))
+
+    def test_takes_without_the_lead_in_get_the_length_checks_and_count_every_attempt(self):
+        provider = self._provider(100, 300)
+        unseparable = [_tone(2400)] * 3
+        kwargs = dict(model='chatterbox', voice='Gianna.wav', input='“Oh!”', response_format='wav',
+                      extra_body={'seed': 10})
+        for plain, kept, attempts, flagged in (([7000, 500], 500, 5, 'unseparated context'),
+                                               ([7000, 6500, 8000], 6500, 6, 'overlong short dialogue')):
+            with self.subTest(plain=plain):
+                provider.client.audio.speech.create.side_effect = [
+                    SimpleNamespace(content=_wav_from_segment(a)) for a in unseparable + [_tone(ms) for ms in plain]]
+                audio, _, made, flag = provider._speak_take(dict(kwargs), '“Oh!”', 'test')
+                self.assertEqual((len(audio), made, flag), (kept, attempts, flagged))
+
+    def test_a_filler_whisper_leaves_out_is_cut_at_the_first_silence_after_the_lead_in(self):
+        provider, checker = self._checked_provider("")
+        checker.transcribe.side_effect = [speech_check.Heard("", self.HEARD_TWO_WORDS[:-2]),
+                                          speech_check.Heard("", [])]
+        provider.client.audio.speech.create.return_value = SimpleNamespace(
+            content=_wav_from_segment(self.TWO_WORDS))
+        audio, params, attempts, flagged = provider._speak_take(
+            dict(model='chatterbox', voice='Gianna.wav', response_format='wav', input='“Um...”',
+                 extra_body={'seed': 10}), '“Um...”', 'test')
+        self.assertEqual((params['_context_trim_ms'], attempts, flagged), (1900, 1, None))
+        self.assertNotIn('_match', params)  # nothing heard is no verdict for a filler
+
+    def test_an_unseparated_unit_is_retried_without_the_lead_in_until_it_passes(self):
+        provider, checker = self._checked_provider()
+        plain = ["Oh, did you get gum?", "Kiss me!"]
+        checker.transcribe.side_effect = lambda audio: speech_check.Heard(
+            "" if len(audio) >= 2000 else plain.pop(0), [])  # the lead-in is never heard: no cut
+        provider.client.audio.speech.create.side_effect = [
+            SimpleNamespace(content=_wav_from_segment(take)) for take in [self.TWO_WORDS] * 3 + [_tone(500)] * 2]
+        with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow",
+                   side_effect=[20, 30, 40, 50]):
+            audio, params, attempts, flagged = provider._speak_take(
+                dict(model='chatterbox', voice='Gianna.wav', response_format='wav', input='“Kiss me!”',
+                     extra_body={'seed': 10}), '“Kiss me!”', 'test')
+        inputs = [call.kwargs['input'] for call in provider.client.audio.speech.create.call_args_list]
+        self.assertEqual(inputs, [_SHORT_QUOTE_CONTEXT + ' “Kiss me!”'] * 3 + ['“Kiss me!”'] * 2)
+        self.assertEqual((params['seed'], params['_match'], attempts, flagged), (51, 1.0, 5, None))
+        self.assertEqual(len(audio), 500)
+
+    def test_speech_check_retries_a_take_that_does_not_say_its_text(self):
+        provider, _ = self._checked_provider("He's nearly.", "Kiss me.")
+        provider.client.audio.speech.create.return_value = SimpleNamespace(
+            content=_wav_from_segment(self.TWO_WORDS))
+        kwargs = dict(model='chatterbox', voice='Gianna.wav', input='“Kiss me!”', response_format='wav',
+                      extra_body={'seed': 10})
+        with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow", return_value=20):
+            audio, params, attempts, flagged = provider._speak_take(kwargs, '“Kiss me!”', 'test')
+        self.assertEqual((params['seed'], params['_match'], attempts, flagged), (21, 1.0, 2, None))
+
+    def test_the_best_matching_take_is_kept_and_flagged_in_the_clip_map(self):
+        heard = ("He's nearly.", "Kiss it, Lee.", "Is it, Lee?")
+        provider, _ = self._checked_provider(*heard)
+        takes = [self.TWO_WORDS + _silence(10 * i) for i in range(3)]  # tell the kept take apart
+        provider.client.audio.speech.create.side_effect = [
+            SimpleNamespace(content=_wav_from_segment(take)) for take in takes]
+        scores = [speech_check.match('“Kiss me!”', text) for text in heard]
+        self.assertLess(max(scores), speech_check.PASS_SCORE)
+        best = scores.index(max(scores))
+        tags = SimpleNamespace(title="Ch", author="A", book_title="B", idx=1, cover=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.wav")
+            with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow",
+                       side_effect=[10, 20, 30]):
+                provider.text_to_speech('“Kiss me!”', path, tags)
+            output = AudioSegment.from_file(path)
+            with open(path + ".clips.json", encoding="utf8") as f:
+                clip = json.load(f)["clips"][0]
+        self.assertEqual(output.raw_data, takes[best][1900:].raw_data)
+        self.assertEqual((clip['seed'], clip['attempts'], clip['flagged']),
+                         ((11, 21, 31)[best], 3, 'speech mismatch'))
+        self.assertEqual((clip['match'], clip['context_trim_ms']), (round(max(scores), 2), 1900))
+
+    def test_speech_check_skips_long_units_and_a_failed_check_keeps_the_take(self):
+        provider, checker = self._checked_provider(RuntimeError("model gone"))
+        prose = 'The lantern burned steadily beside the window.'
+        provider._speak_take(dict(model='chatterbox', voice='Elena.wav', response_format='wav', input=prose),
+                             prose, 'test')
+        self.assertEqual(provider.client.audio.speech.create.call_args.kwargs['input'], prose)
+        checker.transcribe.assert_not_called()
+        provider.client.audio.speech.create.return_value = SimpleNamespace(
+            content=_wav_from_segment(self.TWO_WORDS))
+        audio, params, attempts, flagged = provider._speak_take(
+            dict(model='chatterbox', voice='Elena.wav', response_format='wav', input='she said.',
+                 extra_body={'seed': 10}), 'she said.', 'test')
+        self.assertEqual((len(audio), attempts, flagged), (len(self.TWO_WORDS) - 1900, 1, None))
+        self.assertNotIn('_match', params)
+
     def test_keeps_the_closest_take_when_every_retry_has_an_implausible_length(self):
         # A quick "Well…" can be real speech: three short takes must not fail the chapter (and
         # with it the M4B). The one nearest a plausible length is kept, with its own seed.
@@ -369,7 +611,7 @@ class TestPacedSpeech(unittest.TestCase):
 
     def test_retries_dialogue_that_loops_or_cuts_off(self):
         cases = [
-            ("“Stop!”", 8000, 1060),
+            ("“Stop now!”", 8000, 1060),
             ("“I know, isn’t it?”", 7130, 1220),
             ("“Also, I know everything. I know about you and your affair.”", 1200, 3660),
         ]

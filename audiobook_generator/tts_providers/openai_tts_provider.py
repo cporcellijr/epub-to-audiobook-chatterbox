@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import math
 import os
 import secrets
@@ -23,6 +24,7 @@ from openai import APIConnectionError, APIStatusError, OpenAI
 from audiobook_generator.core.audio_tags import AudioTags
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import delivery
+from audiobook_generator.core import speech_check
 from audiobook_generator.core.dialogue import DIALOGUE, NARRATION, PARAGRAPH_MARK, Segment, chapter_segments
 from audiobook_generator.core.speech_tags import has_speech_tag
 from audiobook_generator.config.general_config import GeneralConfig
@@ -50,6 +52,7 @@ _BAD_CLIP_SILENCE_MS = 3000
 _BAD_CLIP_SILENCE_DBFS = -50
 _BAD_CLIP_RETRIES = 2
 _SHORT_UNIT_CHARS = 25
+_SHORT_QUOTE_CONTEXT = "The room was quiet, and the window was open."
 
 # F-02: after a restart the app can start before Chatterbox has finished loading its model
 # (observed ~12 s); the OpenAI SDK's own retries give up after ~7 s. RETRYABLE_STATUS_CODES are
@@ -160,6 +163,13 @@ def _chatterbox_input(text: str) -> str:
     if len(quoted) > 1 and quoted.startswith("“") and quoted.endswith("“"):
         return quoted[:-1] + "”"
     return text
+
+
+def _tiny_quote(text: str) -> bool:
+    quoted = text.strip()
+    return (2 < len(quoted) <= _SHORT_UNIT_CHARS
+            and (quoted[0], quoted[-1]) in (("“", "”"), ('"', '"'))
+            and re.fullmatch(r"[^\W\d_]+(?:['’][^\W\d_]+)*[!?.,]?", quoted[1:-1]) is not None)
 
 
 def _split_oversized_unit(unit: str) -> List[str]:
@@ -473,6 +483,44 @@ def _silent_core(audio: AudioSegment, start: int, end: int) -> Tuple[int, int]:
     return point, point
 
 
+_CONTEXT_GAP_MS = 80
+_WORD_TIME_SLACK_MS = 150  # Whisper's word times are approximate
+
+
+def _quote_context_cut(audio: AudioSegment) -> Optional[int]:
+    # Single-word quotes only: a longer unit's own pause could be the one silence (_carrier_cut).
+    cores = [_silent_core(audio, start, end) for start, end in _silence_runs(audio)
+             if start > len(audio) / 2]
+    cores = [(start, end) for start, end in cores if end - start >= _CONTEXT_GAP_MS]
+    if len(cores) != 1:
+        return None
+    start, end = cores[0]
+    cut = (start + end) // 20 * 10  # cut inside true silence, preserving the word's quiet onset
+    return cut if 250 <= len(audio) - cut <= 2000 else None
+
+
+def _carrier_cut(audio: AudioSegment, words: List[Tuple[str, int, int]]) -> Optional[int]:
+    """Where the lead-in ends, from Whisper's word times: inside the first true silence that starts
+    after the lead-in's last word ends and before the unit's first word (a two-word quote's own
+    pause starts later), or after the lead-in when Whisper heard no word after it.
+
+    Whisper small ended the lead-in's last word 100-170 ms before the silence on all 8 measured
+    takes (WORKLOG §26.2), so the real gap passes and a pause before that word never does. A late
+    word time finds no silence, and the take is retried."""
+    bounds = speech_check.carrier_bounds(words, _SHORT_QUOTE_CONTEXT)
+    if bounds is None:
+        return None
+    last_end, next_start = bounds
+    cores = [(start, end) for start, end in (_silent_core(audio, s, e) for s, e in _silence_runs(audio))
+             if end - start >= _CONTEXT_GAP_MS and start >= last_end
+             and (next_start is None or start < next_start + _WORD_TIME_SLACK_MS)]
+    if not cores:
+        return None
+    start, end = min(cores)
+    cut = (start + end) // 20 * 10
+    return cut if len(audio) - cut >= 250 else None
+
+
 def get_openai_supported_output_formats():
     return ["mp3", "aac", "flac", "opus", "wav"]
 
@@ -740,6 +788,10 @@ class OpenAITTSProvider(BaseTTSProvider):
         effective_mood = mood if self.config.adaptive_delivery else delivery.MOOD_NORMAL
         exaggeration, cfg_weight, temperature, _ = delivery.unit_preset(
             effective_mood, self._voice_baseline(speaker, text, baseline), text)
+        # Same-seed listening checks: calmer tiny narration tags improved the marked takes.
+        if (self.config.adaptive_delivery and len(text.strip()) <= _SHORT_UNIT_CHARS
+                and has_speech_tag("", text)):
+            exaggeration = min(exaggeration, 0.5)
         return {"exaggeration": exaggeration, "cfg_weight": cfg_weight, "temperature": temperature}
 
     def __str__(self) -> str:
@@ -967,6 +1019,9 @@ class OpenAITTSProvider(BaseTTSProvider):
                     "start_ms": round(start_frame * 1000 / audio_format[0] / speed),
                     "end_ms": round(timeline_frames * 1000 / audio_format[0] / speed),
                     "seed": params.get("seed"), "attempts": attempts,
+                    **({"context_trim_ms": params["_context_trim_ms"]}
+                       if "_context_trim_ms" in params else {}),
+                    **({"match": params["_match"]} if "_match" in params else {}),
                     "settings": {key: params[key] for key in ("exaggeration", "cfg_weight", "temperature")
                                  if key in params},
                     **({"flagged": flagged} if flagged else {}),
@@ -992,12 +1047,29 @@ class OpenAITTSProvider(BaseTTSProvider):
     def _speak_take(self, request_kwargs: dict, unit: str,
                     chunk_id: str) -> Tuple[AudioSegment, dict, int, Optional[str]]:
         """One unit's audio, requested again with a new seed while Chatterbox's take is bad:
-        (audio, the extra_body it was made with, attempts made, the length check it still fails).
+        (audio, the extra_body it was made with, attempts made, why the kept take is suspect).
 
         A take with a long near-silent gap is never kept. When every attempt is rejected only for
         an implausible length, the one nearest a plausible length is kept instead of failing the
-        chapter (and with it the whole M4B): a quick "Well…" can be real speech."""
+        chapter (and with it the whole M4B): a quick "Well…" can be real speech.
+
+        Chatterbox garbles tiny requests, so a single-word English quote is spoken after a
+        same-voice lead-in that is cut off again (WORKLOG §25). With the speech check on (§26),
+        every short English unit gets the lead-in, cut by Whisper's word times unless it is a
+        single word, and a take whose transcript doesn't match its text is retried like a bad
+        length; the best match is kept. A take that may still hold the lead-in is never kept: if
+        no attempt separates, the unit is spoken without it, judged the same way."""
+        english = self._is_chatterbox_engine() and (self.config.language or "en") == "en"
+        checker = speech_check.get() if english and len(unit.strip()) <= _SHORT_UNIT_CHARS else None
+        single_word = english and _tiny_quote(request_kwargs["input"])
+        contextual = single_word or checker is not None
+        plain_kwargs = request_kwargs
+        if contextual:
+            request_kwargs = {**request_kwargs,
+                              "input": _SHORT_QUOTE_CONTEXT + " " + request_kwargs["input"].strip()}
         rejected = []
+        unsafe_reason = "near-silent audio"
+        unseparated = False
         for attempt in range(_BAD_CLIP_RETRIES + 1):
             if attempt:
                 # The server's audiobook preset fixes the seed, so repeating an
@@ -1013,23 +1085,108 @@ class OpenAITTSProvider(BaseTTSProvider):
                 return audio, params, attempt + 1, None
             silent_ms = _long_silence_ms(audio)
             if silent_ms >= _BAD_CLIP_SILENCE_MS:
+                unsafe_reason = "near-silent audio"
                 logger.warning("Chatterbox returned %.1fs of near-silence for %s (attempt %d/%d)",
                                silent_ms / 1000, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
                 continue
-            reason = (("too-short ellipsis audio" if _truncated_ellipsis(audio, unit) else None)
-                      or _implausible_quote_duration(audio, unit)
-                      or _implausible_short_narration_duration(audio, unit))
-            if not reason:
+            if contextual:
+                cut = _quote_context_cut(audio) if single_word else None
+                if cut is None and checker is not None:
+                    heard = self._hear(checker, audio, chunk_id)
+                    cut = _carrier_cut(audio, heard.words) if heard else None
+                if cut is None:
+                    unsafe_reason = "unseparated short-quote context"
+                    unseparated = True
+                    logger.warning("Chatterbox could not separate short-quote context for %s (attempt %d/%d)",
+                                   chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
+                    continue  # never export a take that could still contain the added lead-in
+                audio = audio[cut:]
+                params = {**params, "_context_trim_ms": cut}
+                logger.info("Short-quote context %s: removed %.3fs, seed=%s",
+                            chunk_id, cut / 1000, params.get("seed", "default"))
+            # Heard before the length checks: a take kept for the least-wrong length is leak-checked too.
+            heard = self._hear(checker, audio, chunk_id) if checker is not None else None
+            if contextual and heard and speech_check.leaked(unit, heard.text, _SHORT_QUOTE_CONTEXT):
+                unsafe_reason = "unseparated short-quote context"
+                unseparated = True
+                logger.warning("Lead-in speech remained after the cut for %s (attempt %d/%d)",
+                               chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
+                continue
+            params, verdict = self._verdict(audio, unit, params, heard, chunk_id,
+                                            f"attempt {attempt + 1}/{_BAD_CLIP_RETRIES + 1}")
+            if verdict is None:
                 return audio, params, attempt + 1, None
-            logger.warning("Chatterbox returned %.2fs of %s for %s (attempt %d/%d)",
-                           len(audio) / 1000, reason, chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
-            rejected.append((_duration_miss(audio, unit, reason), attempt, audio, params, reason))
+            rejected.append((verdict[0], verdict[1], attempt, audio, params, verdict[2]))
+        if not rejected and unseparated:
+            return self._speak_plain(plain_kwargs, request_kwargs, checker, unit, chunk_id)
         if not rejected:
-            raise RuntimeError(f"Chatterbox returned repeated near-silent audio for {chunk_id}")
-        _, attempt, audio, params, reason = min(rejected, key=lambda take: take[:2])
-        logger.warning("Keeping attempt %d of %s (%.2fs of %s): no attempt had a plausible length",
+            raise RuntimeError(f"Chatterbox returned repeated {unsafe_reason} for {chunk_id}")
+        _, _, attempt, audio, params, reason = min(rejected, key=lambda take: take[:3])
+        logger.warning("Keeping attempt %d of %s (%.2fs, %s): no attempt passed its checks",
                        attempt + 1, chunk_id, len(audio) / 1000, reason)
         return audio, params, _BAD_CLIP_RETRIES + 1, reason
+
+    def _speak_plain(self, plain_kwargs: dict, context_kwargs: dict, checker, unit: str,
+                     chunk_id: str) -> Tuple[AudioSegment, dict, int, Optional[str]]:
+        """The unit without the lead-in, after no attempt could separate it, judged and retried like
+        any take: one short unit never fails the chapter, and the lead-in never reaches the book.
+        Flagged unless the speech check passed it. Attempts count the lead-in attempts too."""
+        seed = context_kwargs.get("extra_body", {}).get("seed")
+        first = _BAD_CLIP_RETRIES + 1  # lead-in attempts already made
+        rejected = []
+        for attempt in range(_BAD_CLIP_RETRIES + 1):
+            seed = _new_seed(seed)
+            kwargs = {**plain_kwargs, "extra_body": {**plain_kwargs.get("extra_body", {}), "seed": seed}}
+            audio = AudioSegment.from_file(io.BytesIO(self._create_speech(**kwargs).content), format="wav")
+            label = f"attempt {attempt + 1}/{_BAD_CLIP_RETRIES + 1} without the lead-in"
+            silent_ms = _long_silence_ms(audio)
+            if silent_ms >= _BAD_CLIP_SILENCE_MS:
+                logger.warning("Chatterbox returned %.1fs of near-silence for %s (%s)",
+                               silent_ms / 1000, chunk_id, label)
+                continue
+            heard = self._hear(checker, audio, chunk_id) if checker is not None else None
+            params, verdict = self._verdict(audio, unit, kwargs["extra_body"], heard, chunk_id, label)
+            if verdict is None:
+                logger.warning("Keeping %s without its lead-in (seed=%s): no attempt could be separated",
+                               chunk_id, seed)
+                return audio, params, first + attempt + 1, None if "_match" in params else "unseparated context"
+            rejected.append((verdict[0], verdict[1], attempt, audio, params, verdict[2]))
+        if not rejected:
+            raise RuntimeError(f"Chatterbox returned repeated unseparated short-quote context for {chunk_id}")
+        _, _, _, audio, params, reason = min(rejected, key=lambda take: take[:3])
+        logger.warning("Keeping %s without its lead-in (seed=%s, %s): no take passed its checks",
+                       chunk_id, params.get("seed"), reason)
+        return audio, params, first + _BAD_CLIP_RETRIES + 1, reason
+
+    def _verdict(self, audio: AudioSegment, unit: str, params: dict, heard, chunk_id: str,
+                 label: str) -> Tuple[dict, Optional[Tuple[int, float, str]]]:
+        """(params, None) to keep a take; (params, (kind, badness, reason)) to try again. Rejected
+        takes sort by that: a plausible length Whisper doubts (kind 0) before a surely wrong length.
+        params gain the transcript match (`_match`) when the speech check heard the take."""
+        reason = (("too-short ellipsis audio" if _truncated_ellipsis(audio, unit) else None)
+                  or _implausible_quote_duration(audio, unit)
+                  or _implausible_short_narration_duration(audio, unit))
+        if reason:
+            logger.warning("Chatterbox returned %.2fs of %s for %s (%s)",
+                           len(audio) / 1000, reason, chunk_id, label)
+            return params, (1, _duration_miss(audio, unit, reason), reason)
+        score = speech_check.match(unit, heard.text) if heard else None
+        if score is None:
+            return params, None
+        logger.debug("Speech check %s heard [%s]", chunk_id, heard.text)
+        params = {**params, "_match": round(score, 2)}
+        if score >= speech_check.PASS_SCORE:
+            return params, None
+        logger.warning("Speech check %s: transcript matches %.2f (%s)", chunk_id, score, label)
+        return params, (0, -score, "speech mismatch")
+
+    @staticmethod
+    def _hear(checker, audio: AudioSegment, chunk_id: str) -> Optional["speech_check.Heard"]:
+        try:
+            return checker.transcribe(audio)
+        except Exception as error:  # a checker failure costs the check, never the chapter
+            logger.warning("Speech check skipped for %s: %s", chunk_id, error)
+            return None
 
     def _combine_and_export(self, pieces: List[bytes], audio_format: Tuple[int, int, int], speed: float,
                              output_file: str, audio_tags: AudioTags) -> None:
