@@ -2070,7 +2070,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 lab_voice = gr.Dropdown(choices, value=default_voice, label="Voice", allow_custom_value=True)
                 phrase = gr.Textbox(PREVIEW_PHRASE, lines=2, label="Phrase")
             with gr.Row(equal_height=True):
-                exaggeration = gr.Slider(0.25, 2.0, value=saved["exaggeration"], step=0.05, label="Exaggeration",
+                exaggeration = gr.Slider(0.25, 2.0, value=saved["exaggeration"], step=0.01, label="Exaggeration",
                                          info="Emotion and emphasis")
                 cfg_weight = gr.Slider(0.1, 1.0, value=saved["cfg_weight"], step=0.05, label="CFG weight",
                                        info="Lower = slower, more deliberate")
