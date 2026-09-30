@@ -463,8 +463,23 @@ class TestPacedSpeech(unittest.TestCase):
         self.assertEqual(_carrier_cut(audio, words), 1900)
         self.assertIsNone(_carrier_cut(audio, words[:-1] + [("open.", 1600, 1850)]))  # late: retry
 
-    def test_lead_in_speech_left_after_the_cut_is_retried(self):
-        provider, _ = self._checked_provider("Open. Kiss me!", "Kiss me!")
+    def test_a_short_pause_is_enough_where_whisper_places_the_gap(self):
+        # Some voices pause only 30-70 ms after the lead-in; the silence-only rule wants 80.
+        words = self.HEARD_TWO_WORDS[:-2] + [("Oh,", 1850, 2100)]
+        self.assertEqual(_carrier_cut(_tone(1800) + _silence(40) + _tone(500), words), 1820)
+        self.assertIsNone(_carrier_cut(_tone(1800) + _silence(20) + _tone(500), words))
+        self.assertIsNone(_quote_context_cut(_tone(1800) + _silence(40) + _tone(500)))
+        # No pause after the lead-in, only one after the unit's first word ("he" grunts): never cut there.
+        audio = _tone(1800) + _silence(20) + _tone(150) + _silence(40) + _tone(400)
+        self.assertIsNone(_carrier_cut(audio, self.HEARD_TWO_WORDS[:-2] + [("he", 1820, 1960), ("grunts.", 2010, 2400)]))
+
+    def test_lead_in_speech_left_after_the_cut_or_a_lost_first_word_is_retried(self):
+        for heard in ("Open. Kiss me!", "Me!"):
+            with self.subTest(heard=heard):
+                self._retried_after(heard)
+
+    def _retried_after(self, first_heard):
+        provider, _ = self._checked_provider(first_heard, "Kiss me!")
         provider.client.audio.speech.create.return_value = SimpleNamespace(
             content=_wav_from_segment(self.TWO_WORDS))
         with patch("audiobook_generator.tts_providers.openai_tts_provider.secrets.randbelow", return_value=20):
@@ -561,6 +576,9 @@ class TestPacedSpeech(unittest.TestCase):
             dict(model='chatterbox', voice='Elena.wav', response_format='wav', input='she said.',
                  extra_body={'seed': 10}), 'she said.', 'test')
         self.assertEqual((len(audio), attempts, flagged), (len(self.TWO_WORDS) - 1900, 1, None))
+        # After the lead-in a lowercase tag starts its own sentence, as Chatterbox would capitalise it alone.
+        self.assertEqual(provider.client.audio.speech.create.call_args.kwargs['input'],
+                         _SHORT_QUOTE_CONTEXT + ' She said.')
         self.assertNotIn('_match', params)
 
     def test_keeps_the_closest_take_when_every_retry_has_an_implausible_length(self):

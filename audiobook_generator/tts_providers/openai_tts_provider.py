@@ -172,6 +172,17 @@ def _tiny_quote(text: str) -> bool:
             and re.fullmatch(r"[^\W\d_]+(?:['’][^\W\d_]+)*[!?.,]?", quoted[1:-1]) is not None)
 
 
+def _new_sentence(text: str) -> str:
+    """The unit with a capital first letter, as it follows the lead-in. Chatterbox capitalises a
+    request's first letter itself, so "she said." was always spoken as "She said." before the
+    lead-in; after it, lowercase reads as the same sentence running on, often with no pause to cut
+    in (13 of 32 same-seed takes of hard tags unseparated as is, 8 capitalised; WORKLOG §26.5)."""
+    for index, char in enumerate(text):
+        if char.isalpha():
+            return text[:index] + char.upper() + text[index + 1:]
+    return text
+
+
 def _split_oversized_unit(unit: str) -> List[str]:
     """Break a unit over MAX_REQUEST_CHARS into pieces (F-07), so none can reach the server's
     token cap. Pieces are meant to be sent as separate requests joined with NO pause: the cut
@@ -484,7 +495,14 @@ def _silent_core(audio: AudioSegment, start: int, end: int) -> Tuple[int, int]:
 
 
 _CONTEXT_GAP_MS = 80
-_WORD_TIME_SLACK_MS = 150  # Whisper's word times are approximate
+# Where Whisper's word times locate the gap, a shorter pause is enough: 13 of 97 lead-in takes paused
+# only 0-70 ms, and no true silence ever started between Whisper's end of "open." and the real gap
+# (WORKLOG §26.5), so a word's own brief closure can't be mistaken for it.
+_CARRIER_GAP_MS = 30
+# Whisper's start of the unit's first word, plus this, is the latest the gap may start: measured on 150
+# lead-in takes, the real gap started 470 ms before to 30 ms after it, and a pause inside the unit's
+# first word ("he | grunts") no earlier than 90 ms after it (WORKLOG §26.5).
+_UNIT_ONSET_SLACK_MS = 50
 
 
 def _quote_context_cut(audio: AudioSegment) -> Optional[int]:
@@ -501,19 +519,20 @@ def _quote_context_cut(audio: AudioSegment) -> Optional[int]:
 
 def _carrier_cut(audio: AudioSegment, words: List[Tuple[str, int, int]]) -> Optional[int]:
     """Where the lead-in ends, from Whisper's word times: inside the first true silence that starts
-    after the lead-in's last word ends and before the unit's first word (a two-word quote's own
-    pause starts later), or after the lead-in when Whisper heard no word after it.
+    after the lead-in's last word ends and before the unit's first word begins (a two-word quote's
+    own pause starts later), or after the lead-in when Whisper heard no word after it.
 
-    Whisper small ended the lead-in's last word 100-170 ms before the silence on all 8 measured
-    takes (WORKLOG §26.2), so the real gap passes and a pause before that word never does. A late
-    word time finds no silence, and the take is retried."""
+    Measured: the real gap starts after Whisper's end of the lead-in and before its start of the
+    unit plus _UNIT_ONSET_SLACK_MS (WORKLOG §26.2, §26.5), so a pause before the lead-in's last word
+    or inside the unit's first word doesn't qualify. A misplaced word time finds no silence, and
+    the take is retried."""
     bounds = speech_check.carrier_bounds(words, _SHORT_QUOTE_CONTEXT)
     if bounds is None:
         return None
     last_end, next_start = bounds
     cores = [(start, end) for start, end in (_silent_core(audio, s, e) for s, e in _silence_runs(audio))
-             if end - start >= _CONTEXT_GAP_MS and start >= last_end
-             and (next_start is None or start < next_start + _WORD_TIME_SLACK_MS)]
+             if end - start >= _CARRIER_GAP_MS and start >= last_end
+             and (next_start is None or start < next_start + _UNIT_ONSET_SLACK_MS)]
     if not cores:
         return None
     start, end = min(cores)
@@ -1066,7 +1085,7 @@ class OpenAITTSProvider(BaseTTSProvider):
         plain_kwargs = request_kwargs
         if contextual:
             request_kwargs = {**request_kwargs,
-                              "input": _SHORT_QUOTE_CONTEXT + " " + request_kwargs["input"].strip()}
+                              "input": f"{_SHORT_QUOTE_CONTEXT} {_new_sentence(request_kwargs['input'].strip())}"}
         rejected = []
         unsafe_reason = "near-silent audio"
         unseparated = False
@@ -1106,10 +1125,11 @@ class OpenAITTSProvider(BaseTTSProvider):
                             chunk_id, cut / 1000, params.get("seed", "default"))
             # Heard before the length checks: a take kept for the least-wrong length is leak-checked too.
             heard = self._hear(checker, audio, chunk_id) if checker is not None else None
-            if contextual and heard and speech_check.leaked(unit, heard.text, _SHORT_QUOTE_CONTEXT):
+            if contextual and heard and (speech_check.leaked(unit, heard.text, _SHORT_QUOTE_CONTEXT)
+                                         or speech_check.clipped(unit, heard.text)):
                 unsafe_reason = "unseparated short-quote context"
                 unseparated = True
-                logger.warning("Lead-in speech remained after the cut for %s (attempt %d/%d)",
+                logger.warning("The cut missed the lead-in's end for %s (attempt %d/%d)",
                                chunk_id, attempt + 1, _BAD_CLIP_RETRIES + 1)
                 continue
             params, verdict = self._verdict(audio, unit, params, heard, chunk_id,

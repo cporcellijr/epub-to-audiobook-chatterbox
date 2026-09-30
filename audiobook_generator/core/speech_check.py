@@ -82,9 +82,45 @@ def get() -> Optional[SpeechChecker]:
     return _checker
 
 
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
+         "sixteen seventeen eighteen nineteen").split()
+_TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+_ORDINALS = {"one": "first", "two": "second", "three": "third", "five": "fifth", "eight": "eighth",
+             "nine": "ninth", "twelve": "twelfth"}
+
+
+def _spoken(n: int) -> str:
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        return _TENS[n // 10] + (f" {_ONES[n % 10]}" if n % 10 else "")
+    for size, name in ((10**9, "billion"), (10**6, "million"), (1000, "thousand"), (100, "hundred")):
+        if n >= size:
+            return f"{_spoken(n // size)} {name}" + (f" {_spoken(n % size)}" if n % size else "")
+    return str(n)
+
+
+def _ordinal(words: str) -> str:
+    head, _, last = words.rpartition(" ")
+    last = _ORDINALS.get(last) or (last[:-1] + "ieth" if last.endswith("y") else last + "th")
+    return f"{head} {last}".strip()
+
+
+def _spell_numbers(text: str) -> str:
+    """Digits as words: Whisper writes "3." for a spoken "Three,"; "21st" becomes "twenty first"."""
+    def spell(number: re.Match) -> str:
+        digits, suffix = number.group(1), number.group(2)
+        if len(digits) > 12:
+            return number.group(0)
+        words = _spoken(int(digits))
+        return _ordinal(words) if suffix else words
+    text = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)  # 2,000
+    return re.sub(r"(\d+)(st|nd|rd|th)?\b", spell, text)
+
+
 def _words(text: str) -> List[str]:
     # Repeated letters collapse ("Mmm", "Jeeesuss"): Whisper spells drawn-out sounds freely.
-    text = re.sub(r"(.)\1+", r"\1", text.lower().replace("’", "").replace("'", ""))
+    text = re.sub(r"(.)\1+", r"\1", _spell_numbers(text).lower().replace("’", "").replace("'", ""))
     return re.findall(r"[a-z0-9]+", text)
 
 
@@ -94,9 +130,9 @@ _FILLERS = {"um", "uh", "er", "erm", "hm", "m", "mh", "mhm", "ah", "eh", "huh"}
 
 
 def match(expected: str, heard: str) -> Optional[float]:
-    """How closely a transcript matches the text, 0-1; None when it can't be judged (numbers, which
-    Whisper may spell out; no letters; nothing heard for a filler such as "Um..."). A filler heard as
-    any filler matches."""
+    """How closely a transcript matches the text, 0-1; None when it can't be judged (digits in the
+    text, which a narrator may read several ways; no letters; nothing heard for a filler such as
+    "Um..."). A filler heard as any filler matches. Digits Whisper writes are compared as words."""
     if re.search(r"\d", expected) or not re.search(r"[^\W\d_]", expected):
         return None
     if set(_words(expected)) <= _FILLERS and set(_words(heard)) <= _FILLERS:
@@ -110,6 +146,23 @@ def leaked(expected: str, heard: str, carrier: str) -> bool:
     heard_words = _words(heard)
     return (bool(heard_words) and heard_words[0] in _words(carrier)
             and heard_words[:1] != _words(expected)[:1])
+
+
+# Whisper's spellings of a first word that is one sound (after repeated letters collapse): "Eye" for
+# "I", "C." for "See!", "Ho!" for "Oh,".
+_SAME_SOUND = {"eye": "i", "aye": "i", "ay": "i", "c": "se", "sea": "se", "ho": "oh", "o": "oh",
+               "u": "you", "yu": "you", "r": "are", "y": "why", "b": "be"}
+
+
+def clipped(expected: str, heard: str) -> bool:
+    """Whether a cut take lost its first word: the cut came too late ("Grunts" for "he grunts.").
+    Spelling variants and stutters still count as the word ("John" for "Jon", "Why? Yeah!" for
+    "Y-- yeah!"), and a first word that is a filler isn't judged, since Whisper often drops those."""
+    want, got = _words(expected)[:1], [_SAME_SOUND.get(w, w) for w in _words(heard)[:2]]
+    if not want or not got or want[0] in _FILLERS:
+        return False
+    return not any(w.startswith(want[0]) or want[0].startswith(w)
+                   or difflib.SequenceMatcher(None, want[0], w).ratio() >= 0.6 for w in got)
 
 
 def carrier_bounds(words: List[Tuple[str, int, int]], carrier: str) -> Optional[Tuple[int, Optional[int]]]:

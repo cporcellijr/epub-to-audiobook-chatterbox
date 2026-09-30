@@ -30,6 +30,14 @@ class TestMatch(unittest.TestCase):
         for expected, heard in clear:
             self.assertGreaterEqual(match(expected, heard), PASS_SCORE, (expected, heard))
 
+    def test_digits_whisper_writes_are_compared_as_words(self):
+        # A clear "Three," heard as "3." scored 0 and was retried twice (WORKLOG §26.5).
+        for expected, heard in (("“Three,”", "3."), ("“Twenty-one!”", "21!"), ("“First!”", "1st!"),
+                                ("“Two thousand.”", "2,000."), ("“Four thirty,”", "4:30,"),
+                                ("the twelfth time", "the 12th time")):
+            self.assertEqual(match(expected, heard), 1.0, (expected, heard))
+        self.assertLess(match("“Three,”", "3 times 3"), PASS_SCORE)
+
     def test_numbers_letterless_text_and_unheard_fillers_are_not_judged(self):
         self.assertIsNone(match("“Room 12!”", "Room twelve!"))
         self.assertIsNone(match("“...”", ""))
@@ -48,6 +56,17 @@ class TestLeaked(unittest.TestCase):
         self.assertFalse(speech_check.leaked("“Kiss me!”", "Kiss me!", CARRIER))
         self.assertFalse(speech_check.leaked("“Was he your first?”", "Was he your first?", CARRIER))
         self.assertFalse(speech_check.leaked("“Um...”", "", CARRIER))
+
+
+class TestClipped(unittest.TestCase):
+    def test_a_cut_take_that_lost_its_first_word_is_clipped(self):
+        self.assertTrue(speech_check.clipped("he grunts.", "Grunts"))  # a 30 ms rule cut after "he"
+        self.assertTrue(speech_check.clipped("“Kiss me!”", "Me!"))
+        for expected, heard in (("she said.", "She said."), ("“Jon, what?”", "John, what?"),
+                                ("“Y-- yeah!”", "Why? Yeah!"), ("“Um... right.”", "Right."),
+                                ("“Kiss me!”", ""), ("“Three,”", "3."), ("I stammer.", "Eye Stammer"),
+                                ("“See! Asshole!”", "C. Asshole"), ("“Oh,”", "Ho!")):
+            self.assertFalse(speech_check.clipped(expected, heard), (expected, heard))
 
 
 class TestCarrierBounds(unittest.TestCase):

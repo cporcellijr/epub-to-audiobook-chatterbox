@@ -1625,3 +1625,65 @@ problem, apart from the doubled word. The owner called the result good enough to
 
 Private evidence is in `data/diagnostics/volume2_context_fix_run_2026-09-30/` and
 `data/diagnostics/second_book_2026-09-30/` (`rebuild_units.py`, `review_book_run.py`, `review.private.json`).
+
+### 26.5 Fewer lead-in retries, a dropped-first-word bug, and numbers in transcripts
+
+The owner asked to look into the two costs from §26.4.
+
+**Which units failed.** The logs of both runs had 76 unseparated attempts spread over 49 units. Nearly all
+were short narration tags such as "she said." and "he snarls.". Single-word quotes, which use the silence
+rule, failed on 1 of 43 units. In the second book, the narrator's voice (Elena) failed on 25 of its 116
+short units.
+
+**Why.** 97 fresh lead-in takes reproduced it: the 49 failing units plus 49 same-voice controls, analysed
+and saved (`leadin_tuning_2026-09-30/repro_takes.py`).
+- **Controls:** 0 of 48 unseparated. **Failing units:** 13 of 49.
+- In every failure the model paused only 0–70 ms of true silence after "open.", against a median of
+  200 ms in the takes that separated; the cut rule wanted 80 ms. Whisper still heard a full stop in 11 of
+  the 13.
+- The worst cases run the two together as one plausible sentence: "the window was open so much", "open
+  she said".
+
+**Changes to the cut:**
+- **30 ms of true silence is enough where Whisper locates the gap** (`_CARRIER_GAP_MS`). The single-word
+  silence rule keeps its 80 ms. In no take did a true silence start between Whisper's end of "open." and
+  the real gap, so a brief closure inside "open" can't be taken for it.
+- **The gap must start by Whisper's start of the unit plus 50 ms** (`_UNIT_ONSET_SLACK_MS`, down from
+  150). Measured on 150 takes, the real gap starts between 470 ms before and 30 ms after that point, and a
+  pause inside the unit's first word no earlier than 90 ms after it.
+  - **This fixes a bug in §26.2's rule.** Its 150 ms allowance cut one take of "she bites back." to
+    "Bites back.", which scores 0.83 and would pass the check.
+  - The independent transcripts of both finished books show no dropped first word; the only hits were
+    homophones.
+- **`speech_check.clipped`**: a cut take whose transcript lacks the unit's first word is retried, just like
+  a leak. Spelling variants, stutters, fillers and one-sound homophones ("Eye" for "I", "C." for "See!",
+  "Ho!" for "Oh,") still count as the word.
+- **A lowercase unit is capitalised after the lead-in** (`_new_sentence`). Chatterbox's `punc_norm`
+  capitalises a request's first letter, so before the lead-in existed every tag was already spoken as
+  "She said.". On 32 same-seed pairs of the hardest tags, the unseparated count fell from 11 to 8 under the
+  new rules, and pauses under 30 ms fell from 7 to 4.
+
+**Offline check** of the new rules on all 169 saved takes: the 8 owner-approved cuts are unchanged, no
+existing cut moved, and every new cut was heard correctly. The new checks rejected four cuts:
+- one wrong in-word cut ("Edges me on");
+- two genuinely bad takes;
+- one homophone ("See!"), since fixed.
+
+**Live check.** The working-tree `_speak_take` ran against live Chatterbox on the 49 units that failed in
+the two books.
+- Unseparated attempts fell from 76 to 20, and units spoken without the lead-in from 11 to 4.
+- Two stubborn units were flagged "speech mismatch": "N-- no, Ma," and "So much!".
+- "So much!" shows the remaining limit: the model reads "…the window was open so much!" as one sentence.
+  Its first plain retry came out garbled ("In college!", scored 0.12), and the check caught it.
+- Changing the lead-in text itself could fix the run-on, but would need the owner's ear again.
+
+**Numbers.** A clear "Three," heard as "3." scored 0.00 and was retried twice. `match` now spells digits in
+the transcript as words: cardinals, ordinals like "21st", and thousands separators. Text that contains
+digits is still not judged, because a narrator may read "1990" several ways.
+
+**Side finding, left unchanged.** `speech_tags.SPEECH_VERBS` is almost all past tense. In a present-tense
+book, "he murmurs." is not recognised as a tag, so it misses the calmer short-tag cap of §23.1; "panted"
+and "sobbed" are missing too. This list also feeds cast attribution, so any change belongs in its own
+piece of work.
+
+649 tests pass. Deployed with the queue idle; the deployed source hashes match.
