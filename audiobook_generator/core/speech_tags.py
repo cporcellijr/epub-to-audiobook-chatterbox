@@ -17,7 +17,9 @@ nothing between that introduces or names anyone else ("Bring him up," said Mrs. 
 
 These anchors are shown to the LLM as known speakers and are not asked about, which also gives it
 fixed points to follow the turn-taking in untagged exchanges. A wrong anchor can't be corrected
-later, so every rule here errs toward asking (WORKLOG §27).
+later, so every rule here errs toward asking (WORKLOG §27). That includes a family word on its own
+("Dad said"): in one story "Dad" was both the narrator's father and her husband, their son's "Daddy",
+and the tag had locked the father's lines to the husband (§30).
 """
 import re
 from typing import Dict, List, Optional
@@ -253,6 +255,8 @@ def tagged_speakers(paragraphs: List[List[Segment]]) -> Dict[int, str]:
             after_name, before_name = _tag_after(after), _tag_before(before)
             if after_name and before_name and after_name.lower() != before_name.lower():
                 speaker = None  # contradictory tags: the model decides
+            elif (after_name or before_name) in STANDALONE:
+                speaker = None  # "Dad said": whose dad depends on who is telling it; the model decides
             elif after_name or before_name:
                 speaker = named[piece.line_id] = after_name or before_name
             elif _has_pronoun_tag(before, after):

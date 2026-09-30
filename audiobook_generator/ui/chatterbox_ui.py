@@ -1331,6 +1331,40 @@ def sample_character(cast_key: Optional[str], character_key: Optional[str], engi
                          temperature, speed)
 
 
+def merge_choices(cast_key: Optional[str], character_key: Optional[str]) -> dict:
+    """The editor's "Same person as" list: every other character of the cast, most lines first."""
+    cast = cast_store.load_cast(cast_file_for(cast_key)) if cast_key else None
+    if not cast or character_key not in cast["characters"]:
+        return gr.update(choices=[], value=None)
+    return gr.update(choices=[(c.get("name", k), k) for k, c in cast_store.ranked_characters(cast) if k != character_key],
+                     value=None)
+
+
+def merge_cast_character(cast_key: Optional[str], character_key: Optional[str], target_key: Optional[str],
+                         engine: str, confirmed: bool = True) -> tuple:
+    """Merge the selected character into the one picked as the same person (a doctor and her first
+    name, a name the book spells two ways): their lines, names and aliases move over, and the
+    target keeps its voice. Returns (table, keys, status, selection, editor heading)."""
+    if not confirmed:
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+    if not cast_key or not character_key:
+        raise gr.Error("Click a character in the cast table first.")
+    if not target_key:
+        raise gr.Error("Pick who they are the same person as.")
+    path = cast_file_for(cast_key)
+    cast = cast_store.load_cast(path)
+    if cast is None or character_key not in cast["characters"] or target_key not in cast["characters"]:
+        raise gr.Error("That character is no longer in the cast (was it re-analysed?).")
+    source = cast["characters"][character_key].get("name", character_key)
+    target = cast["characters"][target_key].get("name", target_key)
+    cast_store.merge_characters(cast, character_key, target_key)
+    cast_store.save_cast(path, cast)
+    rows, keys = cast_rows(cast, engine)
+    return (gr.update(value=rows, visible=True), keys,
+            f"Merged **{source}** into **{target}**: their lines now use {target}'s voice.", None,
+            "Click a character in the table.")
+
+
 def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gender: str, voice: Optional[str],
                     engine: str, delivery_choice: str = "auto") -> tuple:
     """Save the editor's gender, voice and delivery for the selected character; returns the
@@ -2062,6 +2096,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                         with gr.Column(scale=0, min_width=100):
                             cast_sample_button = gr.Button("▶ Sample", size="sm")
                             cast_apply_button = gr.Button("Save", size="sm")
+                    with gr.Row(equal_height=True):
+                        cast_merge_into = gr.Dropdown([], value=None, label="Same person as", scale=2,
+                                                      info="One person listed twice (a first name and a surname, "
+                                                           "two spellings): merge them.")
+                        cast_merge_button = gr.Button("Merge", size="sm", scale=0, min_width=100)
+                    cast_merge_confirmed = gr.Checkbox(False, visible=False)
                 cast_key_state = gr.State(None)
                 cast_keys_state = gr.State([])
                 cast_selected = gr.State(None)
@@ -2193,7 +2233,15 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         ).then(resuggest_cast_voices, inputs=[cast_key_state, engine, voice, resuggest_confirmed],
                outputs=[cast_table, cast_keys_state, cast_status, *narrator_outputs])
         cast_table.select(select_cast_row, inputs=[cast_key_state, cast_keys_state, engine],
-                          outputs=[cast_selected, cast_editing, cast_gender, cast_voice, cast_profile, cast_delivery])
+                          outputs=[cast_selected, cast_editing, cast_gender, cast_voice, cast_profile, cast_delivery]) \
+            .then(merge_choices, inputs=[cast_key_state, cast_selected], outputs=cast_merge_into)
+        cast_merge_button.click(
+            None, inputs=None, outputs=cast_merge_confirmed,
+            js="() => confirm('Merge this character into the one picked? Their lines, names and aliases move "
+               "over, and they read in that character\\'s voice.')",
+        ).then(merge_cast_character,
+               inputs=[cast_key_state, cast_selected, cast_merge_into, engine, cast_merge_confirmed],
+               outputs=[cast_table, cast_keys_state, cast_status, cast_selected, cast_editing])
         cast_apply_button.click(apply_cast_edit,
                                 inputs=[cast_key_state, cast_selected, cast_gender, cast_voice, engine, cast_delivery],
                                 outputs=[cast_table, cast_keys_state, cast_status])

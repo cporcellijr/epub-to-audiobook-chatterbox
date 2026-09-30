@@ -1869,3 +1869,80 @@ Checks:
 679 tests pass. They cover title-kept keys in either order, the gender check on an exact name, one-letter
 names kept apart while real short forms merge, the family-word alias, the narrator fallback in the queue
 and the provider, and the dialogue mode still needing its own voice.
+
+## 30. A whole collection re-cast: family words, pairs and one person under two names (2026-09-30)
+
+The owner asked for a full cast of the first collection (6 stories, 1,521 lines) to verify §27–§29. It
+was run with the app's own chapter selection, settings and cast job (`run_cast_analysis`); the saved cast
+was backed up before each run. Compared with the old full-book cast from before §22's per-story fixes:
+- **Better:** no unknown lines (was 4), and story 1's narrator is its own "I" (the old cast had story 2's
+  narrator). Every story-1 correction of §27–§28 held.
+- **Three new problems, which this section fixes:**
+
+**1. "Dad" was two men.** In story 2 the narrator's husband is their son's "Daddy", and the model aliased
+him "Dad" for that chapter. The narration's `"…," Dad said` (the narrator's *father*) is a tag, so its
+line was anchored to "Dad", which resolved to the husband: all 25 of the father's lines. The old cast only
+avoided this because that run's model happened to create a separate father.
+- A tag naming only a family word ("Dad said", "said Mother") now tags but anchors nothing, and lends
+  nothing. Whose "Dad" it is depends on who is telling it, so the model decides, as for a pronoun tag.
+- A name behind a title still anchors ("said Aunt Ruth").
+- Asked, the model created "<narrator>'s father" and gave him all 25 lines.
+
+**2. A pair became a name.** The model answered "<twin> and <twin>" for one character, and the roster's
+"the fuller name becomes the display name" rule showed one twin as the pair. A speaker or character
+answered as "X and Y" is now X, and joint aliases are dropped.
+
+**3. One doctor, two characters, two voices.** Story 5's doctor says "please call me <first name>". The
+model gave that very line to the first name, so her earlier lines stayed "Dr. <surname>" (18) and the rest
+went to the first name (61). The old cast only merged them because the model had listed the alias early.
+- **An introduction line merges the name into its speaker.** When a line says "call me X", "my name is
+  X" or "the name's X" (not denied: "don't call me X"), and X is a separate character who first appeared in
+  this chapter, X is folded into the line's speaker. An X not met yet becomes the speaker's alias.
+- **When the line was given to X itself, the model is asked one question.** This applies when the
+  introduction is X's first line: "Is X a new person, or another name for one of these characters who
+  spoke just before?" A "new" answer (a newcomer introducing themselves), an unusable reply or a name
+  outside the candidates changes nothing.
+- On the real story that is one question, answered correctly: 79 lines, one character.
+- **The editor gains Merge.** "Adjust the cast" has a "Same person as" list and a Merge button, with a
+  confirmation. The selected character's lines in every chapter, name, aliases and narrator role move to
+  the chosen one, which keeps its own voice (`cast.merge_characters`).
+
+**Results.** The third whole-book run on the final code, compared with the first of the day:
+
+| | first | now |
+|---|---|---|
+| story 2, the father's 25 lines | the husband | the father |
+| story 5, the doctor | 2 characters (18 + 63 lines) | 1 (79) |
+| a twin's display name | "<twin> and <twin>" | the twin |
+| unknown lines / review requests | 0 / 11 | 0 / 11 (+1 identity question) |
+
+- Analysis time was about 7½ minutes per run.
+- The benchmark is unchanged at 83.9%.
+- One spelling split remains: the author spells a twin's name two ways (26 lines and 1). It was merged
+  with the new editor action, the same code the button runs. The saved cast now has 25 characters.
+
+**Shortfalls, not fixed:**
+- **One story-1 line is still wrong.** The wife's reply at 12:52 goes to her mother (§28), and the review's
+  second answer repeats the mistake.
+- **A name spelled two ways by the book is not merged automatically.** Merging near-identical names is
+  the loose matching §29 removed (Ann/Anna, Andrea/Andrew), so this is left to the editor's Merge.
+- **An editor merge doesn't survive a re-analysis.** Re-analysing rebuilds the characters, carrying over
+  only picked voices, so a merged pair can split again unless the model or an introduction line joins
+  them.
+- **The identity question needs an introduction line.** A character called by title in one part and by
+  first name in another, with no "call me …", can still split.
+- **The model can still confuse a vocative with the speaker.** The benchmark's "Dom." given to Dom
+  (§28) stays wrong.
+- **Voices are not picked by the analysis itself.** They are suggested when the cast is first shown on
+  the page, or when its book is queued.
+
+**Deployment slip.** One rebuild did not complete, and `compose up` left the old container running. The
+deployed-source hash check caught it before any result was trusted. The analysis started on the stale
+code was stopped, and Chatterbox, which that job had unloaded, was reloaded by hand.
+
+687 tests pass. They cover family-word tags (asked, and the answer joining the character given that
+alias), pairs, the introduction merge (by the speaker, given to the new name with "same as" and "new"
+answers, denied names, someone from an earlier chapter, an alias for a name not met yet), `Roster.merge`,
+`cast.merge_characters` (lines across chapters, narrator and point-of-view roles, voice kept) and the
+editor's Merge. Private evidence and the four whole-book casts (the old one, runs 1–3) are in
+`data/diagnostics/tag_direction_2026-09-30/` and `data/cast_backups/`.

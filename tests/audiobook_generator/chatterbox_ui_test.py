@@ -1434,6 +1434,30 @@ class TestCastPanel(unittest.TestCase):
         self.cast_store.save_cast(chatterbox_ui.cast_file_for(key), cast)
         return cast
 
+    def test_one_person_listed_twice_is_merged_in_the_editor(self):
+        # Seen live: a doctor and the first name she asks to be called, as two characters (WORKLOG §30).
+        cast = self._save("k", self.cast_store.STATUS_DONE, {
+            "lena": {"name": "Lena", "aliases": [], "gender": "female", "age": "adult", "lines": 63,
+                       "voice": "Ada.wav"},
+            "hale": {"name": "Dr. Hale", "aliases": [], "gender": "female", "age": "adult", "lines": 18,
+                      "voice": "Bea.wav"},
+        })
+        cast["chapters"]["h"] = {"number": 1, "lines": {"1": "lena", "2": "hale", "3": None}}
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        self.assertEqual(chatterbox_ui.merge_choices("k", "hale")["choices"], [("Lena", "lena")])
+        unchanged = chatterbox_ui.merge_cast_character("k", "hale", "lena", "chatterbox", False)  # cancelled
+        self.assertEqual(unchanged, (chatterbox_ui.gr.update(),) * 5)
+        _, keys, message, selected, _ = chatterbox_ui.merge_cast_character("k", "hale", "lena", "chatterbox")
+        saved = self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))
+        self.assertEqual((list(saved["characters"]), keys), (["lena"], ["lena"]))
+        self.assertEqual(saved["chapters"]["h"]["lines"], {"1": "lena", "2": "lena", "3": None})
+        kept = saved["characters"]["lena"]
+        self.assertEqual((kept["lines"], kept["aliases"], kept["voice"]), (81, ["Dr. Hale"], "Ada.wav"))
+        self.assertEqual((message, selected), ("Merged **Dr. Hale** into **Lena**: their lines now use Lena's voice.",
+                                               None))
+        with self.assertRaises(gr.Error):
+            chatterbox_ui.merge_cast_character("k", "lena", None, "chatterbox")
+
     def test_no_cast_yet_hides_the_table(self):
         table, keys, status, seen = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
         self.assertFalse(table["visible"])

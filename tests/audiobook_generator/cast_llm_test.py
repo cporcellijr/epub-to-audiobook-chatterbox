@@ -272,6 +272,69 @@ class TestConservativeMerging(unittest.TestCase):
         self.assertEqual(roster.add("Mother"), key)
 
 
+class TestOnePersonPerName(unittest.TestCase):
+    """Names that aren't one person, and one person under two names (WORKLOG §30)."""
+
+    def setUp(self):
+        self.log = logging.getLogger("test-cast")
+
+    def test_a_pair_answered_as_one_speaker_is_its_first_person(self):
+        reply = _reply({1: "Jonathon and Jess"}, [{"name": "Jonathon and Jess", "gender": "male",
+                                                   "aliases": ["Jonathon", "Jon & Jess"]}])
+        speakers, characters, _ = parse_reply(json.dumps(reply), [1])
+        self.assertEqual((speakers[1], characters[0]["name"], characters[0]["aliases"]),
+                         ("Jonathon", "Jonathon", ["Jonathon"]))
+
+    TEXT = (f'"Good morning," said Dr. Hale. "Please call me Lena."{M}"Thank you, Lena."{M}'
+            '"You are welcome," Lena said.')
+
+    def test_a_speaker_introducing_themselves_absorbs_that_name(self):
+        chat = ScriptedChat(_reply({3: "Nora"}))
+        roster, stats = Roster(), {}
+        lines, _ = attribute_chapter(chapter_segments(self.TEXT), roster, chat, stats, self.log)
+        self.assertEqual(lines[4], lines[1])
+        self.assertNotIn("lena", roster.characters)
+        self.assertIn("Lena", roster.characters[lines[1]]["aliases"])
+        self.assertEqual((stats["merged_introductions"], roster.characters[lines[1]]["lines"]), (1, 3))
+
+    # Seen live: the model gave the introduction to the new name itself, splitting one doctor in two.
+    GIVEN_TO_NEW_NAME = (f'"Good morning," said Dr. Hale.{M}"Morning," said Nora.{M}'
+                         f'"I am glad. And please call me Lena."{M}"Thank you, Lena," said Nora.{M}'
+                         '"You are welcome," Lena said.')
+
+    def test_an_introduction_given_to_the_new_name_asks_who_it_belongs_to(self):
+        chat = ScriptedChat(_reply({3: "Lena"}), {"same_as": "Dr. Hale"})
+        roster, stats = Roster(), {}
+        lines, _ = attribute_chapter(chapter_segments(self.GIVEN_TO_NEW_NAME), roster, chat, stats, self.log)
+        self.assertEqual((lines[3], lines[5]), (lines[1], lines[1]))
+        self.assertNotIn("lena", roster.characters)
+        self.assertEqual((stats["identity_questions"], stats["merged_introductions"]), (1, 1))
+        self.assertIn("one of these characters who spoke just before: Dr. Hale, Nora", chat.prompts[1][1]["content"])
+
+    def test_a_newcomer_introducing_themselves_stays_new(self):
+        chat = ScriptedChat(_reply({3: "Lena"}), {"same_as": "new"})
+        roster, stats = Roster(), {}
+        lines, _ = attribute_chapter(chapter_segments(self.GIVEN_TO_NEW_NAME), roster, chat, stats, self.log)
+        self.assertEqual(lines[3], lines[5])
+        self.assertNotEqual(lines[3], lines[1])
+        self.assertNotIn("merged_introductions", stats)
+
+    def test_someone_met_in_an_earlier_chapter_is_not_merged(self):
+        roster = Roster()
+        roster.add("Lena", "female")
+        roster.count_line("lena")
+        lines, _ = attribute_chapter(chapter_segments(self.TEXT), roster, ScriptedChat(_reply({3: "Nora"})), {},
+                                     self.log)
+        self.assertEqual(roster.characters[lines[4]]["name"], "Lena")
+
+    def test_a_denied_name_is_no_introduction_and_a_new_one_becomes_an_alias(self):
+        text = f'"Don\'t call me Rex," said Anna.{M}"Fine," Rex said.{M}"Call me Annie," said Anna.'
+        roster = Roster()
+        lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(), {}, self.log)
+        self.assertNotEqual(lines[1], lines[2])
+        self.assertEqual(roster.resolve("Annie"), lines[1])
+
+
 class TestAttributeChapter(unittest.TestCase):
 
     def setUp(self):
@@ -412,9 +475,9 @@ class TestTaggedLines(unittest.TestCase):
         self.assertIn("Ids to answer: 1, 3, 4, 5", prompt)
         self.assertEqual((lines[2], lines[6]), ("tom", "tom"))
 
-    def test_a_tag_name_joins_the_character_the_model_gave_that_alias(self):
+    def test_a_family_word_tag_is_asked_and_the_answer_joins_the_character_given_that_alias(self):
         text = f'"Supper is ready," said Mother.{M}"Coming," said Ada.{M}"Wash your hands first."'
-        chat = ScriptedChat(_reply({3: "Mrs. Marsh"}, [
+        chat = ScriptedChat(_reply({1: "Mother", 3: "Mrs. Marsh"}, [
             {"name": "Mrs. Marsh", "gender": "female", "age": "adult", "aliases": ["Mother"]}]))
         roster = Roster()
         lines, moods = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)

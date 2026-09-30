@@ -69,6 +69,32 @@ class TestPersistence(unittest.TestCase):
         self.assertEqual(cast_store.analysis_progress(None), (0, 0))
 
 
+class TestMerge(unittest.TestCase):
+
+    def test_merging_moves_lines_names_and_the_narrator_role(self):
+        cast = cast_store.new_cast("k", "/x.epub", "T", "A", "chatterbox", "N.wav", [1, 2])
+        cast["characters"] = {
+            "jon": {"name": "Jonathon", "aliases": ["Jon"], "gender": "male", "age": "unknown", "lines": 26,
+                     "voice": "Axel.wav"},
+            "jonathan": {"name": "Jonathan", "aliases": [], "gender": "unknown", "age": "adult", "lines": 1,
+                        "voice": "Henry.wav"},
+        }
+        cast["chapters"] = {"a": {"number": 1, "lines": {"1": "jonathan", "2": "jon"}, "narrator": "jonathan"},
+                            "b": {"number": 2, "lines": {"1": "jonathan"}}}
+        cast["book_tone"] = {"point_of_view": "first", "pov_key": "jonathan"}
+        cast_store.merge_characters(cast, "jonathan", "jon")
+        self.assertEqual(list(cast["characters"]), ["jon"])
+        kept = cast["characters"]["jon"]
+        self.assertEqual((kept["aliases"], kept["lines"], kept["voice"], kept["age"]),
+                         (["Jon", "Jonathan"], 27, "Axel.wav", "adult"))
+        self.assertEqual((cast["chapters"]["a"]["lines"], cast["chapters"]["b"]["lines"]),
+                         ({"1": "jon", "2": "jon"}, {"1": "jon"}))
+        self.assertEqual((cast["chapters"]["a"]["narrator"], cast["book_tone"]["pov_key"]), ("jon", "jon"))
+        for source, target in (("jon", "jon"), ("gone", "jon")):
+            with self.assertRaises(ValueError):
+                cast_store.merge_characters(cast, source, target)
+
+
 class TestVoiceGenders(unittest.TestCase):
 
     def test_kokoro_gender_comes_from_the_prefix(self):

@@ -137,6 +137,13 @@ PROMPTS = {
                 "never \"I\" or \"Narrator\".\n",
     "narrator_unnamed": "The narrator, who says \"I\" in the narration, is never named: answer \"I\" for their "
                         "lines.\n",
+    "identity": (
+        "Passage from a novel; a name in brackets before a quotation is who speaks it:\n\n{passage}\n\n"
+        "The line \"{line}\" introduces a name, {name}, that the passage has not used before. Is {name} a "
+        "new person, or another name for one of these characters who spoke just before: {candidates}?\n"
+        "Reply with exactly this shape: {{\"same_as\": \"Name\"}} using one of those names, or "
+        "{{\"same_as\": \"new\"}}."
+    ),
     "roster_empty": "(none yet)",
     "moods_shape": ', "moods": {"N": "soft|normal|excited"}',
     "moods_rule": ("- moods is your best guess how each marked line sounds: \"soft\" (whispered or quiet), "
@@ -294,12 +301,21 @@ def _line_id(key) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+_JOINED = re.compile(r"\s+(?:and|&)\s+(?=[A-Z])")
+
+
+def _one_person(name: str) -> str:
+    """The first of two people answered as one speaker ("Jonathon and Jess" -> "Jonathon"): a pair is
+    no character, and its fuller-looking name had become one twin's display name (§30)."""
+    return _JOINED.split(name, maxsplit=1)[0]
+
+
 def _speaker_or_none(value) -> Optional[str]:
     if value is None:
         return None
     if not isinstance(value, str):
         raise AttributionError(f"speaker is not a name: {value!r}")
-    name = display_name(value)
+    name = display_name(_one_person(value))
     return None if name.lower().strip(".!? ") in UNKNOWN_SPEAKER_WORDS else name
 
 
@@ -336,9 +352,10 @@ def parse_reply(reply: str, expected_ids: List[int],
             continue
         if _speaker_or_none(item["name"]) is None:  # "Unknown" listed as a character (seen live) is no one
             continue
-        aliases = [display_name(a) for a in item.get("aliases") or [] if isinstance(a, str) and normalize_name(a)]
+        aliases = [display_name(a) for a in item.get("aliases") or [] if isinstance(a, str) and normalize_name(a)
+                   and not _JOINED.search(a)]
         characters.append({
-            "name": display_name(item["name"]),
+            "name": display_name(_one_person(item["name"])),
             "gender": item.get("gender") if item.get("gender") in GENDERS else "unknown",
             "age": item.get("age") if item.get("age") in AGES else "unknown",
             "aliases": aliases,
@@ -406,7 +423,7 @@ class Roster:
     """Characters met so far, with alias merging. Keys are stable (the normalized first-seen
     name), so saved attributions keep pointing at the right character while its display name
     grows more complete ("Tom" -> "Thomas Baker"); when two entries turn out to be one person,
-    canonical() maps the retired key to the surviving one.
+    merge() folds the retired key into the surviving one.
 
     Merging is deliberately conservative: a bare surname ("Mrs. Marsh" next to "Ada Marsh") is
     never merged by code, since a family shares it, and neither are two people of different genders,
@@ -540,6 +557,22 @@ class Roster:
         if norm not in listed:
             character["aliases"].append(display_name(alias))
 
+    def merge(self, source: str, target: str) -> None:
+        """Fold source into target (one person under two names): its names become target's aliases
+        and every alias of source points at target."""
+        gone = self.characters.pop(source)
+        for table in (self.aliases, self.chapter_aliases):
+            for norm, key in list(table.items()):
+                if key == source:
+                    table[norm] = target
+        for alias in [gone["name"], *gone.get("aliases", [])]:
+            self._alias(target, alias)
+        character = self.characters[target]
+        character["lines"] = character.get("lines", 0) + gone.get("lines", 0)
+        for field in ("gender", "age"):
+            if character.get(field, "unknown") == "unknown":
+                character[field] = gone.get(field, "unknown")
+
     def count_line(self, key: str) -> None:
         self.characters[key]["lines"] = self.characters[key].get("lines", 0) + 1
 
@@ -556,6 +589,86 @@ def _messages(window: Window, roster: Roster) -> List[dict]:
             roster=", ".join(names) if names else PROMPTS["roster_empty"], passage=window.passage,
             ids=", ".join(str(i) for i in window.ids), moods_shape=moods_shape, moods_rule=moods_rule)},
     ]
+
+
+# A speaker naming themselves: "please call me Lena", "my name is Tom".
+_SELF_NAMED = re.compile(r"\b(?:[Cc]all me|[Mm]y name is|[Mm]y name's|[Tt]he name's)\s+"
+                         r"((?:(?:Mrs?|Ms|Miss|Dr)\.?\s+)?[A-Z][\w'’-]+)")
+
+
+INTRODUCTION_CONTEXT = 8  # paragraphs before a self-introduction whose speakers it may be a new name for
+
+
+def _same_as(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]], roster: Roster, line: Segment,
+             name: str, new_key: str, chat: Chat, stats: dict) -> Optional[str]:
+    """Ask the model whether a name introduced at its own first line ("...please call me Lena",
+    given to Lena) is another name for someone who spoke just before; their key, or None."""
+    where = next(i for i, p in enumerate(paragraphs) if any(s.line_id == line.line_id for s in p if s.kind == DIALOGUE))
+    start = max(0, where - INTRODUCTION_CONTEXT)
+    earlier = [s.line_id for p in paragraphs[start:where + 1] for s in p
+               if s.kind == DIALOGUE and s.line_id < line.line_id]
+    gender = roster._gender(new_key)
+    candidates = [k for k in dict.fromkeys(result.get(i) for i in earlier)
+                  if k and k != new_key and k in roster.characters
+                  and ("unknown" in (gender, roster._gender(k)) or gender == roster._gender(k))]
+    if not candidates:
+        return None
+    shown = {i: roster.characters[k]["name"] for i, k in result.items() if k in roster.characters and i < line.line_id}
+    passage = cast_review.render(paragraphs, start, where + 1, [], shown, {})
+    names = [roster.characters[k]["name"] for k in candidates]
+    messages = [{"role": "system", "content": PROMPTS["system"]},
+                {"role": "user", "content": PROMPTS["identity"].format(
+                    passage=passage, line=line.text.strip("“”\" "), name=name, candidates=", ".join(names))}]
+    stats["identity_questions"] = stats.get("identity_questions", 0) + 1
+    try:
+        answer = _extract_json(chat(messages)).get("same_as")
+    except AttributionError:
+        return None
+    if not isinstance(answer, str):
+        return None
+    chosen = roster.resolve(answer)
+    return chosen if chosen in candidates else None
+
+
+def merge_self_introductions(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]], roster: Roster,
+                             stats: dict, log: logging.Logger = logger, label: str = "",
+                             chat: Optional[Chat] = None) -> None:
+    """A line in which its speaker names themselves ("please call me Lena") makes that name theirs:
+    a separate character by that name who first speaks in this chapter is folded into the speaker,
+    and a name not met yet becomes the speaker's alias. When the model already gave the line to the
+    new name itself (seen live: a doctor's lines split between "Dr. Hale" and the first name she
+    asks to be called, in two voices, §30), the model is asked whether that name belongs to someone
+    who spoke just before; "new" (a newcomer introducing themselves) changes nothing. result is
+    updated in place; family words never count."""
+    for line in (s for p in paragraphs for s in p if s.kind == DIALOGUE):
+        speaker = result.get(line.line_id)
+        if not speaker or speaker not in roster.characters:
+            continue
+        for match in _SELF_NAMED.finditer(line.text):
+            name = match.group(1)
+            if family_word(name) or not usable_alias(name) or re.search(
+                    r"(?:n't|\bnot|\bnever)\s*$", line.text[max(0, match.start() - 12):match.start()], re.I):
+                continue  # "Don't call me Tom" names no one
+            other = roster.resolve(name, roster.characters[speaker].get("gender", "unknown"))
+            if other is None:
+                roster._alias(speaker, name)
+                continue
+            if roster.characters[other].get("lines", 0):
+                continue  # someone met in an earlier chapter
+            if other == speaker:
+                first = min(i for i, key in result.items() if key == speaker)
+                if chat is None or first != line.line_id:
+                    continue  # the name was theirs before this line
+                target = _same_as(paragraphs, result, roster, line, name, other, chat, stats)
+                if target is None:
+                    continue
+                other, speaker = speaker, target
+            roster.merge(other, speaker)
+            for line_id, key in result.items():
+                if key == other:
+                    result[line_id] = speaker
+            stats["merged_introductions"] = stats.get("merged_introductions", 0) + 1
+            log.info(f"Cast{label}: line {line.line_id} introduces its speaker as {name}; merged them")
 
 
 def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]], anchors: Dict[int, str],
@@ -683,6 +796,7 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
         if line_id not in result:
             result[line_id] = roster.add(name)
     all_lines = [s for p in paragraphs for s in p if s.kind == DIALOGUE]
+    merge_self_introductions(paragraphs, result, roster, stats, log, label, chat)
     if REVIEW_FLAGGED_LINES:
         review_lines(paragraphs, result, anchors, roster, chat, stats, log, label)
         for line in all_lines:  # a continued line follows its (possibly corrected) first part

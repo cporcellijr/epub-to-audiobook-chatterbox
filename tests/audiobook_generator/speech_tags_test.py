@@ -30,8 +30,12 @@ class TestNamedTags(unittest.TestCase):
         self.assertEqual(tags('Mrs. Marsh said quietly, "Out, both of you."'), {1: "Mrs. Marsh"})
         self.assertEqual(tags('She put the cup down. Then Tom said, "Fine."'), {1: "Tom"})
 
-    def test_family_words_count_as_names(self):
-        self.assertEqual(tags('"Supper," said Mother.'), {1: "Mother"})
+    def test_a_family_word_tags_but_names_no_one(self):
+        # Whose "Dad" depends on who tells it: a story's narrator's father and her husband (their son's
+        # "Daddy") were one "Dad" and the father's lines locked to the husband (WORKLOG §30).
+        self.assertEqual(tags('"Supper," said Mother.'), {})
+        self.assertEqual(tags('"Supper," said Mother. "Come now."'), {})  # and lends nothing
+        self.assertEqual(tags('"Supper," said Aunt Ruth.'), {1: "Aunt Ruth"})  # a name behind the title still counts
 
     def test_a_named_tag_is_lent_to_the_other_untagged_quotation_in_its_paragraph(self):
         text = '"Bring him up to the house," said Mrs. Marsh. "Ada, run ahead and build the fire up."'

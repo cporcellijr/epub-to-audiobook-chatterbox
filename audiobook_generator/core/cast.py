@@ -137,6 +137,37 @@ def mood_counts(cast: dict) -> Dict[str, int]:
     return counts
 
 
+def merge_characters(cast: dict, source: str, target: str) -> None:
+    """One person under two names (the cast editor's Merge): source's lines in every chapter, name,
+    aliases and line count go to target, which keeps its own voice, delivery and profile (taking
+    source's voice only when it has none). Raises ValueError for an unknown key or the same key."""
+    characters = cast.get("characters", {})
+    if source == target or source not in characters or target not in characters:
+        raise ValueError(f"cannot merge {source!r} into {target!r}")
+    gone, keep = characters.pop(source), characters[target]
+    known = {normalize_name(n) for n in [keep.get("name", target), *keep.get("aliases", [])]}
+    for name in [gone.get("name", source), *gone.get("aliases", [])]:
+        if normalize_name(name) and normalize_name(name) not in known:
+            keep.setdefault("aliases", []).append(name)
+            known.add(normalize_name(name))
+    keep["lines"] = keep.get("lines", 0) + gone.get("lines", 0)
+    for field in ("gender", "age"):
+        if keep.get(field, "unknown") == "unknown":
+            keep[field] = gone.get(field, "unknown")
+    if not keep.get("voice") and gone.get("voice"):
+        keep["voice"] = gone["voice"]
+    for chapter in cast.get("chapters", {}).values():
+        lines = chapter.get("lines", {})
+        for line_id, key in lines.items():
+            if key == source:
+                lines[line_id] = target
+        if chapter.get("narrator") == source:
+            chapter["narrator"] = target
+    tone = cast.get("book_tone") or {}
+    if tone.get("pov_key") == source:
+        tone["pov_key"] = target
+
+
 def character_voice(cast: dict, speaker: Optional[str]) -> Optional[str]:
     """The voice chosen for a speaker key, or None (unknown speaker, or no voice picked yet)."""
     if not speaker:
