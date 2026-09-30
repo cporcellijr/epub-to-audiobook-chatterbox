@@ -234,6 +234,44 @@ class TestRoster(unittest.TestCase):
         self.assertEqual(roster.add("Tom"), "thomas baker")
 
 
+class TestConservativeMerging(unittest.TestCase):
+    """A wrong merge gives a whole character the wrong voice (WORKLOG §29)."""
+
+    def test_a_gendered_title_keeps_two_people_with_one_surname_apart(self):
+        for genders in (("male", "female"), ("unknown", "unknown")):
+            with self.subTest(genders=genders):
+                roster = Roster()
+                mr, mrs = roster.add("Mr. Smith", genders[0]), roster.add("Mrs. Smith", genders[1])
+                self.assertEqual((mr, mrs), ("smith", "mrs smith"))
+                self.assertEqual((roster.add("Mrs. Smith"), roster.add("Mr. Smith")), (mrs, mr))
+                self.assertEqual((roster.characters[mr]["gender"], roster.characters[mrs]["gender"]),
+                                 ("male", "female"))
+
+    def test_the_other_order_keys_the_second_with_its_title(self):
+        roster = Roster()
+        self.assertEqual([roster.add(n) for n in ("Mrs. Smith", "Mr. Smith", "Mr. Smith")],
+                         ["smith", "mr smith", "mr smith"])
+
+    def test_a_known_gender_is_checked_on_an_exact_name_too(self):
+        roster = Roster()
+        roster.add("Sam", "male")
+        self.assertNotEqual(roster.add("Sam", "female"), "sam")
+        self.assertEqual(roster.add("Sam", "male"), "sam")
+
+    def test_a_name_one_letter_longer_is_another_name(self):
+        for short, long in (("Ann", "Anna"), ("Paul", "Paula"), ("Carl", "Carla"), ("Dan", "Dana")):
+            roster = Roster()
+            self.assertNotEqual(roster.add(short), roster.add(long), (short, long))
+        for short, long in (("Ben", "Benjamin"), ("Chris", "Christopher"), ("Ann", "Annie"), ("Tom", "Thomas")):
+            roster = Roster()
+            self.assertEqual(roster.add(short), roster.add(long), (short, long))
+
+    def test_a_family_word_alias_still_resolves(self):
+        roster = Roster()
+        key = roster.add("Mrs. Marsh", "female", aliases=["Mother"])
+        self.assertEqual(roster.add("Mother"), key)
+
+
 class TestAttributeChapter(unittest.TestCase):
 
     def setUp(self):

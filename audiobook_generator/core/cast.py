@@ -149,11 +149,37 @@ def character_voice(cast: dict, speaker: Optional[str]) -> Optional[str]:
 
 # ---- names ----
 
+def _name_words(name: str) -> List[str]:
+    return [w.strip("'-") for w in re.sub(r"[^\w\s'-]", " ", (name or "").lower()).split()]
+
+
+def titled_name(name: str) -> str:
+    """normalize_name with its titles kept: "Mrs. Smith" -> "mrs smith". Keys a second person who
+    shares a surname with a character of the other gender (Roster)."""
+    return " ".join(w for w in _name_words(name) if w)
+
+
+_MALE_TITLES = frozenset({"mr", "mister", "sir", "lord", "master", "father", "brother", "uncle"})
+_FEMALE_TITLES = frozenset({"mrs", "ms", "miss", "lady", "madam", "madame", "mother", "sister", "aunt"})
+
+
+def title_gender(name: str) -> str:
+    """"male" or "female" when a name's leading titles say so ("Mr. Smith", "Aunt Ruth", "Mother"),
+    else "unknown"."""
+    for word in _name_words(name):
+        if word in _MALE_TITLES:
+            return "male"
+        if word in _FEMALE_TITLES:
+            return "female"
+        if word not in _TITLES:
+            break
+    return "unknown"
+
+
 def normalize_name(name: str) -> str:
     """Key form of a character name: lower case, titles and punctuation dropped, single spaces.
     "Mr. Baker" -> "baker", "THOMAS  Baker" -> "thomas baker"."""
-    words = re.sub(r"[^\w\s'-]", " ", (name or "").lower()).split()
-    words = [w.strip("'-") for w in words]
+    words = _name_words(name)
     stripped = list(words)
     while stripped and stripped[0] in _TITLES:
         stripped = stripped[1:]

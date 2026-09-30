@@ -1829,3 +1829,43 @@ Tests: 673 pass. They cover each signal, grouping and rendering, the narrator vo
 the three sanitised cases (asked, corrected, counted), an "unknown" review keeping the first answer, an
 unusable review changing nothing, and a consistent chapter asking nothing more. Private evidence is in
 `data/diagnostics/tag_direction_2026-09-30/`.
+
+## 29. The narrator reads what the cast can't place; more careful merging (2026-09-30)
+
+The outside review's third and fourth recommendations.
+
+**Fallback voice.** In cast mode, a line with no speaker, or a character with no voice yet, was read by the
+Dialogue voice setting. The owner's default there was a voice belonging to no character, so the unknown
+lines at 12:52 came out in a third voice between the husband's and the wife's, exactly where attribution
+had failed.
+- The Dialogue voice list now starts with "(the narrator's voice)", and that is the default in cast mode.
+  The provider already read an absent dialogue voice as the narrator's, so the change is in the UI and in
+  what gets queued. In a collection's first-person story that means the teller's voice.
+- Picking a real voice still works. "Narrator + dialogue voice" mode still needs one, or it would be
+  single voice.
+- The cast summary names the fallback: "N with no speaker found (read by the Dialogue voice setting: the
+  narrator's voice unless you pick another)".
+- With §28, unknown lines are rarer to begin with: the first chapter now has none.
+
+**Merging.** Both of the review's reproductions held:
+- "Mr. Smith" and "Mrs. Smith" became one character even with recorded genders of male and female.
+  Keys drop titles, and an exact name match skipped the gender check.
+- "Ann" and "Anna" merged by prefix, as did "Paul" and "Paula" until their genders were known.
+
+Changes:
+- A gendered title counts as gender evidence (`cast.title_gender`): Mr/Sir/Lord/Uncle… male, Mrs/Ms/
+  Miss/Lady/Aunt… female.
+- An exact name match is refused when the genders conflict, recorded or implied by title. The second
+  person then gets a key that keeps the title ("mrs smith"), where later mentions find them.
+- A first name merges with a longer one only when that is at least two letters longer (Ben/Benjamin,
+  Chris/Christopher, Ann/Annie), or through the nickname table (Tom/Thomas).
+
+Checks:
+- **Benchmark:** unchanged at 83.9%; its passages are full of titles (Master, Lady, Constable, Captain,
+  Aunt, Dr., Nurse).
+- **The first real chapter's cast:** the same 5 characters with the same genders and aliases (the wife's
+  short name still merges with her full one), and the same attributions as §28.
+
+679 tests pass. They cover title-kept keys in either order, the gender check on an exact name, one-letter
+names kept apart while real short forms merge, the family-word alias, the narrator fallback in the queue
+and the provider, and the dialogue mode still needing its own voice.

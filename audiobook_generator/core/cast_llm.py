@@ -22,7 +22,7 @@ import time
 from typing import Callable, Collection, Dict, List, NamedTuple, Optional, Tuple
 
 from audiobook_generator.core import cast_review
-from audiobook_generator.core.cast import AGES, GENDERS, display_name, normalize_name
+from audiobook_generator.core.cast import AGES, GENDERS, display_name, normalize_name, title_gender, titled_name
 from audiobook_generator.core.delivery import MOOD_NORMAL, MOODS, segment_moods
 from audiobook_generator.core.dialogue import DIALOGUE, Segment
 from audiobook_generator.core.speech_tags import tagged_speakers
@@ -390,11 +390,13 @@ _NICKNAMES = {
 
 
 def _same_person(word: str, other: str) -> bool:
-    """The same first name in two forms: identical, one the start of the other (Ben / Benjamin),
-    or a listed short form (Tom / Thomas, Bill / Will / William)."""
+    """The same first name in two forms: identical, one the start of the other and at least two
+    letters shorter (Ben / Benjamin, but not Ann / Anna or Paul / Paula, which are other names), or a
+    listed short form (Tom / Thomas, Bill / Will / William)."""
     if word == other:
         return True
-    if (len(word) >= 3 and other.startswith(word)) or (len(other) >= 3 and word.startswith(other)):
+    short, long = sorted((word, other), key=len)
+    if len(short) >= 3 and long.startswith(short) and len(long) - len(short) >= 2:
         return True
     full_a, full_b = _NICKNAMES.get(word, word), _NICKNAMES.get(other, other)
     return full_a == full_b
@@ -407,9 +409,10 @@ class Roster:
     canonical() maps the retired key to the surviving one.
 
     Merging is deliberately conservative: a bare surname ("Mrs. Marsh" next to "Ada Marsh") is
-    never merged by code, since a family shares it, and neither are two people of different known
-    genders; a wrong merge gives a main character the wrong voice, while a split just shows two
-    rows the owner can give the same voice. The prompt asks the model for aliases, which do merge.
+    never merged by code, since a family shares it, and neither are two people of different genders,
+    known or said by a title ("Mr. Smith" and "Mrs. Smith" stay two, the second keyed "mrs smith"); a
+    wrong merge gives a main character the wrong voice, while a split just shows two rows the owner
+    can give the same voice. The prompt asks the model for aliases, which do merge.
 
     A family word ("Mom", "Dad", "Grandpa") names one person only within a chapter: in a collection
     every story has its own mother (seen live: every "Mom" of six stories merged into one), so such
@@ -432,6 +435,12 @@ class Roster:
 
     def names_for_prompt(self) -> List[str]:
         return [c["name"] for _, c in sorted(self.characters.items(), key=lambda kv: -kv[1].get("lines", 0))]
+
+    def _gender(self, key: str) -> str:
+        """A character's recorded gender, else the one its name's title says."""
+        character = self.characters[key]
+        known = character.get("gender", "unknown")
+        return known if known != "unknown" else title_gender(character.get("name", ""))
 
     def _candidates(self, norm: str) -> List[str]:
         """Existing characters this normalized name may refer to (see the class docstring), the
@@ -460,12 +469,18 @@ class Roster:
         norm = normalize_name(name)
         if not norm:
             return None
+        if gender == "unknown":
+            gender = title_gender(name)
+        titled = titled_name(name)
+        if titled != norm and titled in self.aliases:  # "Mrs. Smith" keyed apart from a "Mr. Smith"
+            return self.aliases[titled]
         if norm in self.chapter_aliases:  # this chapter's "Mom" before anyone else's
             return self.chapter_aliases[norm]
         if norm in self.aliases:
-            return self.aliases[norm]
+            key = self.aliases[norm]
+            return key if "unknown" in (gender, self._gender(key)) or gender == self._gender(key) else None
         candidates = [k for k in self._candidates(norm)
-                      if "unknown" in (gender, self.characters[k]["gender"]) or gender == self.characters[k]["gender"]]
+                      if "unknown" in (gender, self._gender(k)) or gender == self._gender(k)]
         if len(candidates) == 1:
             return candidates[0]
         first = norm.split()[0]
@@ -475,8 +490,10 @@ class Roster:
     def add(self, name: str, gender: str = "unknown", age: str = "unknown", aliases: Optional[List[str]] = None) -> str:
         """Register a character (or merge into the one this name refers to); returns its key."""
         key = self.resolve(name, gender)
+        if gender not in GENDERS or gender == "unknown":
+            gender = title_gender(name)
         if key is None:
-            key = normalize_name(name)
+            key = self._new_key(name)
             self.characters[key] = {"name": display_name(name), "aliases": [], "gender": "unknown",
                                     "age": "unknown", "lines": 0}
             self.aliases[key] = key
@@ -494,6 +511,17 @@ class Roster:
         if age in AGES and age != "unknown" and character["age"] == "unknown":
             character["age"] = age
         return key
+
+    def _new_key(self, name: str) -> str:
+        """The normalized name, or when someone else already has it (a "Mr. Smith" before this "Mrs.
+        Smith"), the name with its titles, else a number."""
+        for key in (normalize_name(name), titled_name(name)):
+            if key not in self.characters:
+                return key
+        number = 2
+        while f"{normalize_name(name)} {number}" in self.characters:
+            number += 1
+        return f"{normalize_name(name)} {number}"
 
     def _alias(self, key: str, alias: str) -> None:
         norm = normalize_name(alias)

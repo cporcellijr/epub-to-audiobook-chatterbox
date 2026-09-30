@@ -187,11 +187,15 @@ class TestProviderVoices(unittest.TestCase):
             cast_store.save_cast(path, cast)
             provider = self._provider(voice_mode="cast", dialogue_voice="Dialogue.wav", cast_file=path)
             requests = self._requests(provider, text)
+            # The default in cast mode: no dialogue voice, so the narrator reads what the cast can't place.
+            narrator_reads = self._requests(self._provider(voice_mode="cast", cast_file=path), text)
         self.assertEqual(requests, [
             ("Ada.wav", '"Come in,"'), ("Narrator.wav", "said Ada."),
             ("Dialogue.wav", '"Thanks,"'), ("Narrator.wav", "he said."),  # character without a voice yet
             ("Dialogue.wav", '"Who is there?"'),                          # unknown speaker
         ])
+        self.assertEqual([voice for voice, _ in narrator_reads],
+                         ["Ada.wav", "Narrator.wav", "Narrator.wav", "Narrator.wav", "Narrator.wav"])
 
     def test_adaptive_delivery_uses_each_speakers_setting_when_their_voice_is_shared(self):
         text = ('"Ada says this in a complete sentence that is long enough."' + M +

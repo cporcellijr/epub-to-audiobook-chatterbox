@@ -1885,6 +1885,19 @@ class TestQueueTimeCastChecks(unittest.TestCase):
         with self.assertRaises(gr.Error):
             self._queue([1], dialogue_voice="Gone.wav")
 
+    def test_lines_with_no_speaker_default_to_the_narrators_voice(self):
+        # An unattributed line in a voice that belongs to no one stood out exactly where attribution
+        # failed (WORKLOG §29): the narrator's voice is the default fallback in cast mode.
+        self._cast([1, 2, 3])
+        for choice in (chatterbox_ui.NARRATOR_FALLBACK, None):
+            settings = self._queue([1], dialogue_voice=choice)
+            self.assertIsNone(settings["dialogue_voice"])
+            self.assertIsNone(chatterbox_ui.build_config(**settings).dialogue_voice)
+        self.assertEqual(self._queue([1], dialogue_voice="Tom.wav")["dialogue_voice"], "Tom.wav")  # still a choice
+        self.assertEqual(chatterbox_ui.dialogue_voice_choices([("Tom", "Tom.wav")])[0][1], chatterbox_ui.NARRATOR_FALLBACK)
+        with self.assertRaisesRegex(gr.Error, "Pick a dialogue voice"):  # the dialogue mode needs a voice of its own
+            chatterbox_ui._dialogue_voice_setting(chatterbox_ui.VOICE_MODE_DIALOGUE, chatterbox_ui.NARRATOR_FALLBACK)
+
     def test_no_voices_folder_means_the_voice_check_is_skipped(self):
         self._cast([1, 2, 3], voice="Anything.wav")
         with patch.dict(os.environ, {"TTS_VOICES_DIR": ""}):

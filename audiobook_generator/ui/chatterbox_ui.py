@@ -799,8 +799,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
     if voice_mode not in VOICE_MODES:
         raise gr.Error(f"Unknown voice mode '{voice_mode}'.")
     cast_source = None
-    if voice_mode != VOICE_MODE_SINGLE and not dialogue_voice:
-        raise gr.Error("Pick a dialogue voice (it speaks quoted lines, and any speaker the cast doesn't know).")
+    dialogue_voice = _dialogue_voice_setting(voice_mode, dialogue_voice)
     if voice_mode == VOICE_MODE_CAST:
         cast_source, cast = _finished_cast(cast_key)
         wrong = cast_store.voices_belong_to_engine(cast, engine)
@@ -817,7 +816,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
             raise gr.Error(f"The cast has no analysis for chapter{'s' if len(gaps) > 1 else ''} "
                            f"{', '.join(map(str, gaps))} as the book reads now (a chapter was ticked after the "
                            "analysis, or a text option changed). Press Analyse selected chapters again.")
-    chosen = [voice] + ([dialogue_voice] if voice_mode != VOICE_MODE_SINGLE else [])
+    chosen = [voice] + ([dialogue_voice] if dialogue_voice else [])
     if voice_mode == VOICE_MODE_CAST:
         chosen += [c.get("voice") for c in cast["characters"].values()]
     gone = missing_voices(chosen, engine)
@@ -960,6 +959,25 @@ def cast_coverage_gaps(book: str, cast: dict, selection: List[int], title_mode: 
                              search_and_replace_file)
     analysed = cast.get("chapters", {})
     return [n for n in selection if 0 < n <= len(chapters) and cast_store.text_hash(chapters[n - 1][1]) not in analysed]
+
+
+# The Dialogue voice choice that means "the narrator's voice". In cast mode it reads the lines whose
+# speaker wasn't found (and characters with no voice yet), and it is the default there: a voice that
+# belongs to no one, heard exactly where attribution failed, is the more jarring fallback (WORKLOG §29).
+NARRATOR_FALLBACK = "(narrator)"
+
+
+def dialogue_voice_choices(choices: list) -> list:
+    return [("(the narrator's voice)", NARRATOR_FALLBACK)] + list(choices)
+
+
+def _dialogue_voice_setting(voice_mode: str, dialogue_voice: Optional[str]) -> Optional[str]:
+    """The dialogue voice to queue: None means the narrator's (cast mode only; "narrator + dialogue
+    voice" mode needs a voice of its own, or it is single voice)."""
+    voice = None if dialogue_voice in (None, "", NARRATOR_FALLBACK) else dialogue_voice
+    if voice_mode == VOICE_MODE_DIALOGUE and not voice:
+        raise gr.Error("Pick a dialogue voice: it speaks every quoted line in this mode.")
+    return voice if voice_mode != VOICE_MODE_SINGLE else None
 
 
 def engine_voice_choices(engine: str) -> list:
@@ -1131,7 +1149,8 @@ def _cast_summary(cast: dict, auto_pick: bool = False) -> str:
     known = lines - unknown
     parts = [f"**Cast ready**: {len(cast['characters'])} characters, {known} of {lines} lines attributed"]
     if unknown:
-        parts.append(f"{unknown} unknown (spoken by the dialogue voice)")
+        parts.append(f"{unknown} with no speaker found (read by the Dialogue voice setting: the narrator's "
+                     "voice unless you pick another)")
     moods = cast_store.mood_counts(cast)
     mood_parts = [f"{moods[key]} {label}" for key, label in
                   (("soft", "soft"), ("emphatic", "emphasized"), ("excited", "excited")) if moods.get(key)]
@@ -1396,8 +1415,7 @@ def book_options_for_later(library_book, chapter_table, stats: list, output_dir:
     """With Auto-pick on, the Make tab's book options go with the cast analysis so the book joins
     the queue once its cast is ready (queue_book_after_cast). What can already be checked is
     checked now, while the owner is at the page."""
-    if not dialogue_voice:
-        raise gr.Error("Pick a dialogue voice (it speaks quoted lines, and any speaker the cast doesn't know).")
+    dialogue_voice = _dialogue_voice_setting(VOICE_MODE_CAST, dialogue_voice)
     output_dir = (output_dir or "").strip()
     if not output_dir:
         raise gr.Error("Set an output folder.")
@@ -1768,7 +1786,14 @@ def refresh_voices() -> tuple:
     choices = openai_voice_choices()
     default = default_openai_voice(choices)
     return (gr.update(choices=choices, value=default), gr.update(choices=choices, value=default),
-            gr.update(choices=own_voice_choices()), gr.update(choices=choices, value=default))
+            gr.update(choices=own_voice_choices()), _dialogue_voice_update(choices, default))
+
+
+def _dialogue_voice_update(choices: list, default: Optional[str]) -> dict:
+    """The Dialogue voice dropdown for an engine's voices: the narrator's voice first, and selected
+    when the page starts in cast mode (an LLM is configured)."""
+    return gr.update(choices=dialogue_voice_choices(choices),
+                     value=NARRATOR_FALLBACK if llm_configured() else default)
 
 
 def engine_changed(engine: str) -> tuple:
@@ -1782,7 +1807,7 @@ def engine_changed(engine: str) -> tuple:
         choices = openai_voice_choices()
         default = default_openai_voice(choices)
     is_chatterbox = engine != "kokoro"
-    return (gr.update(choices=choices, value=default), gr.update(choices=choices, value=default),
+    return (gr.update(choices=choices, value=default), _dialogue_voice_update(choices, default),
             gr.update(choices=choices, value=None), gr.update(visible=is_chatterbox), gr.update(visible=is_chatterbox))
 
 
@@ -1958,9 +1983,11 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 voice_mode = gr.Radio(voice_mode_choices(), value=initial_mode, label="Voice mode", scale=2,
                                       info="Single voice reads everything as before. The other modes give quoted "
                                            "lines their own voice; Cast asks the local LLM who speaks each line.")
-                dialogue_voice = gr.Dropdown(choices, value=default_voice, label="Dialogue voice", scale=1,
+                dialogue_voice = gr.Dropdown(dialogue_voice_choices(choices), label="Dialogue voice", scale=1,
+                                             value=NARRATOR_FALLBACK if initial_mode == VOICE_MODE_CAST else default_voice,
                                              allow_custom_value=True, visible=initial_mode != VOICE_MODE_SINGLE,
-                                             info="Quoted lines (in cast mode: lines whose speaker is unknown).")
+                                             info="Quoted lines. In cast mode, only lines whose speaker wasn't "
+                                                  "found: the narrator's voice unless you pick another.")
             with gr.Row(equal_height=True):
                 adaptive_delivery = gr.Checkbox(
                     True, label="Adaptive delivery", visible=True,
