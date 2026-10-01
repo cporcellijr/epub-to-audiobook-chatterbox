@@ -273,6 +273,26 @@ class TestChapterNarrators(unittest.TestCase):
         return {"characters": {k: dict(v) for k, v in _ANTHOLOGY_CHARACTERS.items()},
                 "chapters": {f"h{n}": {"number": n, "lines": {}} for n in numbers}}
 
+    def _disputed_chapter(self):
+        cast = self._cast(1)
+        cast["characters"].update({
+            "polly": {"name": "Polly", "aliases": [], "gender": "female", "age": "adult", "lines": 10},
+            "dermatologist": {"name": "Self-proclaimed dermatologist", "aliases": [], "gender": "female",
+                              "age": "adult", "lines": 0},
+        })
+        chapter = _story(1, _FIRST_PERSON, {})
+        dialogue_ids = [s.line_id for p in chapter.paragraphs for s in p if s.kind == "dialogue"]
+        tagged = first_person_tagged(chapter.paragraphs)
+        chapter.lines.update({line_id: "bettie" for line_id in dialogue_ids})
+        chapter.lines.update({line_id: "dermatologist" for line_id in tagged})
+        cast["characters"]["bettie"]["lines"] = len(dialogue_ids) - len(tagged)
+        cast["characters"]["dermatologist"]["lines"] = len(tagged)
+        cast["chapters"]["h1"]["lines"] = {str(line_id): speaker for line_id, speaker in chapter.lines.items()}
+        return cast, chapter, tagged
+
+    def _book_tone(self, name="Polly"):
+        return {**TestBookTone.TONE, "point_of_view": "first", "pov_key": name.lower(), "pov_character": name}
+
     def test_point_of_view_comes_from_the_narration_not_the_dialogue(self):
         self.assertEqual(chapter_point_of_view(_story(1, _FIRST_PERSON, self.FIRST)), "first")
         self.assertEqual(chapter_point_of_view(_story(1, _THIRD_PERSON, self.THIRD)), "third")
@@ -283,7 +303,8 @@ class TestChapterNarrators(unittest.TestCase):
         cast = self._cast(1)
         chapters = [_story(1, _FIRST_PERSON, self.FIRST)]
         wrong = dict(TestBookTone.TONE, pov_character="Bettie")
-        describe_book(cast, chapters, ScriptedChat(json.dumps(wrong)))
+        describe_book(cast, chapters, ScriptedChat(json.dumps(wrong),
+                                                   json.dumps(dict(TestBookTone.TONE, pov_character="Oliver"))))
         self.assertEqual((cast["book_tone"]["pov_key"], cast["book_tone"]["pov_character"]), ("oliver", "Oliver"))
         self.assertEqual(cast["chapters"]["h1"], {"number": 1, "lines": {}, "point_of_view": "first",
                                                   "narrator": "oliver"})
@@ -309,15 +330,96 @@ class TestChapterNarrators(unittest.TestCase):
         # A chapter with too few "I said" lines of its own follows the nearest one whose teller speaks in it.
         self.assertEqual([found[n]["narrator"] for n in (1, 2, 3)], ["oliver", "bettie", "bettie"])
 
+    def test_narration_confirms_an_anthologys_alternate_narrator(self):
+        chapters = [_story(1, _FIRST_PERSON, self.FIRST),
+                    _story(2, _FIRST_PERSON, {1: "oliver", 2: "bettie", 3: "bettie"})]
+        chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Bettie")))
+        found = chapter_narrators(self._cast(1, 2), chapters, self._book_tone("Oliver"), chat)
+        self.assertEqual([found[n]["narrator"] for n in (1, 2)], ["oliver", "bettie"])
+        self.assertEqual(len(chat.prompts), 1)
+        self.assertIn("(Chapter 2)", chat.prompts[0][1]["content"])
+
+    def test_conflicting_chapter_vote_is_corrected_by_narration_only(self):
+        cast, chapter, tagged = self._disputed_chapter()
+        chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Polly")))
+        found = chapter_narrators(cast, [chapter], self._book_tone(), chat)
+        self.assertGreaterEqual(len(tagged), 2)
+        self.assertEqual(found[1]["narrator"], "polly")
+        prompt = chat.prompts[0][1]["content"]
+        self.assertIn("I walked her home", prompt)
+        self.assertNotIn("You worry too much", prompt)
+
+    def test_an_untagged_chapter_does_not_inherit_an_unconfirmed_later_vote(self):
+        cast = self._cast(1, 2)
+        cast["characters"].update({
+            "polly": {"name": "Polly", "aliases": [], "gender": "female", "age": "adult", "lines": 10},
+            "dermatologist": {"name": "Self-proclaimed dermatologist", "aliases": [], "gender": "female",
+                              "age": "adult", "lines": 6},
+        })
+        untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
+        chapters = [_story(1, untagged, {1: "dermatologist", 2: "dermatologist", 3: "dermatologist"}),
+                    _story(2, _FIRST_PERSON, {1: "bettie", 2: "dermatologist", 3: "dermatologist"})]
+        reply = json.dumps(dict(TestBookTone.TONE, pov_character="Polly"))
+        chat = ScriptedChat(reply, reply)
+
+        found = chapter_narrators(cast, chapters, self._book_tone(), chat)
+
+        self.assertEqual([found[n]["narrator"] for n in (1, 2)], ["polly", "polly"])
+        self.assertEqual(len(chat.prompts), 2)
+        self.assertIn("(Chapter 1)", chat.prompts[0][1]["content"])
+        self.assertIn("(Chapter 2)", chat.prompts[1][1]["content"])
+
+    def test_unconfirmed_conflicting_chapter_vote_falls_back_to_book_narrator(self):
+        replies = (None, ScriptedChat("not json", "still not json"),
+                   ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Bettie"))))
+        for chat in replies:
+            with self.subTest(chat=chat):
+                cast, chapter, _ = self._disputed_chapter()
+                self.assertEqual(chapter_narrators(cast, [chapter], self._book_tone(), chat)[1]["narrator"], "polly")
+
+    def test_applying_narrator_corrects_tagged_lines_and_continuations_once(self):
+        cast = self._cast(1)
+        cast["characters"]["dermatologist"] = {"name": "Self-proclaimed dermatologist", "lines": 0}
+        cast["characters"]["oliver"]["lines"] = 0
+        text = (f'“Stay, I told her,” I said, “and then took the long way home{M}'
+                f'“past the river and back again.”{M}'
+                f'“What about you?” Bettie asked.')
+        chapter = _story(1, text, {})
+        segments = [s for p in chapter.paragraphs for s in p if s.kind == "dialogue"]
+        tagged = set(first_person_tagged(chapter.paragraphs))
+        continuation = next(s.line_id for s in segments if s.continues)
+        self.assertTrue(tagged)
+        self.assertIn(continuation - 1, tagged)
+        chapter.lines.update({s.line_id: "bettie" for s in segments})
+        chapter.lines.update({line_id: "dermatologist" for line_id in tagged | {continuation}})
+        cast["characters"]["dermatologist"]["lines"] = len(tagged) + 1
+        unrelated = next(s.line_id for s in segments if s.line_id not in tagged | {continuation})
+        cast["characters"]["bettie"]["lines"] = len(segments) - len(tagged) - 1
+        cast["chapters"]["h1"]["lines"] = {str(line_id): speaker for line_id, speaker in chapter.lines.items()}
+        found = {1: {"point_of_view": "first", "narrator": "oliver"}}
+
+        apply_chapter_narrators(cast, [chapter], found)
+        expected = tagged | {continuation}
+        self.assertTrue(all(chapter.lines[line_id] == "oliver" for line_id in expected))
+        self.assertTrue(all(cast["chapters"]["h1"]["lines"][str(line_id)] == "oliver" for line_id in expected))
+        self.assertEqual(chapter.lines[unrelated], "bettie")
+        self.assertEqual(cast["chapters"]["h1"]["lines"][str(unrelated)], "bettie")
+        self.assertEqual(cast["characters"]["dermatologist"]["lines"], 0)
+        self.assertEqual(cast["characters"]["oliver"]["lines"], len(expected))
+        counts = {key: value["lines"] for key, value in cast["characters"].items()}
+        apply_chapter_narrators(cast, [chapter], found)
+        self.assertEqual({key: value["lines"] for key, value in cast["characters"].items()}, counts)
+
     def test_an_untagged_story_next_to_a_tagged_one_is_asked_about_not_handed_its_teller(self):
         # Review finding: the next story of a collection has other people, so its neighbour's
         # teller (who doesn't speak in it) is no answer; the LLM is asked about that chapter alone.
         untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
         chapters = [_story(1, _FIRST_PERSON, self.FIRST), _story(2, untagged, {1: "tom", 2: "tom", 3: "tom"})]
         chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Tom")))
-        found = chapter_narrators(self._cast(1, 2), chapters, None, chat)
+        found = chapter_narrators(self._cast(1, 2), chapters, self._book_tone("Oliver"), chat)
         self.assertEqual([found[n]["narrator"] for n in (1, 2)], ["oliver", "tom"])
         self.assertIn("(Chapter 2)", chat.prompts[0][1]["content"])
+        self.assertEqual(len(chat.prompts), 1)
         # A novel's untagged chapter where the "I" speaks follows its neighbour without asking.
         chapters[1] = _story(2, untagged, {1: "bettie", 2: "oliver", 3: "oliver"})
         chat = ScriptedChat()
@@ -356,10 +458,12 @@ class TestChapterNarrators(unittest.TestCase):
         cast = self._cast(1, 2)
         cast["book_tone"] = {"point_of_view": "first", "pov_key": "tom", "pov_character": "Tom"}
         chapters = [_story(1, _THIRD_PERSON * 3, self.THIRD), _story(2, _FIRST_PERSON, self.FIRST)]
-        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, cast["book_tone"]))
+        chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Oliver")))
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, cast["book_tone"], chat))
         self.assertEqual(cast["book_tone"]["point_of_view"], "third")
         self.assertNotIn("pov_key", cast["book_tone"])
         self.assertEqual(cast["chapters"]["h2"]["narrator"], "oliver")  # still read as Oliver's in its chapter
+        self.assertEqual(len(chat.prompts), 1)
 
 
 if __name__ == "__main__":

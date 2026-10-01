@@ -542,13 +542,11 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
                       chat: Optional[Chat] = None, log: logging.Logger = logger) -> Dict[int, dict]:
     """{chapter number: {"point_of_view", "narrator"}} for the chapters whose point of view could be
     told (a chapter too short to tell, with no neighbour to follow, is left out, so the book's own
-    narrator still applies to it). A first-person chapter's narrator is the character its "I said"
-    lines were attributed to (the attribution sees who is talked to, which narration alone doesn't
-    show). A chapter with too few takes a neighbour's narrator in the same run of first-person
-    chapters, the nearest first, but only one who speaks in it: the next story of a collection has
-    other people. Then, in a book with a single first-person run, the book tone's narrator if they
-    speak in it; otherwise the LLM is asked about that chapter alone (skipped without `chat`), and
-    its answer is lent onwards like a vote. Last resort: the single run's book tone narrator."""
+    narrator still applies to it). "I said" lines vote for a chapter's narrator; when that vote differs
+    from a single first-person run's book narrator, narration-only chapter evidence must confirm the
+    alternate or the book narrator wins. A chapter with too few votes takes a neighbour's narrator in
+    the same run, the nearest first, but only one who speaks in it; otherwise the LLM is asked about
+    that chapter alone when available. Last resort: the single run's book narrator."""
     views = [chapter_point_of_view(chapter) for chapter in chapters]
     stories = _stories(chapters, views)
     narrators: Dict[int, dict] = {c.number: {"point_of_view": view, "narrator": None}
@@ -563,6 +561,7 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
         pooled = _voted_narrator(members)
         for i, chapter in enumerate(members):
             found = own[i]
+            tone = None
             if not found:
                 speaking = set(chapter.lines.values())
                 nearest = sorted((abs(j - i), j) for j, key in enumerate(own) if key)
@@ -574,7 +573,16 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
             if not found and chat is not None:
                 tone = _ask_tone(cast.get("characters", {}), [chapter], chat, log, label=f"chapter {chapter.number}")
                 found = tone.get("pov_key") if tone and tone.get("point_of_view") == "first" else None
-                own[i] = found  # lent to the chapters after it, like a vote, so a novel asks once
+            if found and single_run_tone and found != single_run_tone:
+                if tone is None and chat is not None:
+                    tone = _ask_tone(cast.get("characters", {}), [chapter], chat, log,
+                                     label=f"chapter {chapter.number}")
+                verified = tone.get("pov_key") if tone and tone.get("point_of_view") == "first" else None
+                if verified != found:
+                    log.info(f"Cast: chapter {chapter.number} narrator vote {found} not confirmed; "
+                             f"using book narrator {single_run_tone}")
+                    found = single_run_tone
+            own[i] = found  # lend the final narrator to later untagged chapters, like a vote
             narrators[chapter.number] = {"point_of_view": "first", "narrator": found or single_run_tone}
     return narrators
 
@@ -582,13 +590,42 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
 def apply_chapter_narrators(cast: dict, chapters: List[ChapterText], narrators: Dict[int, dict]) -> None:
     """Keep each chapter's point of view and narrator with its attributions (cast["chapters"]), and
     let them settle the book's own: first person when most of the narration is, told by whoever
-    narrates most of it. The book's narrator decides the narrator voice's gender and fit."""
+    narrates most of it. For a known narrator, first-person-tagged dialogue (and its quote continuations)
+    follows them in the saved lines and character counts. The book's narrator decides the narrator
+    voice's gender and fit."""
+    from audiobook_generator.core.speech_tags import first_person_tagged
+
+    entries = {entry.get("number"): entry for entry in cast.get("chapters", {}).values()}
     for entry in cast.get("chapters", {}).values():
         if entry.get("number") in narrators:
             entry.update(narrators[entry["number"]])
         else:  # undecided: no chapter-level narrator, so the book's own applies (cast.chapter_narrator)
             entry.pop("point_of_view", None)
             entry.pop("narrator", None)
+    characters = cast.get("characters", {})
+    for chapter in chapters:
+        narrator = (narrators.get(chapter.number) or {}).get("narrator")
+        if not narrator:
+            continue
+        line_ids = set(first_person_tagged(chapter.paragraphs))
+        for paragraph in chapter.paragraphs:
+            for piece in paragraph:
+                if piece.kind == DIALOGUE and piece.continues and piece.line_id - 1 in line_ids:
+                    line_ids.add(piece.line_id)
+        entry = entries.get(chapter.number)
+        stored_lines = entry.setdefault("lines", {}) if entry is not None else None
+        for line_id in line_ids:
+            previous = chapter.lines.get(line_id)
+            if previous == narrator:
+                continue
+            if previous in characters:
+                character = characters[previous]
+                character["lines"] = max(0, int(character.get("lines", 0)) - 1)
+            chapter.lines[line_id] = narrator
+            if stored_lines is not None:
+                stored_lines[str(line_id)] = narrator
+            if narrator in characters:
+                characters[narrator]["lines"] = int(characters[narrator].get("lines", 0)) + 1
     words = {c.number: _narration_words(c) for c in chapters}
     first = sum(words[n] for n, found in narrators.items() if found["point_of_view"] == "first")
     third = sum(words[n] for n, found in narrators.items() if found["point_of_view"] == "third")
