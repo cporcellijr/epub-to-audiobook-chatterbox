@@ -4,11 +4,13 @@ import unittest
 import zipfile
 from unittest.mock import MagicMock
 
+from ebooklib import epub
+
 from audiobook_generator.book_parsers.epub_book_parser import EpubBookParser
 from audiobook_generator.config.general_config import GeneralConfig
 
 
-def _write_epub(path: str) -> None:
+def _write_epub(path: str, first_body=None, navigation=None) -> None:
     """EPUB whose manifest order differs from its spine, with a nav doc and a non-linear item."""
     chapters = {
         "c1": "Chapter One text.",
@@ -37,14 +39,16 @@ def _write_epub(path: str) -> None:
                    f'{manifest}</manifest><spine>'
                    '<itemref idref="nav"/><itemref idref="c1"/><itemref idref="c2"/><itemref idref="c3"/>'
                    '<itemref idref="notes" linear="no"/></spine></package>')
+        navigation = navigation or ('<nav epub:type="toc"><ol>'
+                                    '<li><a href="c1.xhtml">Table of Contents Entry</a></li></ol></nav>')
         z.writestr("OEBPS/nav.xhtml",
                    '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" '
-                   'xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol>'
-                   '<li><a href="c1.xhtml">Table of Contents Entry</a></li></ol></nav></body></html>')
+                   f'xmlns:epub="http://www.idpf.org/2007/ops"><body>{navigation}</body></html>')
         for key, body in chapters.items():
+            body = first_body if key == "c1" and first_body is not None else f"<p>{body}</p>"
             z.writestr(f"OEBPS/{key}.xhtml",
                        '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head>'
-                       f'<title>{key}</title></head><body><p>{body}</p></body></html>')
+                       f'<title>{key}</title></head><body>{body}</body></html>')
 
 
 def _config(input_file: str) -> GeneralConfig:
@@ -128,6 +132,62 @@ class TestEpubReadingOrder(unittest.TestCase):
     def test_non_linear_items_are_skipped(self):
         texts = " ".join(text for _, text in self.parser.get_chapters(" "))
         self.assertNotIn("Endnote text.", texts)
+
+    def test_contents_fragments_split_one_document_and_keep_whole_headings(self):
+        body = ('<div><h1>1 <span id="one">First</span></h1><p>over<em>whelmed</em>.</p>'
+                '<p id="page2">Still the first chapter.</p>'
+                '<h1>2 <span id="two words">Second</span></h1><p>Second chapter.</p>'
+                '<h1 id="last">Last Section</h1><p>Final words.</p></div>')
+        navigation = ('<nav epub:type="toc"><ol><li><a href="c1.xhtml#one">First</a><ol>'
+                      '<li><a href="./c1.xhtml#two%20words">Second</a></li>'
+                      '<li><a href="c1.xhtml#last">Last Section</a></li></ol></li></ol></nav>'
+                      '<nav epub:type="page-list"><ol><li><a href="c1.xhtml#page2">2</a></li></ol></nav>')
+        _write_epub(self.path, body, navigation)
+        parser = EpubBookParser(_config(self.path))
+        for mode in ("auto", "tag_text", "first_few"):
+            with self.subTest(mode=mode):
+                parser.config.title_mode = mode
+                chapters = parser.get_chapters(" @BRK# ")
+                self.assertEqual(len(chapters), 5)
+                if mode != "first_few":
+                    self.assertEqual([title for title, _ in chapters[:3]], ["1 First", "2 Second", "Last Section"])
+                self.assertEqual([text for _, text in chapters[:3]], [
+                    "1 First @BRK# overwhelmed. @BRK# Still the first chapter.",
+                    "2 Second @BRK# Second chapter.", "Last Section @BRK# Final words."])
+                self.assertEqual([text for _, text in chapters[3:]], ["Chapter Two text.", "Chapter Three text."])
+
+    def test_fragment_boundaries_follow_text_order_and_preserve_a_preamble(self):
+        body = ('<p>Opening words.</p><h1 id="one">First</h1><p>First words.</p>'
+                '<h2><a name="two"/>Second</h2><p>Last words.</p>')
+        navigation = ('<nav epub:type="toc"><ol><li><a href="c1.xhtml#two">Second</a></li>'
+                      '<li><a href="c1.xhtml#one">First</a></li><li><a href="c1.xhtml#one">Duplicate</a></li>'
+                      '<li><a href="c1.xhtml#missing">Broken</a></li>'
+                      '<li><a href="https://example.invalid/c1.xhtml#one">External</a></li></ol></nav>')
+        _write_epub(self.path, body, navigation)
+        chapters = EpubBookParser(_config(self.path)).get_chapters(" ")
+        self.assertEqual([text for _, text in chapters], [
+            "Opening words.", "First First words.", "Second Last words.", "Chapter Two text.", "Chapter Three text."])
+        self.assertEqual([title for title, _ in chapters[1:3]], ["First", "Second"])
+
+    def test_missing_or_single_fragment_keeps_the_document_as_one_chapter(self):
+        body = '<p>Opening words.</p><h1 id="one">First</h1><p>Last words.</p>'
+        navigation = ('<nav epub:type="toc"><ol><li><a href="c1.xhtml#one">First</a></li>'
+                      '<li><a href="c1.xhtml#missing">Broken</a></li></ol></nav>')
+        _write_epub(self.path, body, navigation)
+        chapters = EpubBookParser(_config(self.path)).get_chapters(" ")
+        self.assertEqual(len(chapters), 3)
+        self.assertEqual(chapters[0][1], "Opening words. First Last words.")
+
+    def test_ncx_only_contents_can_start_at_the_file_and_name_unheaded_sections(self):
+        _write_epub(self.path, '<p>First words.</p><a id="two"/><p>Second words.</p>')
+        book = epub.read_epub(self.path)
+        book.items = [item for item in book.items if not isinstance(item, epub.EpubNav)]
+        book.add_item(epub.EpubNcx())
+        book.toc = [epub.Link("c1.xhtml", "First", "one"), epub.Link("c1.xhtml#two", "Second", "two")]
+        epub.write_epub(self.path, book)
+        chapters = EpubBookParser(_config(self.path)).get_chapters(" ")
+        self.assertEqual(chapters[:2], [("First", "First words."), ("Second", "Second words.")])
+        self.assertEqual(len(chapters), 4)
 
 
 if __name__ == "__main__":

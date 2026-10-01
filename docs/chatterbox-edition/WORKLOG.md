@@ -1977,3 +1977,40 @@ and no saved cast or audio was regenerated. Introduction matching is intentional
 mixed quoted speech and introductions outside the recognized direct sentence forms stay unmerged.
 The remaining attribution and re-analysis limitations in §30 still apply; these tests do not establish
 a new live-book accuracy score.
+
+## 32. Multiple EPUB chapters inside one text file (2026-09-30)
+
+The owner reported that *Apex Prey: Polly* came through as one chapter. The library copy is named
+`Lesley A. Camphouse/Apex Prey/01. Apex Prey (2025).epub`. Its main `c2T.xhtml` contains seven numbered
+chapters plus "Self-Preservation", with all eight boundaries present in both the EPUB contents and
+the headings. The parser previously returned one chapter per spine document, so chapter selection
+picked one approximately 95,000-character story row titled "1 My Birth".
+
+**Fix:** `EpubBookParser._chapter_sections` groups the contents links by document and splits documents
+with at least two distinct resolved targets. It uses EbookLib's contents tree, which already excludes
+page-list and landmark links and supports EPUB3 navigation and NCX-only navigation. Targets inside a
+heading move to the start of that heading, preserving its number and title. Duplicate and missing
+targets are ignored; sections follow document order even when contents links are out of order. A
+preamble is retained, and documents without multiple usable targets retain the previous behavior.
+All sections use the existing paragraph marking, text cleanup and title modes. No heading guesses,
+new dependency or model request was added.
+
+**Verification:**
+- New synthetic regressions failed before the fix. They cover three sections inside one file, nested
+  contents, anchors inside headings, encoded fragments, page-list exclusion, inline words, all three
+  title modes, duplicate/broken/external links, preamble retention, legacy named anchors, and NCX-only
+  contents with file-start links and unheaded sections.
+- **Polly:** 7 parser rows became 14 (front matter included); automatic selection now picks all
+  **8 story sections** with their proper headings. Comparing the combined text before and after,
+  ignoring whitespace and paragraph markers, confirms no content was lost or duplicated.
+- **Apex Prey 2:** all 18 parser rows and texts are unchanged; 10 story chapters selected.
+- **The Reaping:** all 17 parser rows and texts are unchanged; 9 story chapters selected.
+- **Robinson Crusoe:** its three contents-linked front-matter sections now separate, so 23 parser rows
+  become 25. Its 20 story chapters remain 20. The integration expectation documents that change.
+- **33 parser tests and all 702 application tests pass.** The full suite ran in the existing image
+  against read-only working source, with temporary logs and networking disabled. `git diff --check`
+  passes.
+
+The earlier five cast fixes (§31) and this parser fix are committed separately. No services were
+rebuilt or restarted, and existing saved casts, ebooks and audio were not rewritten. Books without
+usable contents boundaries still use their original document boundaries.

@@ -1,9 +1,11 @@
 import logging
+import posixpath
 import re
 from typing import List, Optional, Tuple
+from urllib.parse import unquote, urlsplit
 
 import ebooklib
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, CData, NavigableString
 from ebooklib import epub
 
 from audiobook_generator.book_parsers.base_book_parser import BaseBookParser
@@ -142,14 +144,56 @@ class EpubBookParser(BaseBookParser):
         for line_break in soup.find_all("br"):
             line_break.replace_with("\n")
 
+    def _chapter_sections(self):
+        """Text and heading per contents-linked section, or per spine document as before."""
+        def links(entries):
+            for entry in entries:
+                if isinstance(entry, (tuple, list)):
+                    yield from links(entry)
+                elif getattr(entry, "href", None):
+                    yield entry
+
+        by_file = {}
+        for link in links(self.book.toc):
+            href = urlsplit(link.href)
+            if not href.scheme and not href.netloc:
+                by_file.setdefault(posixpath.normpath(unquote(href.path)), []).append((unquote(href.fragment), link.title))
+        headings = ("h1", "h2", "h3", "h4", "h5", "h6")
+        for item in self._reading_order_documents():
+            soup = BeautifulSoup(item.get_content(), "lxml-xml")
+            boundaries = {}
+            for fragment, title in by_file.get(posixpath.normpath(unquote(item.get_name())), []):
+                target = (soup.find(id=fragment) or soup.find(attrs={"name": fragment})) if fragment else soup.body
+                if target is None:
+                    continue
+                heading = target if target.name in headings else target.find_parent(headings)
+                boundary = heading if heading is not None else target
+                boundaries.setdefault(id(boundary), heading.get_text() if heading is not None else title)
+            self._mark_paragraphs(soup)
+            tag_title = next((soup.find(level).text for level in ("title", "h1", "h2", "h3")
+                              if soup.find(level) is not None), "")
+            if len(boundaries) < 2:
+                sections = [(soup.get_text(strip=False), tag_title)]
+            else:
+                sections, strings, title = [], [], tag_title
+                for node in soup.descendants:
+                    if id(node) in boundaries:
+                        raw = "".join(strings)
+                        if raw.strip():
+                            sections.append((raw, title))
+                        strings, title = [], boundaries[id(node)]
+                    elif type(node) in (NavigableString, CData):  # same string types as get_text; no comments
+                        strings.append(str(node))
+                raw = "".join(strings)
+                if raw.strip():
+                    sections.append((raw, title))
+            soup.decompose()
+            yield from sections
+
     def get_chapters(self, break_string) -> List[Tuple[str, str]]:
         chapters = []
         search_and_replaces = self.get_search_and_replaces()
-        for item in self._reading_order_documents():
-            content = item.get_content()
-            soup = BeautifulSoup(content, "lxml-xml")
-            self._mark_paragraphs(soup)
-            raw = soup.get_text(strip=False)
+        for raw, tag_title in self._chapter_sections():
             logger.debug("Raw text: <%s>", raw)
 
             # Replace excessive whitespaces and newline characters based on the mode
@@ -187,21 +231,11 @@ class EpubBookParser(BaseBookParser):
 
             # Get proper chapter title
             if self.config.title_mode == "auto":
-                title = ""
-                title_levels = ['title', 'h1', 'h2', 'h3']
-                for level in title_levels:
-                    if soup.find(level):
-                        title = soup.find(level).text
-                        break
+                title = tag_title
                 if title.strip() == "" or re.match(r'^\d{1,3}$', title.strip()) is not None:
                     title = cleaned_text.replace(break_string, " ")[:60]
             elif self.config.title_mode == "tag_text":
-                title = ""
-                title_levels = ['title', 'h1', 'h2', 'h3']
-                for level in title_levels:
-                    if soup.find(level):
-                        title = soup.find(level).text
-                        break
+                title = tag_title
                 if title.strip() == "":
                     title = "<blank>"
             elif self.config.title_mode == "first_few":
@@ -213,7 +247,6 @@ class EpubBookParser(BaseBookParser):
             logger.debug("Display title: <%s>", title)
 
             chapters.append((title, cleaned_text))
-            soup.decompose()
         return chapters
 
     def get_search_and_replaces(self) -> List[dict]:

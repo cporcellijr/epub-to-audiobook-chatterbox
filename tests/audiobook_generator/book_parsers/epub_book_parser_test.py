@@ -24,9 +24,11 @@ class TestGetBookParser(unittest.TestCase):
         self.assertEqual(parser.get_book_author(), "Daniel Defoe")
         self.assertEqual(parser.get_book_title(), "The Life and Adventures of Robinson Crusoe")
         self.assertEqual(parser._sanitize_title(parser.get_book_title(), " @BRK#"), "The_Life_and_Adventures_of_Robinson_Crusoe")
-        # 23 spine documents; the manifest also lists the EPUB3 nav (toc.xhtml), which is a
-        # table of contents, not narration, and must not be read as a chapter.
-        self.assertEqual(len(parser.get_chapters("   ")), 23)
+        # 23 spine documents; three contents-linked front-matter sections share one of them.
+        # The separate EPUB3 nav (toc.xhtml) is still excluded from narration.
+        chapters = parser.get_chapters("   ")
+        self.assertEqual(len(chapters), 25)
+        self.assertEqual(sum(title.startswith("CHAPTER ") for title, _ in chapters), 20)
         self.assertNotIn("toc.xhtml", [item.get_name() for item in parser._reading_order_documents()])
         self.assertEqual(parser._reading_order_documents()[0].get_name(), "wrap0000.xhtml")
 
