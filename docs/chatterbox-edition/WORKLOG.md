@@ -2585,3 +2585,73 @@ against the book text. Return ranked, evidenced findings and a minimal phased im
 plan, including which existing changes to retain, revise or revert. Do not edit code, deploy,
 change casts or queues, regenerate audio, or launch more model experiments during that audit.
 The owner will provide the fixes to implement afterward. Algorithm work remains stopped.
+
+## 42. Astra audit implemented: identity fixes and an offline Apex Prey 3 replay (2026-10-01)
+
+The Astra audit (§41.5) returned seven ranked findings and a phased plan. The owner authorized the
+plan. Codex implemented the first two phases and part of the rest, then ran out of budget; Claude
+reviewed that work, had cheaper-model agents finish it, and checked each result.
+
+### 42.1 Commits
+
+| Commit | Phase | Change |
+|---|---|---|
+| `621a9b3` | 0 | Offline scorer against a source-linked 269-line Apex Prey 3 reference (kept outside the repository, see below) (`cast_audit_eval.py`) reporting wrong speakers, splits, false merges, unresolved lines and voice routes separately. |
+| `b049841` | 1 | "I", "narrator" and "the narrator" mean one person per chapter (an anthology's next "I" is someone else); the resolved narrator reaches attribution and review. |
+| `42feb41` | 2-4 | Descriptions are chapter-local identities; declared description aliases bind; answers to "what's your name?" and short "I'm X" introduce the speaker; review answers that the line's own tag contradicts are rejected. |
+| `d8e410b` | 1, 4-6 | One unnamed narrator per first-person run; final reconciliation before profiles (pronoun-contradicted lines go to no speaker and are listed); advisory issues; profiles rebuilt after identity changes; voice picks carry by real names only; embedded documents and backmatter excluded from narrator evidence. |
+| `5c7a44c` | tooling | Private production-path runner with exact request logging; dry voice-routing regression test. |
+
+### 42.2 What the review changed in Codex's unfinished work, and why
+
+- **Name matching had been switched off entirely** ("Tom" and "Thomas Baker" became two people, 7
+  tests failing). The audit called it a latent risk, not a defect; it was restored and only kept
+  away from descriptions.
+- **A never-named narrator got a new identity in every chapter**: in a first-person book whose "I"
+  is never named, that meant a voice change per chapter (the Apex Prey 2 bug class). One unnamed
+  narrator now serves a whole first-person run and becomes the book's POV character.
+- **Codex's readiness gate blocked automatic voices and queueing on any unknown line or unclosed
+  "I open the letter".** Nearly every book has unknown lines, and nothing in the UI could clear an
+  issue, so cast mode would have stopped being automatic. Replaced by repair-and-report: a
+  contradicted line is not accepted (it is read in the dialogue voice) and is listed in the summary.
+- **Unclosed document frames** excluded the rest of the chapter from narrator evidence; now only a
+  frame opened and closed within 8 paragraphs is excluded.
+- **Direction of self-introductions**: the replay below showed the narrator's own "Call me ..." line
+  (tagged "I say") folding the named narrator into the anonymous "The Narrator". A description or
+  unnamed "I" who gives a name now becomes that named person.
+
+### 42.3 Offline replay on Apex Prey 3
+
+No model was called. `data/diagnostics/apex3_2026-10-01/replay/replay_apex3.py` runs the current
+production `analyse_book` on the real EPUB and answers every attribution and review request with the
+answer qwen2.5:14b gave for the same lines in the failed rerun (§41.3). Run against the rerun's own
+code (`32631d1`), it reproduced that rerun exactly: same chapter hashes, same 26 requests, same
+scorer output. So the comparison holds the model's answers fixed and isolates the code.
+
+| Scorer result (reference of §41.1, corrected) | Rerun code | Current code |
+|---|---|---|
+| Lines whose speaker label differs | 29 | 6 |
+| Narrator identities | Polly + "unnamed female" | Polly only, all 9 chapters |
+| Gemma | 2 characters (Gianna / Lucy) | 1 |
+| Hospital patient vs Jimmy's companion | one character | two |
+| Alan's "he cries out" line | female speaker | no speaker, listed as an issue |
+
+The 6 remaining: the opening Jimmy lines given to Jose and the needle-phobic girl's two lines given
+to Polly are model errors no code change here touches; the hospital patient's line is the right
+person under another description; Jimmy's companion joins Gus only if the model answers the new
+identity question ("same as one of the guys?"), which the replay can only answer "new". Pair counts
+(splits 1977 → 18, false merges 297 → 310) move with those same lines.
+
+### 42.4 Tests and what is not verified
+
+- 915 app tests pass in the container (full discovery, including the UI modules).
+- Not verified: a fresh real-model analysis with the new prompts and the identity question; the
+  replay cannot show what the model now answers when the narrator is named in the prompt. The
+  release gate from the audit still applies: a private Apex Prey 3 rerun via `evaluate_cast.py`,
+  inspected line by line, before any larger book.
+- The reference contains the book's text, so it is not in the repository: Codex's original
+  commit (which added it under `tests/fixtures`) was rewritten before any push. The reference is at
+  `data/diagnostics/apex3_2026-10-01/expected_speakers_source_linked.json`; `cast_audit_eval.py`
+  reads it from there by default (or `--reference` / `CAST_AUDIT_REFERENCE`), and its unit tests
+  use an invented reference. The pre-rewrite history is kept on the local branch
+  `backup/before-fixture-move`, which must never be pushed.
