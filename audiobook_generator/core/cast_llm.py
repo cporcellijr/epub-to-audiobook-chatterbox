@@ -85,6 +85,14 @@ def usable_alias(alias: str) -> bool:
     words = normalize_name(alias).split()
     return bool(words) and words[0] not in _POSSESSIVES and not all(w in _NOT_ALIASES for w in words)
 
+
+def _relationship_owner(name: str) -> Optional[str]:
+    """The person before a possessive relationship label, e.g. "Jimmy" in "Jimmy's companion"."""
+    for marker in ("'s ", "’s "):
+        if marker in name:
+            return name.split(marker, 1)[0]
+    return None
+
 PROMPTS = {
     "system": (
         "You identify who speaks each line of dialogue in a passage from a novel. "
@@ -442,8 +450,9 @@ class Roster:
         for key, character in (characters or {}).items():
             self.characters[key] = dict(character)
             self.aliases[key] = key
+            owner = _relationship_owner(character["name"])
             for alias in character.get("aliases", []):
-                if not family_word(alias):
+                if not family_word(alias) and normalize_name(alias) != normalize_name(owner or ""):
                     self.aliases[normalize_name(alias)] = key
 
     def new_chapter(self) -> None:
@@ -466,6 +475,9 @@ class Roster:
         found = []
         for key, character in self.characters.items():
             key_words = normalize_name(character["name"]).split() or key.split()
+            owner = _relationship_owner(character["name"])
+            if owner and _same_person(words[0], normalize_name(owner).split()[0]):
+                continue  # "Jimmy's companion" is not the first-name character Jimmy
             if len(words) == 1:
                 # "Tom" / "Thomas Baker" (first name), never "Baker" / "Thomas Baker" (surname)
                 if _same_person(words[0], key_words[0]) and (len(key_words) == 1 or words[0] != key_words[-1]):
@@ -499,8 +511,9 @@ class Roster:
             key = self.aliases[norm]
             if "unknown" in (gender, self._gender(key)) or gender == self._gender(key):
                 return key
-        candidates = [k for k in self._candidates(norm)
-                      if "unknown" in (gender, self._gender(k)) or gender == self._gender(k)]
+        candidates = [] if _relationship_owner(name) else [
+            k for k in self._candidates(norm)
+            if "unknown" in (gender, self._gender(k)) or gender == self._gender(k)]
         if len(candidates) == 1:
             return candidates[0]
         first = norm.split()[0]
@@ -547,6 +560,9 @@ class Roster:
         norm = normalize_name(alias)
         if not norm or self.aliases.get(norm) not in (None, key):
             return  # an alias already owned by another character stays theirs
+        owner = _relationship_owner(self.characters[key]["name"])
+        if owner and norm == normalize_name(owner):
+            return  # a relationship label's owner is a different character
         own_name = norm == normalize_name(self.characters[key]["name"])
         if not usable_alias(alias) and not own_name:
             return  # "he", "honey", "his mom": not a name

@@ -203,6 +203,31 @@ class TestRoster(unittest.TestCase):
         self.assertEqual(roster.add("Mother"), key)
         self.assertEqual(roster.add("Mrs Hale"), key)
 
+    def test_possessive_relationship_name_stays_distinct_from_its_owner(self):
+        for label in ("Jimmy's companion", "Jimmy’s companion"):
+            for companion_first in (True, False):
+                with self.subTest(label=label, companion_first=companion_first):
+                    roster = Roster()
+                    if companion_first:
+                        companion = roster.add(label, "male", aliases=["Jimmy"])
+                        jimmy = roster.add("Jimmy", "male")
+                    else:
+                        jimmy = roster.add("Jimmy", "male")
+                        companion = roster.add(label, "male", aliases=["Jimmy"])
+                    self.assertNotEqual(companion, jimmy)
+                    self.assertEqual(roster.add("Jimmy"), jimmy)
+                    self.assertEqual(roster.add(label), companion)
+
+            companion_key = cast_llm_module.normalize_name(label)
+            restored = Roster({companion_key: {
+                "name": label, "aliases": ["Jimmy"], "gender": "male", "lines": 1
+            }})
+            companion = restored.add(label, "male")
+            jimmy = restored.add("Jimmy", "male")
+            self.assertEqual(companion, companion_key)
+            self.assertNotEqual(jimmy, companion)
+            self.assertEqual(restored.aliases["jimmy"], jimmy)
+
     def test_words_anyone_may_be_called_are_never_aliases(self):
         # Seen live: Chris collected "he", "honey" and "child"; Nina "his mom".
         roster = Roster()
