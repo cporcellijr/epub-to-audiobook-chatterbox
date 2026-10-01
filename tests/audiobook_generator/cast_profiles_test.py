@@ -1,10 +1,11 @@
 """Character profiles: which passages a character's profile is written from, strict reply parsing,
 and the pass over a cast with a scripted stand-in for the chat endpoint."""
 import json
+import logging
 import unittest
 
 from audiobook_generator.core.cast_profiles import (
-    ChapterText, Passage, ProfileError, _spread, apply_chapter_narrators, chapter_narrators, chapter_point_of_view,
+    ChapterText, Passage, ProfileError, _ask_tone, _spread, apply_chapter_narrators, chapter_narrators, chapter_point_of_view,
     character_passages, describe_book, drop_unsupported_accents, first_lines, name_forms, narration_passages,
     parse_profile, parse_tone, profile_cast, profile_candidates, render_excerpts, select_passages,
 )
@@ -432,9 +433,34 @@ class TestChapterNarrators(unittest.TestCase):
         for n in (1, 2):
             cast["chapters"][f"h{n}"] = {"number": n, "lines": {}}
         apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
-        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3)], ["bettie", "oliver", "narrator"])
+        # The named narrators stay apart; the unnamed "I" beside them is the nearest one's story.
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3)], ["bettie", "oliver", "oliver"])
         self.assertIn("bettie", cast["characters"])
         self.assertIn("oliver", cast["characters"])
+        self.assertNotIn("narrator", cast["characters"])
+
+    def test_a_run_named_once_keeps_that_narrator_where_later_chapters_only_say_i(self):
+        # Seen live: chapters 1-2 named the narrator, the model left 3-9 as "I", the book tone (offered
+        # the placeholder) picked "The Narrator", and the book's narrator split in two at chapter 3.
+        cast = self._anonymous_cast(["narrator", "narrator 2"], (2, 3))
+        cast["chapters"]["h1"] = {"number": 1, "lines": {"1": "bettie", "2": "oliver", "3": "oliver"}}
+        chapters = [_story(1, _FIRST_PERSON, {1: "bettie", 2: "oliver", 3: "oliver"}),
+                    self._anonymous_story(2, "narrator"), self._anonymous_story(3, "narrator 2")]
+        found = chapter_narrators(cast, chapters, None)
+        apply_chapter_narrators(cast, chapters, found)
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3)], ["oliver"] * 3)
+        self.assertEqual([dict(c.lines) for c in chapters], [{1: "bettie", 2: "oliver", 3: "oliver"}] * 3)
+        self.assertNotIn("narrator", cast["characters"])
+        self.assertNotIn("narrator 2", cast["characters"])
+        self.assertEqual(cast["book_tone"]["pov_key"], "oliver")
+
+    def test_the_book_tone_is_never_offered_or_given_the_unnamed_placeholder(self):
+        characters = dict(_ANTHOLOGY_CHARACTERS, narrator={"name": "The Narrator", "aliases": [], "gender": "female",
+                                                           "age": "adult", "lines": 50})
+        chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="The Narrator")))
+        tone = _ask_tone(characters, [_story(1, _FIRST_PERSON, {})], chat, logging.getLogger("test"))
+        self.assertNotIn("The Narrator", chat.prompts[0][1]["content"])
+        self.assertIsNone(tone["pov_key"])
 
     def test_conflicting_chapter_vote_is_corrected_by_narration_only(self):
         cast, chapter, tagged = self._disputed_chapter()

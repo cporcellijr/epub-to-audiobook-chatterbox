@@ -495,8 +495,11 @@ def _ask_tone(characters: Dict[str, dict], chapters: List[ChapterText], chat: Ch
     passages = select_passages(narration_passages(chapters), TONE_MAX_CHARS, TONE_LEAD_PASSAGES)
     if not passages:
         return None
-    listed = [f"{characters[k].get('name', k)} ({characters[k].get('gender', 'unknown')})"
-              for k in profile_candidates(characters, min_lines=1, limit=OTHERS_IN_PROMPT)]
+    # The roster's unnamed "The Narrator" placeholder is no answer to "who says I" (seen live: offered
+    # it, the model picked it over the named narrator, splitting the book's narrator in two).
+    named = {k: c for k, c in characters.items() if c.get("name") != ANONYMOUS_NARRATOR}
+    listed = [f"{named[k].get('name', k)} ({named[k].get('gender', 'unknown')})"
+              for k in profile_candidates(named, min_lines=1, limit=OTHERS_IN_PROMPT)]
     messages = [{"role": "system", "content": TONE_PROMPTS["system"]},
                 {"role": "user", "content": TONE_PROMPTS["book"].format(
                     characters=", ".join(listed) or PROMPTS["others_none"],
@@ -515,7 +518,7 @@ def _ask_tone(characters: Dict[str, dict], chapters: List[ChapterText], chat: Ch
         return None
     if tone["pov_character"]:
         from audiobook_generator.core.cast_llm import Roster
-        tone["pov_key"] = Roster(characters).resolve(tone["pov_character"])
+        tone["pov_key"] = Roster(named).resolve(tone["pov_character"])
     return tone
 
 
@@ -639,14 +642,18 @@ def _drop_unused(cast: dict, keys, entries: dict) -> None:
             characters.pop(key, None)
 
 
+ANONYMOUS_NARRATOR = "The Narrator"  # cast_llm.Roster's name for a chapter's never-named "I"
+
+
 def _share_anonymous_narrator(cast: dict, chapters: List[ChapterText], narrators: Dict[int, dict],
                               entries: dict) -> set:
-    """One first-person story has one "I": the chapters of a run whose narrator the model never named
-    (an anonymous "The Narrator" the roster made per chapter) all take the run's first such key, so
-    the story keeps one voice. Returns the keys whose lines changed."""
+    """One first-person story has one "I": a chapter whose narrator the model never named (an anonymous
+    "The Narrator" the roster made per chapter) takes the nearest named narrator of its run, or, in a
+    run that names no narrator, the run's first such key, so the story keeps one voice. Returns the
+    keys whose lines changed."""
     characters = cast.get("characters", {})
     anonymous = {e["narrator_reference"] for e in entries.values() if e.get("narrator_reference")}
-    anonymous |= {k for k, c in characters.items() if c.get("name") == "The Narrator" and not c.get("voice_picked")}
+    anonymous |= {k for k, c in characters.items() if c.get("name") == ANONYMOUS_NARRATOR and not c.get("voice_picked")}
     runs = _stories(chapters, [(narrators.get(c.number) or {}).get("point_of_view") for c in chapters])
     changed, folded = set(), set()
     for run in runs:
@@ -658,11 +665,17 @@ def _share_anonymous_narrator(cast: dict, chapters: List[ChapterText], narrators
                 final[chapter.number] = key
         if not final:
             continue
-        shared = next(final[c.number] for c, _ in members if c.number in final)
-        for chapter, entry in members:
+        # A run that names its narrator anywhere is that narrator's story: an unnamed "I" chapter
+        # takes the nearest named one (seen live: two chapters named Polly, seven only "I", and the
+        # book's narrator split in two). Only a run that never names its "I" keeps an unnamed one.
+        named = [(n, (narrators.get(c.number) or {}).get("narrator")) for n, (c, _) in enumerate(members)
+                 if c.number not in final and (narrators.get(c.number) or {}).get("narrator") in characters]
+        unnamed = next(final[c.number] for c, _ in members if c.number in final)
+        for n, (chapter, entry) in enumerate(members):
             old = final.get(chapter.number)
             if old is None:
                 continue
+            shared = min(named, key=lambda item: (abs(item[0] - n), item[0] > n))[1] if named else unnamed
             if old != shared:
                 for line_id, speaker in chapter.lines.items():
                     if speaker == old:
@@ -672,7 +685,8 @@ def _share_anonymous_narrator(cast: dict, chapters: List[ChapterText], narrators
                         entry["lines"][line_id] = shared
                 folded.add(old)
                 changed.add(shared)
-            entry["narrator"] = entry["narrator_reference"] = shared
+            entry["narrator"] = shared
+            entry["narrator_reference"] = shared if shared in anonymous else old
             narrators.setdefault(chapter.number, {"point_of_view": "first"})["narrator"] = shared
     _drop_unused(cast, folded, entries)
     return changed

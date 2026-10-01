@@ -104,6 +104,7 @@ class TestTenses(unittest.TestCase):
                      f'"First," I say.{M}"Second."'):
             self.assertEqual(first_person_tagged(chapter_segments(text)), [1])
         self.assertEqual(tags('"Last part," Alan finishes.'), {1: "Alan"})
+        self.assertEqual(tags('"No, nope, not you," Rob sputters.'), {1: "Rob"})
 
     def test_first_person_speech_tag_can_follow_in_the_next_paragraph(self):
         text = f'"Last sentence."{M}I say the last sentence with a snarl, then jab the needle in.'

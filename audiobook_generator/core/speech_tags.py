@@ -46,7 +46,7 @@ SPEECH_VERBS = (
     "whimpers", "sobbed", "sobs", "wailed", "wails", "snarled", "snarls", "sniffed", "sniffs",
     "purred", "purrs", "giggled", "giggles", "chuckled", "chuckles", "squealed", "squeals",
     "shrieked", "shrieks", "barked", "barks", "mocked", "mocks", "teased", "teases", "grumbled",
-    "grumbles", "whined", "whines", "stuttered", "stutters", "blurted", "blurts", "bellowed",
+    "grumbles", "whined", "whines", "stuttered", "stutters", "sputtered", "sputters", "blurted", "blurts", "bellowed",
     "bellows", "roared", "roars", "seethed", "seethes",
 )
 # Titles that must be followed by a name, and family words that are names on their own.
