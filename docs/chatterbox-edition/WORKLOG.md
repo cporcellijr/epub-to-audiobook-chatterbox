@@ -2767,3 +2767,56 @@ Apex Prey 3's remaining 7 errors stay the held-out check.
 
 - Tests: 926 app tests pass in the container (1 skipped: private reference check).
 - Not deployed yet.
+
+## 44. Library scan and a story collection: one narrator per story (2026-10-01)
+
+### 44.1 Library scan
+
+`data/diagnostics/library_scan_2026-10-01/scan.py` parses all 1,518 library EPUBs as the analysis does
+(read-only; 4 could not be parsed) and records dialogue lines, tagged share, first-person tags and
+recurring speakers per book and chapter (`scan.jsonl`). It ranked candidate test books by difficulty:
+big third-person casts with few tags (The Stand, Imajica), first-person books with big casts (Pierce
+Brown), and collections or multi-POV books (You Like It Darker, Hyperion). The owner chose *You Like
+It Darker* to test different first-person narrators side by side.
+
+### 44.2 Test set and reference
+
+Chapters 12 ("Red Screen", third person), 15-16 ("Rattlesnakes", first person, Vic Trenton) and 17
+("The Dreamers", first person, William Davis): 923 lines. Two independent Sonnet labelers agreed on
+919; three differences were spelling only, and Claude left ch17 line 172 out as ambiguous. Excluded
+from scoring: 12 quoted titles and terms that are not speech. 910 lines scored, each chapter's
+narrator recorded. Scored with `score.py` there, which maps the model's other names for the same
+people ("Allie Bell" for Alita Bell, "Officer Zane" for Preston Zane) so only real errors count.
+
+### 44.3 What failed and the fix (`21c85fc`)
+
+The deployed code made Allie Bell, a woman in the story, narrator of chapter 15 (the book-tone guess,
+used because the model had left that chapter's "I" unnamed), and gave chapter 17 the previous story's
+narrator Vic: the model had answered "Vic Trenton" for The Dreamers' "I said" lines.
+
+- **Tried and reverted:** asking the model about each unnamed-"I" chapter with only that chapter's
+  people listed. On Apex Prey 3 it named whoever it was offered (Gemma, Alan) as narrator and the same
+  answer "confirmed" itself: Polly's narration would have changed voice twice. Asking again is the
+  fragile step.
+- **Kept:** a deterministic "same story" test -- a chapter belongs to a narrator's story when,
+  besides the narrator, it shares someone with that narrator's chapters (speakers or names in the
+  text). An unnamed-"I" chapter takes the nearest named narrator that passes it. A chapter "narrated"
+  by someone with at least 3 other named people, none shared, and the narrator's name nowhere in it
+  gets its own unnamed narrator. Apex Prey 3's chapters all share people (Jimmy, Jose, Stuart,
+  Alan), so its narrator stays one.
+
+### 44.4 Results (live, qwen2.5:14b)
+
+| Run | Ch 15 | Ch 16 | Ch 17 | Wrong of 910 | Apex Prey 3 |
+|---|---|---|---|---|---|
+| Baseline (deployed `2cdd6ce`) | Allie Bell | Vic | Vic | 237 | as §42.5 |
+| Unnamed-"I" chapters asked again | Vic | Allie Bell | Vic | 191 | narrator split (Gemma, Alan) |
+| Story-aware fold | Vic | Vic | Vic | 169 | as §42.5 |
+| + story-break split (`21c85fc`) | Vic | Vic | own narrator | 93 | as §42.5 |
+
+The remaining 93 are model errors, led by 24 of Andy Pelley's lines given to Vic when Pelley says
+"..., Vic?" (an addressed name taken for the speaker), and Elgin's lines the model gave to "Vic" in
+ch17, which now sit with ch17's narrator. That error class is the next prompt-tuning target. The
+model never learns that ch17's narrator is William Davis, so his voice is chosen without a name.
+
+- Tests: 928 app tests pass in the container. Not deployed yet.
