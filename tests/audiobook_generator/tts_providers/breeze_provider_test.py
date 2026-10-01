@@ -1,0 +1,365 @@
+"""The Breeze path of the OpenAI provider: a chapter's units go to the server in batches of 32 with
+their voice and its transcript, the checks of one batch run in a worker thread while the next batch
+generates, units that fail are sent again together with a new seed (the best take is kept), server
+errors count as failed attempts, and tone matching and the clip map work as for Chatterbox. The server
+is a fake; nothing here talks to a real one."""
+import json
+import os
+import re
+import tempfile
+import threading
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+from pydub import AudioSegment
+from pydub.generators import Sine
+
+from audiobook_generator.config.general_config import GeneralConfig
+from audiobook_generator.core import speech_check, tone_match
+from audiobook_generator.tts_providers import openai_tts_provider
+from audiobook_generator.tts_providers.openai_tts_provider import BREEZE_BATCH_SIZE, OpenAITTSProvider
+
+RATE = 24000
+PROVIDER = "audiobook_generator.tts_providers.openai_tts_provider"
+TAGS = SimpleNamespace(title="Ch", author="A", book_title="B", idx=1, cover=None)
+
+
+def _text(count: int) -> str:
+    return " ".join(f"Sentence {chr(65 + n // 26)}{chr(65 + n % 26)} is long enough to be a unit of its own."
+                    for n in range(count))
+
+
+def _unit_text(index: int) -> str:
+    return f"Sentence {chr(65 + index // 26)}{chr(65 + index % 26)} is long enough to be a unit of its own."
+
+
+def _tone(ms: int) -> AudioSegment:
+    return Sine(440).to_audio_segment(duration=ms, volume=-12).set_frame_rate(RATE).set_channels(1).set_sample_width(2)
+
+
+def _chunk(item: dict) -> int:
+    return int(re.search(r"chunk_(\d+)_of", item["id"]).group(1))
+
+
+class FakeBreeze:
+    """breeze_client.synthesize_batch stand-in: a tone of 1000 + chunk number ms for every item,
+    unless `behave(item, round)` (round = how often this chunk was asked for, from 1) says otherwise:
+    an AudioSegment, or a string for a server error."""
+
+    def __init__(self, behave=None):
+        self.calls = []
+        self.asked = {}
+        self.behave = behave
+
+    def __call__(self, items, seed=None):
+        self.calls.append((list(items), seed))
+        results = []
+        for item in items:
+            number = _chunk(item)
+            self.asked[number] = self.asked.get(number, 0) + 1
+            made = self.behave(item, self.asked[number]) if self.behave else None
+            results.append(made if made is not None else _tone(1000 + number))
+        return results
+
+
+def _provider(**extra) -> OpenAITTSProvider:
+    fields = dict(tts="openai", model_name="breeze", voice_name="Dark.wav", output_format="wav",
+                  speed=1.0, instructions=None, language="en", sentence_pause_ms=100, paragraph_pause_ms=300,
+                  paced_unit_mode="sentence", voice_mode="single", dialogue_voice=None, cast_file=None,
+                  openai_base_url=None, adaptive_delivery=False, delivery_exaggeration=None,
+                  delivery_cfg_weight=None, delivery_temperature=None, tone_match=False)
+    fields.update(extra)
+    return OpenAITTSProvider(GeneralConfig(SimpleNamespace(**fields)))
+
+
+class _Run:
+    """One chapter through the provider with a fake server, a fake transcript and a fake checker."""
+
+    def __init__(self, test, text, server=None, checker=None, transcript=lambda voice: f"words of {voice}", **extra):
+        self.server = server or FakeBreeze()
+        self.provider = _provider(**extra)
+        self.dir = tempfile.TemporaryDirectory()
+        test.addCleanup(self.dir.cleanup)
+        self.output = os.path.join(self.dir.name, "out.wav")
+        self.pieces = None
+        original = self.provider._combine_and_export
+
+        def capture(pieces, *args):
+            self.pieces = list(pieces)
+            original(pieces, *args)
+        with patch(f"{PROVIDER}.breeze_client.synthesize_batch", self.server), \
+                patch(f"{PROVIDER}.voice_transcripts.transcript", side_effect=transcript) as self.transcripts, \
+                patch(f"{PROVIDER}.speech_check.get", return_value=checker), \
+                patch.object(self.provider, "_combine_and_export", side_effect=capture):
+            self.error = None
+            try:
+                self.provider.text_to_speech(text, self.output, TAGS)
+            except Exception as error:
+                self.error = error
+
+    def clips(self):
+        with open(f"{self.output}.clips.json", encoding="utf-8") as f:
+            return json.load(f)["clips"]
+
+
+class TestBreezeBatches(unittest.TestCase):
+
+    def test_units_go_out_in_batches_of_32_in_order(self):
+        self.assertEqual(BREEZE_BATCH_SIZE, 32)
+        run = _Run(self, _text(70))
+        self.assertIsNone(run.error)
+        self.assertEqual([len(items) for items, _ in run.server.calls], [32, 32, 6])
+        sent = [_chunk(item) for items, _ in run.server.calls for item in items]
+        self.assertEqual(sent, list(range(1, 71)))
+        # The chapter is assembled in unit order: take n lasts 1000 + n ms.
+        takes = [len(AudioSegment(data=p, frame_rate=RATE, channels=1, sample_width=2)) for p in run.pieces
+                 if len(p) > 20000]
+        self.assertEqual(takes, [1000 + n for n in range(1, 71)])
+
+    def test_every_item_carries_its_text_voice_and_transcript(self):
+        run = _Run(self, _text(3), voice_mode="dialogue", dialogue_voice="Teen.mp3",
+                   transcript=lambda voice: {"Dark.wav": "dark words", "Teen.mp3": "teen words"}[voice])
+        self.assertIsNone(run.error)
+        items = run.server.calls[0][0]
+        self.assertEqual([item["text"] for item in items], [_unit_text(n) for n in range(3)])
+        # Narration is the narrator's voice; no quotes here, so every unit is Dark.wav.
+        self.assertEqual({(item["voice"], item["ref_text"]) for item in items}, {("Dark.wav", "dark words")})
+        self.assertTrue(all(item["instruction"] is None and item["cfg_scale"] is None for item in items))
+
+    def test_a_dialogue_unit_is_sent_with_the_dialogue_voice_and_its_own_transcript(self):
+        text = f"{_unit_text(0)} “Where are you going to be tomorrow evening?” she asked him quietly."
+        run = _Run(self, text, voice_mode="dialogue", dialogue_voice="Teen.mp3",
+                   transcript=lambda voice: {"Dark.wav": "dark words", "Teen.mp3": "teen words"}[voice])
+        self.assertIsNone(run.error)
+        voices = {(item["voice"], item["ref_text"]) for item in run.server.calls[0][0]}
+        self.assertIn(("Teen.mp3", "teen words"), voices)
+        self.assertIn(("Dark.wav", "dark words"), voices)
+
+    def test_a_voice_without_a_transcript_fails_the_chapter_before_any_request(self):
+        run = _Run(self, _text(3), transcript=lambda voice: None)
+        self.assertIsInstance(run.error, ValueError)
+        self.assertIn("Dark.wav", str(run.error))
+        self.assertEqual(run.server.calls, [])
+
+    def test_paragraph_mode_and_the_openai_client_are_not_used(self):
+        provider = _provider(paced_unit_mode="paragraph")
+        self.assertIsNone(provider.client)
+        run = _Run(self, _text(2), paced_unit_mode="paragraph")
+        self.assertIsNone(run.error)
+        self.assertEqual(len(run.server.calls[0][0]), 2)  # sentence units, not one paragraph request
+
+    def test_adaptive_delivery_is_ignored(self):
+        run = _Run(self, _text(2), adaptive_delivery=True)
+        self.assertIsNone(run.error)
+        self.assertEqual({clip["mood"] for clip in run.clips()}, {"normal"})
+
+
+class TestBreezeRetries(unittest.TestCase):
+
+    def test_a_near_silent_take_is_sent_again_with_a_new_seed(self):
+        def behave(item, round):
+            return AudioSegment.silent(3500, frame_rate=RATE) if _chunk(item) == 2 and round == 1 else None
+        run = _Run(self, _text(3), FakeBreeze(behave))
+        self.assertIsNone(run.error)
+        (first, first_seed), (second, second_seed) = run.server.calls
+        self.assertEqual([_chunk(i) for i in first], [1, 2, 3])
+        self.assertEqual([_chunk(i) for i in second], [2])
+        self.assertNotEqual(first_seed, second_seed)
+        clips = run.clips()
+        self.assertEqual([(c["attempts"], c["seed"]) for c in clips],
+                         [(1, first_seed), (2, second_seed), (1, first_seed)])
+        self.assertTrue(all("flagged" not in c for c in clips))
+
+    def test_failed_units_of_a_big_chapter_are_resent_together(self):
+        def behave(item, round):
+            return AudioSegment.silent(3500, frame_rate=RATE) if _chunk(item) in (1, 40) and round == 1 else None
+        run = _Run(self, _text(40), FakeBreeze(behave))
+        self.assertIsNone(run.error)
+        self.assertEqual([[_chunk(i) for i in items] for items, _ in run.server.calls],
+                         [list(range(1, 33)), list(range(33, 41)), [1, 40]])
+
+    def test_the_best_take_is_kept_when_none_passes_and_the_chapter_goes_on(self):
+        expected = _unit_text(1)
+        heard_by_length = {1002: "completely different words", 1102: " ".join(expected.split()[:4]),
+                           1202: "nothing alike"}
+
+        def behave(item, round):
+            return _tone(1002 + (round - 1) * 100) if _chunk(item) == 2 else None
+
+        class Checker:
+            def transcribe(self, audio):
+                if len(audio) in heard_by_length:
+                    return speech_check.Heard(heard_by_length[len(audio)], [])
+                return speech_check.Heard(_unit_text(len(audio) - 1001), [])
+        run = _Run(self, _text(3), FakeBreeze(behave), checker=Checker())
+        self.assertIsNone(run.error)
+        self.assertEqual(len(run.server.calls), 3)  # the first try and _BAD_CLIP_RETRIES more
+        seeds = [seed for _, seed in run.server.calls]
+        self.assertEqual(len(set(seeds)), 3)
+        clip = run.clips()[1]
+        self.assertEqual((clip["attempts"], clip["seed"], clip["flagged"]), (3, seeds[1], "speech mismatch"))
+        self.assertLess(clip["match"], speech_check.PASS_SCORE)
+        # Attempt 2's take (the closest match, 1102 ms) is what the chapter holds.
+        lengths = [len(AudioSegment(data=p, frame_rate=RATE, channels=1, sample_width=2)) for p in run.pieces
+                   if len(p) > 20000]
+        self.assertEqual(lengths, [1001, 1102, 1003])
+
+    def test_a_server_error_counts_as_a_failed_attempt(self):
+        run = _Run(self, _text(3), FakeBreeze(lambda item, round: "CUDA out of memory"
+                                              if _chunk(item) == 3 and round == 1 else None))
+        self.assertIsNone(run.error)
+        self.assertEqual([[_chunk(i) for i in items] for items, _ in run.server.calls], [[1, 2, 3], [3]])
+        self.assertEqual([c["attempts"] for c in run.clips()], [1, 1, 2])
+
+    def test_a_unit_the_server_never_makes_audio_for_fails_the_chapter(self):
+        run = _Run(self, _text(2), FakeBreeze(lambda item, round: "no good" if _chunk(item) == 2 else None))
+        self.assertIsInstance(run.error, RuntimeError)
+        self.assertIn("no good", str(run.error))
+        self.assertEqual(len(run.server.calls), 3)
+
+    def test_an_always_near_silent_take_is_kept_rather_than_failing_the_chapter(self):
+        run = _Run(self, _text(2), FakeBreeze(lambda item, round:
+                                              AudioSegment.silent(3500, frame_rate=RATE) if _chunk(item) == 2 else None))
+        self.assertIsNone(run.error)
+        self.assertEqual(run.clips()[1]["flagged"], "near-silent audio")
+
+
+class TestBreezeChecksInAThread(unittest.TestCase):
+
+    def test_batch_one_is_checked_while_batch_two_generates(self):
+        second_batch_started = threading.Event()
+        checked_in = []
+        gate_opened = []
+
+        class Server(FakeBreeze):
+            def __call__(self, items, seed=None):
+                if len(self.calls) == 1:
+                    second_batch_started.set()
+                return super().__call__(items, seed)
+
+        class Checker:
+            def transcribe(self, audio):
+                checked_in.append(threading.current_thread().name)
+                if not gate_opened:  # the very first take waits for batch two's request
+                    gate_opened.append(second_batch_started.wait(timeout=10))
+                return speech_check.Heard(_unit_text(len(audio) - 1001), [])
+        run = _Run(self, _text(40), Server(), checker=Checker())
+        self.assertIsNone(run.error)
+        self.assertEqual(gate_opened, [True])
+        self.assertEqual(len(checked_in), 40)
+        self.assertTrue(all(name.startswith("breeze-check") for name in checked_in))
+        self.assertEqual(len(run.server.calls), 2)  # every take matched: nothing retried
+
+    def test_generation_never_runs_more_than_one_batch_ahead_of_the_checks(self):
+        checked = []
+        ahead = []
+
+        class Server(FakeBreeze):
+            def __call__(self, items, seed=None):
+                ahead.append(len(checked))
+                return super().__call__(items, seed)
+
+        class Checker:
+            def transcribe(self, audio):
+                checked.append(1)
+                return speech_check.Heard(_unit_text(len(audio) - 1001), [])
+        run = _Run(self, _text(96), Server(), checker=Checker())
+        self.assertIsNone(run.error)
+        self.assertEqual(len(ahead), 3)
+        self.assertGreaterEqual(ahead[2], 32)  # batch 1 is fully checked before batch 3 is requested
+
+    def test_a_failed_speech_check_never_fails_the_chapter(self):
+        class Checker:
+            def transcribe(self, audio):
+                raise RuntimeError("whisper broke")
+        run = _Run(self, _text(2), checker=Checker())
+        self.assertIsNone(run.error)
+        self.assertEqual(len(run.server.calls), 1)
+
+
+class TestBreezeToneMatch(unittest.TestCase):
+
+    def _top_band(self, samples):
+        spectrum, _ = tone_match.speech_spectrum(samples)
+        return float(tone_match.balance(spectrum, RATE)[-1])
+
+    def _bright_run(self, **extra):
+        voices = tempfile.TemporaryDirectory()
+        self.addCleanup(voices.cleanup)
+        rng = np.random.default_rng(1)
+
+        def wav(samples):
+            return AudioSegment(data=(np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes(),
+                                frame_rate=RATE, channels=1, sample_width=2)
+        dark = np.convolve(rng.normal(0, 0.1, RATE * 8), [0.25, 0.5, 0.25], mode="same")
+        wav(dark).export(os.path.join(voices.name, "Dark.wav"), format="wav")
+
+        def behave(item, round):
+            return wav(np.random.default_rng(_chunk(item)).normal(0, 0.1, int(RATE * 4.5)))
+        with patch.dict(os.environ, {"TTS_VOICES_DIR": voices.name}):
+            return _Run(self, _text(4), FakeBreeze(behave), **extra)
+
+    def test_a_brighter_than_its_clip_voice_is_cut(self):
+        run = self._bright_run(tone_match=True)
+        self.assertIsNone(run.error)
+        units = [np.frombuffer(p, dtype="<i2").astype(np.float32) / 32768 for p in run.pieces if len(p) > 20000]
+        self.assertEqual(len(units), 4)
+        for unit in units:
+            self.assertLess(self._top_band(unit), -8)  # white noise measures ~0 dB before matching
+
+    def test_the_book_can_turn_matching_off(self):
+        run = self._bright_run(tone_match=False)
+        for piece in (p for p in run.pieces if len(p) > 20000):
+            self.assertGreater(self._top_band(np.frombuffer(piece, dtype="<i2").astype(np.float32) / 32768), -2)
+
+
+class TestBreezeClipMap(unittest.TestCase):
+
+    def test_the_clip_map_has_the_chatterbox_keys(self):
+        run = _Run(self, _text(3))
+        self.assertIsNone(run.error)
+        clips = run.clips()
+        self.assertEqual(len(clips), 3)
+        for number, clip in enumerate(clips, 1):
+            self.assertEqual(clip["chunk"], number)
+            self.assertEqual(clip["voice"], "Dark.wav")
+            self.assertEqual(clip["mood"], "normal")
+            self.assertEqual(clip["attempts"], 1)
+            self.assertEqual(clip["seed"], run.server.calls[0][1])
+            self.assertEqual(clip["text_length"], len(_unit_text(number - 1)))
+            self.assertEqual(clip["settings"], {})
+        self.assertLess(clips[0]["end_ms"], clips[1]["start_ms"])
+
+    def test_the_speech_checks_match_is_recorded(self):
+        class Checker:
+            def transcribe(self, audio):
+                return speech_check.Heard(_unit_text(len(audio) - 1001), [])
+        run = _Run(self, _text(2), checker=Checker())
+        self.assertEqual([c["match"] for c in run.clips()], [1.0, 1.0])
+
+
+class TestOtherEnginesUnchanged(unittest.TestCase):
+
+    def test_kokoro_and_chatterbox_still_make_one_request_per_unit_and_never_touch_breeze(self):
+        for model in ("kokoro", "chatterbox"):
+            with self.subTest(model=model), patch.dict(os.environ, {"OPENAI_API_KEY": "test"}):
+                provider = _provider(model_name=model, output_format="mp3")
+                requests = []
+
+                def create(**kwargs):
+                    requests.append(kwargs)
+                    return SimpleNamespace(content=_tone(1500).export(format="wav").read())
+                provider.client = SimpleNamespace(audio=SimpleNamespace(speech=SimpleNamespace(create=create)))
+                with tempfile.TemporaryDirectory() as folder, \
+                        patch(f"{PROVIDER}.breeze_client.synthesize_batch") as batch, \
+                        patch(f"{PROVIDER}.speech_check.get", return_value=None):
+                    provider.text_to_speech(_text(3), os.path.join(folder, "out.mp3"), TAGS)
+                self.assertEqual(len(requests), 3)
+                self.assertEqual({r["model"] for r in requests}, {model})
+                batch.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,7 +1,8 @@
 """Personal web UI: EPUB -> audiobook through a local Chatterbox server, plus a voice lab.
 
 The OpenAI-compatible provider is exposed twice over: pointed at Chatterbox via OPENAI_BASE_URL
-(the default engine), or at Kokoro via KOKORO_BASE_URL (opt-in second engine). Upstream's
+(the default engine), or at Kokoro via KOKORO_BASE_URL (opt-in second engine); Breeze (BREEZE_BASE_URL, opt-in third engine)
+speaks through its own batch client. Upstream's
 multi-provider UI stays in web_ui.py, whose process helpers are reused here.
 
 Environment:
@@ -15,6 +16,8 @@ Environment:
                           to hide the Engine choice entirely and behave exactly as without Kokoro)
     KOKORO_DEFAULT_VOICE Kokoro voice id selected by default (default: the server's own
                           default_voice, else "af_heart")
+    BREEZE_BASE_URL      Breeze TTS 2 server, e.g. http://breeze:8005 (optional: unset hides the Breeze
+                          choice; it speaks with the same voice files as Chatterbox)
     LLM_BASE_URL         Local OpenAI-compatible chat endpoint for cast analysis, e.g.
                           http://ollama:11434/v1 (optional: leave unset to hide the Cast voice mode)
     LLM_MODEL            Chat model name for cast analysis
@@ -44,7 +47,7 @@ from pydub import AudioSegment
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import delivery, voice_measure
+from audiobook_generator.core import breeze_client, delivery, voice_measure, voice_transcripts
 from audiobook_generator.core.cast_llm import llm_configured
 from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.core.chatterbox_control import chatterbox_url
@@ -96,6 +99,9 @@ def _http_error_detail(error: urllib.error.HTTPError) -> str:
 
 # ---- Kokoro (second engine) ----
 
+# Engines that speak with the voices folder's files (Breeze clones the same clips as Chatterbox).
+FILE_VOICE_ENGINES = ("chatterbox", "breeze")
+BREEZE_ENGINE_CHOICE = ("Breeze TTS 2 (best quality, needs the GPU to itself)", "breeze")
 KOKORO_ENGLISH_PREFIXES = ("af_", "am_", "bf_", "bm_")  # American/British female/male
 KOKORO_TIMEOUT_SECONDS = 5
 _KOKORO_PREFIX_LABELS = {
@@ -330,6 +336,30 @@ def preview_delivery_range(voice: str, phrase: str, exaggeration: float, cfg_wei
     return path
 
 
+def _breeze_sample(voice: str) -> str:
+    """One-off Breeze sample of PREVIEW_PHRASE in a voice file, as one item of a batch."""
+    global _current_preview_path
+    if not breeze_client.configured():
+        raise gr.Error("Breeze is not configured (BREEZE_BASE_URL).")
+    ref_text = voice_transcripts.transcript(voice)
+    if not ref_text:
+        raise gr.Error(f"Breeze needs the words spoken in {voice}, and the speech check's Whisper model "
+                       "could not transcribe it (SPEECH_CHECK_MODEL).")
+    try:
+        take = breeze_client.synthesize_batch([{"id": "sample", "text": PREVIEW_PHRASE, "voice": voice,
+                                                "ref_text": ref_text, "instruction": None, "cfg_scale": None}])[0]
+    except Exception as e:
+        raise gr.Error(f"Could not reach Breeze: {e}")
+    if isinstance(take, str):
+        raise gr.Error(f"Breeze could not make the sample: {take}")
+    handle, path = tempfile.mkstemp(prefix="voice_preview_", suffix=".mp3")
+    with os.fdopen(handle, "wb") as f:
+        take.export(f, format="mp3")
+    _delete_if_exists(_current_preview_path)
+    _current_preview_path = path
+    return path
+
+
 def _kokoro_sample(voice: str, speed: float) -> str:
     """One-off Kokoro sample of PREVIEW_PHRASE; mirrors preview_voice's temp-file handling (F-30)."""
     global _current_preview_path
@@ -361,12 +391,15 @@ def sample_voice(engine: str, voice: str, speed: float) -> str:
     """Speak PREVIEW_PHRASE with the Make tab's selected engine, voice and speed, so a voice can
     be auditioned before queuing a book. Chatterbox goes through preview_voice with its saved
     delivery settings (i.e. what a book will actually sound like); Kokoro has no delivery sliders
-    to save, so it is asked directly.
+    to save, so it is asked directly, and so is Breeze (a Chatterbox preview would need Chatterbox
+    loaded, which a Breeze book keeps off the GPU).
     """
     if not voice:
         raise gr.Error("Pick a voice first.")
     if engine == "kokoro":
         return _kokoro_sample(voice, speed)
+    if engine == "breeze":
+        return _breeze_sample(voice)
     settings = read_saved_settings()
     return preview_voice(voice, PREVIEW_PHRASE, settings["exaggeration"], settings["cfg_weight"],
                          settings["temperature"], speed)
@@ -431,7 +464,7 @@ def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bo
         message += " It's short: Chatterbox sounds steadier with 10-15 s of speech."
     message += " " + _measure_after_add(file_name)
     choices = openai_voice_choices()
-    make_tab_update = gr.update(choices=choices, value=file_name) if engine == "chatterbox" else gr.update()
+    make_tab_update = gr.update(choices=choices, value=file_name) if engine in FILE_VOICE_ENGINES else gr.update()
     return (message, gr.update(choices=choices, value=file_name), make_tab_update,
             gr.update(choices=own_voice_choices()))
 
@@ -472,12 +505,12 @@ def _is_safe_voice_filename(name: str) -> bool:
 
 
 def _voice_in_use(name: str, jobs: List[dict]) -> Optional[str]:
-    """Title of the queued/running Chatterbox job still using this voice file, if any."""
+    """Title of the queued/running Chatterbox or Breeze job still using this voice file, if any."""
     for job in jobs:
         if job.get("status") not in (QUEUED, RUNNING):
             continue
         settings = job.get("settings") or {}
-        if settings.get("engine", "chatterbox") == "chatterbox" and settings.get("voice") == name:
+        if settings.get("engine", "chatterbox") in FILE_VOICE_ENGINES and settings.get("voice") == name:
             return job.get("title") or "a queued book"
     return None
 
@@ -627,7 +660,11 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     paragraph mode's gap detector was tuned on Chatterbox audio and saves nothing on a server this
     fast (see the Narration units info text); delivery is ignored entirely for Kokoro.
 
-    Raises ValueError if engine is "kokoro" but KOKORO_BASE_URL isn't configured; queue_settings
+    Breeze is the same: sentence units, no delivery sliders or adaptive delivery (moods come later as
+    spoken instructions), tone matching as passed, and no OpenAI endpoint (it has its own client).
+
+    Raises ValueError if engine is "kokoro" but KOKORO_BASE_URL isn't configured (or "breeze" without
+    BREEZE_BASE_URL); queue_settings
     already refuses that earlier with a friendlier gr.Error at enqueue time, so this only guards a
     job that was queued while Kokoro was configured and lost that configuration before its turn.
     """
@@ -638,7 +675,7 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     config.output_text = output_text
     config.skip_existing = skip_existing
     config.log = log_level
-    config.worker_count = 1  # Chatterbox/Kokoro handle one request at a time from this app
+    config.worker_count = 1  # Chatterbox/Kokoro handle one request at a time from this app (Breeze: one batch)
     config.no_prompt = True
     config.title_mode = title_mode
     config.newline_mode = newline_mode
@@ -673,6 +710,15 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
         config.adaptive_delivery = False
         config.delivery_exaggeration = config.delivery_cfg_weight = config.delivery_temperature = None
         config.tone_match = False
+    elif engine == "breeze":
+        if not breeze_client.configured():
+            raise ValueError("BREEZE_BASE_URL is not configured.")
+        config.model_name = "breeze"
+        config.openai_base_url = None
+        config.paced_unit_mode = "sentence"
+        config.adaptive_delivery = False
+        config.delivery_exaggeration = config.delivery_cfg_weight = config.delivery_temperature = None
+        config.tone_match = bool(tone_match)
     else:
         config.model_name = "chatterbox"
         config.openai_base_url = None
@@ -797,6 +843,9 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
     if engine == "kokoro" and not kokoro_base_url():
         raise gr.Error("Kokoro is not configured (set KOKORO_BASE_URL first), or switch the Engine "
                        "back to Chatterbox.")
+    if engine == "breeze" and not breeze_client.configured():
+        raise gr.Error("Breeze is not configured (set BREEZE_BASE_URL first), or switch the Engine "
+                       "back to Chatterbox.")
     voice_mode = voice_mode or VOICE_MODE_SINGLE
     if voice_mode not in VOICE_MODES:
         raise gr.Error(f"Unknown voice mode '{voice_mode}'.")
@@ -859,10 +908,10 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         "log_level": log_level, "paced_unit_mode": paced_unit_mode or "sentence",
         "engine": engine,
         "voice_mode": voice_mode, "dialogue_voice": dialogue_voice or None, "cast_file": queued_cast_file,
-        "adaptive_delivery": bool(adaptive_delivery) and engine != "kokoro",
-        "delivery_exaggeration": None if engine == "kokoro" else delivery_exaggeration,
-        "delivery_cfg_weight": None if engine == "kokoro" else delivery_cfg_weight,
-        "delivery_temperature": None if engine == "kokoro" else delivery_temperature,
+        "adaptive_delivery": bool(adaptive_delivery) and engine == "chatterbox",
+        "delivery_exaggeration": delivery_exaggeration if engine == "chatterbox" else None,
+        "delivery_cfg_weight": delivery_cfg_weight if engine == "chatterbox" else None,
+        "delivery_temperature": delivery_temperature if engine == "chatterbox" else None,
         "tone_match": bool(tone_match) and engine != "kokoro",
     }
 
@@ -1318,6 +1367,8 @@ def sample_character(cast_key: Optional[str], character_key: Optional[str], engi
         raise gr.Error("Pick a voice first.")
     if engine == "kokoro":
         return _kokoro_sample(voice, speed)
+    if engine == "breeze":
+        return _breeze_sample(voice)
     cast = (cast_store.load_cast(cast_file_for(cast_key)) if cast_key else None) or {"characters": {}}
     character = dict(cast["characters"].get(character_key or "") or {})
     character["delivery"] = delivery_choice or "auto"
@@ -1595,13 +1646,15 @@ QUEUE_COLUMNS = ["#", "Book", "Voice", "Chapters", "Status", "Generating time"]
 
 def _voice_column(job: dict) -> str:
     """Voice column text: the bare (extension-stripped) file name for Chatterbox, prefixed with
-    the engine name for Kokoro (its ids carry no file extension to strip); a cast analysis says
+    the engine name for Kokoro (its ids carry no file extension to strip) and Breeze; a cast analysis says
     so, and a multi-voice book adds its mode."""
     if job_kind(job) == CAST:
         return "cast analysis (LLM)"
     settings = job.get("settings", {})
-    voice = f"Kokoro · {job['voice']}" if settings.get("engine", "chatterbox") == "kokoro" \
-        else os.path.splitext(job["voice"])[0]
+    engine = settings.get("engine", "chatterbox")
+    voice = (f"Kokoro · {job['voice']}" if engine == "kokoro"
+             else f"Breeze · {os.path.splitext(job['voice'])[0]}" if engine == "breeze"
+             else os.path.splitext(job["voice"])[0])
     mode = settings.get("voice_mode", VOICE_MODE_SINGLE)
     if mode == VOICE_MODE_CAST:
         return f"{voice} + cast"
@@ -1671,6 +1724,10 @@ PACED_GENERATION_OVERHEAD = 1.26
 KOKORO_CHARS_PER_AUDIO_SECOND = 16.9
 KOKORO_GENERATION_SPEED = 52.9
 KOKORO_PACED_GENERATION_OVERHEAD = 3.07
+# Breeze speaks about as fast as Chatterbox (same chars per audio second). Its server generates at 7.1x
+# real time with 32 sentences per request (measured 2026-10-01); with the speech check on every take and
+# the retried ones that is a GUESS of 4x until a real book has been timed.
+BREEZE_GENERATION_SPEED = 4.0
 CHAPTER_COLUMNS = ["#", "Include", "Chapter", "Starts with", "Listening"]
 _SENTENCE_END = re.compile(r"[.!?\u2026]+[\"'\u201d\u2019)\]]*(?=\s|$)")
 
@@ -1699,6 +1756,8 @@ def _engine_estimate_constants(engine: str) -> Tuple[float, float, float]:
     """(chars_per_audio_second, generation_speed, paced_overhead) for the given engine."""
     if engine == "kokoro":
         return KOKORO_CHARS_PER_AUDIO_SECOND, KOKORO_GENERATION_SPEED, KOKORO_PACED_GENERATION_OVERHEAD
+    if engine == "breeze":
+        return CHARS_PER_AUDIO_SECOND, BREEZE_GENERATION_SPEED, 1.0
     return CHARS_PER_AUDIO_SECOND, GENERATION_SPEED, PACED_GENERATION_OVERHEAD
 
 
@@ -1837,14 +1896,15 @@ def _dialogue_voice_update(choices: list, default: Optional[str]) -> dict:
 def engine_changed(engine: str) -> tuple:
     """Switching the Make tab's engine swaps the Voice, Dialogue voice and cast-editor voice
     dropdowns to that engine's own choices and default (Chatterbox's file list, or Kokoro's
-    English voices from its live API), and shows the adaptive delivery checkbox and its baseline
-    line only while Chatterbox is selected (delivery is ignored entirely for Kokoro)."""
+    English voices from its live API; Breeze clones the same voice files as Chatterbox), and shows
+    the adaptive delivery checkbox and its baseline line only while Chatterbox is selected (delivery is
+    ignored entirely for Kokoro and Breeze)."""
     if engine == "kokoro":
         choices, default = kokoro_voices_and_default()
     else:
         choices = openai_voice_choices()
         default = default_openai_voice(choices)
-    is_chatterbox = engine != "kokoro"
+    is_chatterbox = engine not in ("kokoro", "breeze")
     return (gr.update(choices=choices, value=default), _dialogue_voice_update(choices, default),
             gr.update(choices=choices, value=None), gr.update(visible=is_chatterbox), gr.update(visible=is_chatterbox))
 
@@ -1853,7 +1913,7 @@ def _sync_if_chatterbox(value: str, engine: str) -> dict:
     """Pass a voice value through to the paired dropdown only while the Make tab's engine is
     Chatterbox: a Kokoro id must never land in the (Chatterbox-only) Voice lab, and a Chatterbox
     file name must never land in the Make-tab dropdown while Kokoro is selected there."""
-    return gr.update(value=value) if engine == "chatterbox" else gr.update()
+    return gr.update(value=value) if engine in FILE_VOICE_ENGINES else gr.update()
 
 
 # ---- Layout ----
@@ -1867,6 +1927,13 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
     choices = openai_voice_choices()
     default_voice = default_openai_voice(choices)
     kokoro_configured = bool(kokoro_base_url())
+    engine_choices = [("Chatterbox", "chatterbox")]
+    if kokoro_configured:
+        engine_choices.append(("Kokoro", "kokoro"))
+    if breeze_client.configured():
+        engine_choices.append(BREEZE_ENGINE_CHOICE)
+    # Breeze is the default once it is set up: the owner retired Chatterbox for it (2026-10-01).
+    initial_engine = "breeze" if breeze_client.configured() else "chatterbox"
     saved = read_saved_settings()  # also seeds the Make tab's initial delivery baseline line
 
     def refresh_queue() -> tuple:
@@ -1944,7 +2011,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         default = default_openai_voice(choices)
         lab_update = _voice_dropdown_after_delete(choices, current_lab_voice, name, default)
         voice_update = (_voice_dropdown_after_delete(choices, current_voice, name, default)
-                        if engine == "chatterbox" else gr.update())
+                        if engine in FILE_VOICE_ENGINES else gr.update())
         return message, lab_update, voice_update, gr.update(choices=own_voice_choices(), value=None)
 
     def select_job(ids: list, evt: gr.SelectData) -> tuple:
@@ -2004,9 +2071,8 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                     output_dir = gr.Textbox(label="Output folder", value=timestamped_output_dir,
                                             info="Filled in from the book title; lands in the audiobook library.")
                     with gr.Row(equal_height=True):
-                        engine = gr.Dropdown([("Chatterbox", "chatterbox"), ("Kokoro", "kokoro")],
-                                             value="chatterbox", label="Engine", visible=kokoro_configured,
-                                             scale=1)
+                        engine = gr.Dropdown(engine_choices, value=initial_engine, label="Engine",
+                                             visible=len(engine_choices) > 1, scale=1)
                         voice = gr.Dropdown(choices, value=default_voice, label="Voice",
                                             allow_custom_value=True, scale=2)
                         with gr.Column(scale=0, min_width=100):
@@ -2028,11 +2094,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                                   "found: the narrator's voice unless you pick another.")
             with gr.Row(equal_height=True):
                 adaptive_delivery = gr.Checkbox(
-                    True, label="Adaptive delivery", visible=True,
+                    True, label="Adaptive delivery", visible=initial_engine == "chatterbox",
                     info="Dialogue tagged whispered/shouted (and, in Cast mode, the LLM's own read) is spoken "
                          "softer or more excited around this book's baseline, instead of one flat delivery.")
                 delivery_baseline_info = gr.Markdown(
-                    delivery_baseline_text(saved["exaggeration"], saved["cfg_weight"], saved["temperature"]))
+                    delivery_baseline_text(saved["exaggeration"], saved["cfg_weight"], saved["temperature"]),
+                    visible=initial_engine == "chatterbox")
             with gr.Row(equal_height=True):
                 sentence_pause = gr.Slider(0.0, 1.5, value=0.35, step=0.05, label="Pause after sentences (s)")
                 paragraph_pause = gr.Slider(0.0, 3.0, value=0.9, step=0.1, label="Pause between paragraphs (s)")

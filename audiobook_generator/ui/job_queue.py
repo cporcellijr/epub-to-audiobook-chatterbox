@@ -51,12 +51,10 @@ def _now() -> str:
 
 
 def _chatterbox_ready(settings: dict) -> bool:
-    """Default engine_ready: a Chatterbox book waits while the model is unloaded; Kokoro has no
-    unload and never waits."""
-    if settings.get("engine", "chatterbox") == "kokoro":
-        return True
-    from audiobook_generator.core.chatterbox_control import ready_for_book
-    return ready_for_book()
+    """Default engine_ready: a book waits until its engine's model is the one on the GPU (Chatterbox
+    reloads after a cast analysis, Breeze is loaded in place of Chatterbox); Kokoro never waits."""
+    from audiobook_generator.core.engine_gpu import ready_for_book
+    return ready_for_book(settings.get("engine", "chatterbox"))
 
 
 class JobQueue:
@@ -338,8 +336,8 @@ class JobQueue:
             if job_kind(job) == CAST:
                 process = self._process_factory(target=run_cast_job, args=(dict(job["settings"]), self._log_file()))
             else:
-                # Never start a book while Chatterbox is unloaded (a cast analysis freed it and has
-                # not brought it back yet): its requests would all fail with 503.
+                # Never start a book before its engine's model is loaded (a cast analysis freed the
+                # GPU, or the other engine holds it): its requests would fail with 503.
                 if not self._engine_ready(job["settings"]):
                     return
                 config = self._build_config(**job["settings"])

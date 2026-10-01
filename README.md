@@ -36,6 +36,15 @@ The repo holds the whole stack:
   shown when `KOKORO_BASE_URL` is configured); the Voice dropdown swaps to Kokoro's English voices,
   best-graded first. A **Sample** button next to the Voice dropdown speaks a short fixed phrase with
   the selected engine, voice and speed so a voice can be auditioned before queuing a book.
+- **Breeze TTS 2** (`./breeze`, shown when `BREEZE_BASE_URL` is set, and then the default engine): a
+  3B model that clones the same voice files much more naturally than Chatterbox. One sentence at a
+  time it is slow on a 12 GB card (0.45× real time), so chapters are made in batches of 32 sentences
+  (5–7× real time), every take checked by Whisper and the failures retried in the next batch. It
+  needs the exact words of each voice clip, which the app transcribes once with Whisper and caches
+  (`voice_transcripts.json`). The server loads its model only when a Breeze book starts and the app
+  unloads it for a cast analysis, since Breeze (~8 GB) and the LLM can't share the GPU. Adaptive
+  delivery isn't wired to Breeze yet. Breeze's weights are for research and non-commercial use only
+  (WORKLOG #35).
 - **Voice lab**: play a phrase with any voice, tune Chatterbox's exaggeration / CFG weight / temperature
   and save them as the settings books use, add new voices (long pauses in the sample are removed,
   because Chatterbox copies a reference clip's pauses), and delete a voice you added (Chatterbox's
@@ -161,6 +170,7 @@ Settings the app reads (the compose file sets them):
 | `OPENAI_BASE_URL` | Chatterbox's OpenAI endpoint, e.g. `http://chatterbox:8004/v1` |
 | `OPENAI_API_KEY` | Any non-empty value (Chatterbox has no auth) |
 | `TTS_VOICES_DIR` | Chatterbox's voices folder (writable, for the Voice lab) |
+| `BREEZE_BASE_URL` | Breeze TTS 2 server, e.g. `http://breeze:8005`. When set, Breeze is offered and is the default engine. Chatterbox then only starts with `docker compose --profile chatterbox up -d` |
 | `OPENAI_DEFAULT_VOICE` | Voice selected by default |
 | `CHATTERBOX_CONFIG` | Chatterbox's `config.yaml` (read-only), for the Voice lab sliders |
 | `CHATTERBOX_URL` | Chatterbox root URL, if it isn't `OPENAI_BASE_URL` minus `/v1` |

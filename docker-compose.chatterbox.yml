@@ -1,9 +1,12 @@
-# The whole stack: Chatterbox TTS server (./chatterbox) + the audiobook web UI (repo root).
-# Two containers, one project. Copy .env.example to .env, set the paths, then:
+# The whole stack: the audiobook web UI (repo root) + Breeze TTS 2 (./breeze, idle until used), and
+# Chatterbox (./chatterbox) only on request. Copy .env.example to .env, set the paths, then:
 #   docker compose -f docker-compose.chatterbox.yml up -d --build
-# Web UI: http://localhost:7860 · Chatterbox UI/API: http://localhost:8004 (OpenAI API under /v1)
+# Web UI: http://localhost:7860 · Breeze API: http://localhost:8005
+# Chatterbox, retired for Breeze on 2026-10-01: add --profile chatterbox to bring it back
+# (UI/API http://localhost:8004, OpenAI API under /v1).
 services:
   chatterbox:
+    profiles: ["chatterbox"]
     build:
       context: ./chatterbox
       dockerfile: Dockerfile
@@ -57,14 +60,47 @@ services:
               capabilities:
                 - gpu
 
+  breeze:
+    # Breeze TTS 2 (3B). Comes up with the stack but idle: the model loads on the first request
+    # (or POST /api/load) and the app unloads it again so it never shares the GPU with Chatterbox.
+    build: ./breeze
+    image: breeze-tts:local
+    container_name: breeze
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-UTC}
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - BREEZE_MAX_BATCH=${BREEZE_MAX_BATCH:-32}
+    volumes:
+      - breeze-models:/models  # ~7 GB of weights, downloaded on first load
+      - ${CHATTERBOX_DATA:?set CHATTERBOX_DATA in .env}/voices:/voices:ro  # same voice library as Chatterbox
+    ports:
+      - ${BREEZE_PORT:-8005}:8005
+    networks:
+      - tts
+    healthcheck:
+      # Answers while the model is unloaded, so "healthy" means the server is up, not the model.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+
   epub-to-audiobook:
     build: .
     image: epub_to_audiobook:local
     container_name: epub-to-audiobook
     restart: unless-stopped
-    depends_on:
-      chatterbox:
-        condition: service_healthy
     command: ["--host", "0.0.0.0", "--port", "7860"]
     environment:
       - TZ=${TZ:-UTC}
@@ -83,6 +119,8 @@ services:
       # Optional second engine. Leave unset (the default) to hide the Engine choice entirely.
       - KOKORO_BASE_URL=${KOKORO_BASE_URL:-}
       - KOKORO_DEFAULT_VOICE=${KOKORO_DEFAULT_VOICE:-}
+      # Optional engine. Leave unset (the default) to hide it. Set to http://breeze:8005 to use Breeze TTS 2.
+      - BREEZE_BASE_URL=${BREEZE_BASE_URL:-}
       # Optional local LLM (OpenAI-compatible chat endpoint) for multi-voice cast analysis. Leave
       # LLM_BASE_URL unset (the default) to hide the Cast voice mode entirely.
       - LLM_BASE_URL=${LLM_BASE_URL:-}
@@ -105,6 +143,8 @@ services:
       - tts
 
 volumes:
+  breeze-models:
+    name: ${BREEZE_MODELS_VOLUME:-breeze-models}  # set to breeze-bakeoff-models to reuse downloaded weights (mounted at /models)
   hf-cache:
     # Reuse an existing model cache by naming it here (avoids re-downloading several GB of models).
     name: ${HF_CACHE_VOLUME:-chatterbox-hf-cache}

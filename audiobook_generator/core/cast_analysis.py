@@ -10,7 +10,7 @@ from typing import Callable, Optional
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import chatterbox_control
+from audiobook_generator.core import chatterbox_control, engine_gpu
 from audiobook_generator.core.cast_llm import ChatClient, Chat, Roster, attribute_chapter, llm_api_key, llm_base_url, \
     llm_model
 from audiobook_generator.core.cast_profiles import ChapterText, describe_book, profile_cast
@@ -49,10 +49,11 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
     key = settings.get("cast_key") or cast_store.cast_key(settings["input_file"])
     path = settings["cast_file"]
     previous = cast_store.load_cast(path)  # an earlier analysis of this book: its voice picks carry over
-    if previous and previous.get("engine") != settings.get("engine", "chatterbox"):
+    engine = cast_store.voice_library(settings.get("engine", "chatterbox"))
+    if previous and previous.get("engine") != engine:
         previous = None  # another engine's voices can't be used
     cast = cast_store.new_cast(key, settings["input_file"], parser.get_book_title(), parser.get_book_author(),
-                               settings.get("engine", "chatterbox"), settings.get("voice"), selection)
+                               engine, settings.get("voice"), selection)
     cast_store.save_cast(path, cast)
     roster = Roster()
     stats = cast["stats"]
@@ -96,9 +97,11 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
 def run_cast_analysis(settings: dict, log_file: str, unload_allowed: Callable[[], bool] = chatterbox_control.unload_enabled,
                       unload: Callable[[], bool] = chatterbox_control.unload,
                       reload: Callable[[], bool] = chatterbox_control.reload,
+                      unload_breeze: Callable[[], bool] = engine_gpu.unload_breeze_if_loaded,
                       analyse: Callable[..., dict] = analyse_book, exit: Callable[[int], None] = sys.exit) -> None:
-    """Process target for the queue: unload Chatterbox (when allowed), analyse, then reload it and
-    wait for the model whether or not the analysis succeeded. Exit code 0 only on success.
+    """Process target for the queue: unload Chatterbox and Breeze (when allowed), analyse, then
+    reload Chatterbox and wait for the model whether or not the analysis succeeded (Breeze loads
+    again when a Breeze book starts, core.engine_gpu). Exit code 0 only on success.
 
     The Chatterbox and analysis steps are injectable for the queue tests; the queue itself passes
     only (settings, log_file).
@@ -109,6 +112,7 @@ def run_cast_analysis(settings: dict, log_file: str, unload_allowed: Callable[[]
     try:
         if unload_allowed():
             unloaded = unload()
+            unload_breeze()
         else:
             logger.info("Cast: LLM_UNLOAD_CHATTERBOX is off; Chatterbox stays loaded during the analysis")
         analyse(settings)

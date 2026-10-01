@@ -9,7 +9,8 @@ import os
 import secrets
 import subprocess
 import time
-from typing import Callable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Iterator, List, Optional, Tuple
 
 from pydub import AudioSegment
 from sentencex import segment
@@ -22,9 +23,11 @@ from mutagen.id3._frames import TIT2, TPE1, TALB, TRCK, APIC
 from openai import APIConnectionError, APIStatusError, OpenAI
 
 from audiobook_generator.core.audio_tags import AudioTags
+from audiobook_generator.core import breeze_client
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import delivery
 from audiobook_generator.core import speech_check
+from audiobook_generator.core import voice_transcripts
 from audiobook_generator.core.m4b import LOSSY_BITRATE
 from audiobook_generator.core.dialogue import DIALOGUE, NARRATION, PARAGRAPH_MARK, Segment, chapter_segments
 from audiobook_generator.core.speech_tags import has_speech_tag
@@ -53,6 +56,9 @@ _LOSSY_FORMATS = ("mp3", "aac", "opus")
 _BAD_CLIP_SILENCE_MS = 3000
 _BAD_CLIP_SILENCE_DBFS = -50
 _BAD_CLIP_RETRIES = 2
+# Breeze is fast only when many sentences are generated together (7.1x real time at 32 per request,
+# 0.45x at 1; 2026-10-01), so a chapter goes to its server in requests of this many units.
+BREEZE_BATCH_SIZE = 32
 _SHORT_UNIT_CHARS = 25
 _SHORT_QUOTE_CONTEXT = "The room was quiet, and the window was open."
 
@@ -669,7 +675,9 @@ class OpenAITTSProvider(BaseTTSProvider):
 
         # base_url=None falls back to OPENAI_BASE_URL exactly as before; a per-config URL (e.g.
         # Kokoro's) must win over that env var, since both can be set at once.
-        self.client = OpenAI(max_retries=4, base_url=config.openai_base_url)  # OPENAI_API_KEY env var still required
+        # Breeze has its own client (core.breeze_client), so it needs no OpenAI key or endpoint.
+        self.client = (None if config.model_name == "breeze"
+                       else OpenAI(max_retries=4, base_url=config.openai_base_url))  # OPENAI_API_KEY env var still required
         self._tone = None  # tone_match.ToneMatcher, made on the first chapter that matches
         self.cast: Optional[dict] = None
         if config.voice_mode == VOICE_MODE_CAST:
@@ -756,6 +764,11 @@ class OpenAITTSProvider(BaseTTSProvider):
         adaptive delivery and the baseline sliders only mean anything to Chatterbox's own endpoint
         extensions, and chatterbox_ui.build_config is the only caller that sets this model name."""
         return self.config.model_name == "chatterbox"
+
+    def _is_breeze_engine(self) -> bool:
+        """True when this provider speaks through the Breeze server, in batches (build_config sets this
+        model name)."""
+        return self.config.model_name == "breeze"
 
     def _adaptive_active(self) -> bool:
         return bool(self.config.adaptive_delivery) and self._is_chatterbox_engine()
@@ -856,8 +869,9 @@ class OpenAITTSProvider(BaseTTSProvider):
                 delay = min(delay * 2, SERVER_WAIT_MAX_DELAY_SECONDS)
 
     def text_to_speech(self, text: str, output_file: str, audio_tags: AudioTags):
-        if self.pacing_enabled():
-            if self.config.paced_unit_mode == "paragraph":
+        if self.pacing_enabled() or self._is_breeze_engine():
+            # Paragraph mode's gap detector was tuned on Chatterbox audio: Breeze is sentence units only.
+            if self.config.paced_unit_mode == "paragraph" and not self._is_breeze_engine():
                 self._paced_text_to_speech_paragraph(text, output_file, audio_tags)
             else:
                 self._paced_text_to_speech(text, output_file, audio_tags)
@@ -967,14 +981,13 @@ class OpenAITTSProvider(BaseTTSProvider):
 
     def _speak_units(self, units: List[tuple], output_file: str,
                      audio_tags: AudioTags) -> None:
-        """Request each (paragraph, text, sentence_count, continues_previous, voice, mood, speaker)
-        unit at speed 1.0, insert the configured pauses between them and export the chapter once.
+        """Turn each (paragraph, text, sentence_count, continues_previous, voice, mood, speaker) unit
+        into audio (_unit_takes), insert the configured pauses between them and export the chapter once.
 
-        Adaptive delivery (Chatterbox only) sends the unit's mood preset via extra_body and applies
-        that preset's gain plus the peak guard to the decoded audio before it is joined with the
-        pauses; a per-book baseline with adaptive delivery off still sends that baseline via
-        extra_body (mood is ignored: every unit's `mood` is "normal" already, so this is the plain
-        baseline unchanged), with no gain change. Neither applies: today's plain request.
+        Producing a unit's audio is separate from assembling the chapter: Chatterbox and Kokoro make
+        takes one request at a time, Breeze makes them in batches, and the assembly below is the same
+        for all of them. Adaptive delivery (Chatterbox only) applies the unit's mood preset's gain plus
+        the peak guard to the decoded audio before it is joined with the pauses.
         """
         speed = float(self.config.speed or 1.0)
         sentence_gap_ms = int(self.config.sentence_pause_ms or 0)
@@ -991,31 +1004,11 @@ class OpenAITTSProvider(BaseTTSProvider):
         previous_paragraph = None
         timeline_frames = 0
         clip_entries = []
-        for number, item in enumerate(units, 1):
+        mapped = self._is_chatterbox_engine() or self._is_breeze_engine()
+        for number, (item, take) in enumerate(zip(units, self._unit_takes(units, audio_tags, baseline)), 1):
             paragraph, unit, sentence_count, continues_previous, voice, mood, speaker = item
             chunk_id = f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{number}_of_{len(units)}"
-            detail = f", sentences={sentence_count}" if self.config.paced_unit_mode == "paragraph" else ""
-            if self.config.voice_mode != VOICE_MODE_SINGLE:
-                detail += f", voice={voice}"
-            if adaptive:
-                detail += f", mood={mood}"
-            logger.info(f"Processing {chunk_id}, length={len(unit)}{detail}")
-            logger.debug(f"Processing {chunk_id}, length={len(unit)}, text=[{unit}]")
-            request_kwargs = dict(
-                model=self.config.model_name,
-                voice=voice,
-                speed=1.0,
-                instructions=self.config.instructions,
-                input=_chatterbox_input(unit) if self._is_chatterbox_engine() else unit,
-                response_format="wav",
-            )
-            extra_body = self._delivery_extra_body(mood, speaker, unit, baseline)
-            if extra_body is not None:
-                request_kwargs["extra_body"] = extra_body
-            if self._is_chatterbox_engine() and len(unit.strip()) <= _SHORT_UNIT_CHARS:
-                request_kwargs["extra_body"] = {**request_kwargs.get("extra_body", {}),
-                                                "seed": _new_seed()}
-            audio, params, attempts, flagged = self._speak_take(request_kwargs, unit, chunk_id)
+            audio, params, attempts, flagged = take
             if sentence_count > 1 and sentence_gap_ms > 0:
                 audio = _stretch_sentence_gaps(audio, sentence_count - 1, sentence_gap_ms)
             if adaptive:
@@ -1037,7 +1030,7 @@ class OpenAITTSProvider(BaseTTSProvider):
             spoken.append((len(pieces), voice))
             pieces.append(audio.raw_data)
             timeline_frames += len(audio.raw_data) // (audio_format[1] * audio_format[2])
-            if self._is_chatterbox_engine():
+            if mapped:
                 clip_entries.append({
                     "chunk": number, "text_sha1": hashlib.sha1(unit.encode("utf-8")).hexdigest(),
                     "text_length": len(unit), "voice": voice, "mood": mood,
@@ -1069,6 +1062,138 @@ class OpenAITTSProvider(BaseTTSProvider):
                 os.replace(f"{map_path}.tmp", map_path)
             except OSError as error:
                 logger.warning("Could not save clip locations for %s: %s", output_file, error)
+
+    def _unit_takes(self, units: List[tuple], audio_tags: AudioTags,
+                    baseline: Optional[delivery.Baseline]) -> Iterator[Tuple[AudioSegment, dict, int, Optional[str]]]:
+        """(audio, the parameters it was made with, attempts made, why the kept take is suspect) for
+        every unit, in order: one request per unit for Chatterbox and Kokoro, batches for Breeze."""
+        if self._is_breeze_engine():
+            yield from self._breeze_takes(units, audio_tags)
+            return
+        adaptive = self._adaptive_active()
+        for number, item in enumerate(units, 1):
+            paragraph, unit, sentence_count, continues_previous, voice, mood, speaker = item
+            chunk_id = f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{number}_of_{len(units)}"
+            detail = f", sentences={sentence_count}" if self.config.paced_unit_mode == "paragraph" else ""
+            if self.config.voice_mode != VOICE_MODE_SINGLE:
+                detail += f", voice={voice}"
+            if adaptive:
+                detail += f", mood={mood}"
+            logger.info(f"Processing {chunk_id}, length={len(unit)}{detail}")
+            logger.debug(f"Processing {chunk_id}, length={len(unit)}, text=[{unit}]")
+            request_kwargs = dict(
+                model=self.config.model_name,
+                voice=voice,
+                speed=1.0,
+                instructions=self.config.instructions,
+                input=_chatterbox_input(unit) if self._is_chatterbox_engine() else unit,
+                response_format="wav",
+            )
+            extra_body = self._delivery_extra_body(mood, speaker, unit, baseline)
+            if extra_body is not None:
+                request_kwargs["extra_body"] = extra_body
+            if self._is_chatterbox_engine() and len(unit.strip()) <= _SHORT_UNIT_CHARS:
+                request_kwargs["extra_body"] = {**request_kwargs.get("extra_body", {}),
+                                                "seed": _new_seed()}
+            yield self._speak_take(request_kwargs, unit, chunk_id)
+
+    def _breeze_takes(self, units: List[tuple],
+                      audio_tags: AudioTags) -> List[Tuple[AudioSegment, dict, int, Optional[str]]]:
+        """Every unit's take from the Breeze server, in unit order.
+
+        The units go out in requests of BREEZE_BATCH_SIZE. The checks of one batch (near-silence, then
+        the speech check's transcript through _verdict, for every take) run in a worker thread while
+        the next batch generates: Whisper uses the CPU, generation the GPU. Generation never gets
+        more than one batch ahead of the checks. Units that fail are sent again together, in new
+        batches with a new seed, for up to _BAD_CLIP_RETRIES more rounds; the best take is kept
+        when none passes (as _speak_take does), and a unit fails the chapter only when the server
+        never made any audio for it."""
+        total = len(units)
+        ids = [f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{n}_of_{total}" for n in range(1, total + 1)]
+        items = []
+        for number, (_, unit, _, _, voice, _, _) in enumerate(units):
+            ref_text = voice_transcripts.transcript(voice)
+            if not ref_text:
+                raise ValueError(f"Breeze needs the words spoken in the voice clip {voice} and could not get "
+                                 "them (the speech check's Whisper model, SPEECH_CHECK_MODEL, transcribes it)")
+            # The EPUB's quote repairs are not specific to Chatterbox.
+            items.append({"id": ids[number], "text": _chatterbox_input(unit), "voice": voice,
+                          "ref_text": ref_text, "instruction": None, "cfg_scale": None})
+        checker = speech_check.get()
+        kept: dict = {}                            # unit index -> the take that passed
+        rejected = {n: [] for n in range(total)}   # unit index -> (kind, badness, attempt, audio, params, reason)
+        errors: dict = {}                          # unit index -> the server's last error for it
+        pending = list(range(total))
+        seed = None
+        for attempt in range(_BAD_CLIP_RETRIES + 1):
+            seed = _new_seed(seed)
+            label = f"attempt {attempt + 1}/{_BAD_CLIP_RETRIES + 1}"
+            batches = [pending[i:i + BREEZE_BATCH_SIZE] for i in range(0, len(pending), BREEZE_BATCH_SIZE)]
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="breeze-check") as checks:
+                futures = []
+                for number, batch in enumerate(batches, 1):
+                    if len(futures) >= 2:
+                        futures[-2].result()  # the checks of the batch before last are done
+                    logger.info("Breeze %s, batch %d of %d: %d units, seed=%d", label, number, len(batches),
+                                len(batch), seed)
+                    takes = breeze_client.synthesize_batch([items[i] for i in batch], seed)
+                    futures.append(checks.submit(self._check_breeze_batch, batch, takes, units, ids, seed,
+                                                 attempt, label, checker))
+                results = [future.result() for future in futures]
+            pending = []
+            for batch_results in results:
+                for index, outcome, detail in batch_results:
+                    if outcome == "pass":
+                        kept[index] = detail
+                        continue
+                    if outcome == "error":
+                        errors[index] = detail
+                    else:
+                        rejected[index].append(detail)
+                    pending.append(index)
+            pending.sort()
+            if not pending:
+                break
+        takes = []
+        for index in range(total):
+            if index in kept:
+                takes.append(kept[index])
+                continue
+            if not rejected[index]:
+                raise RuntimeError(f"Breeze made no audio for {ids[index]}: {errors.get(index, 'no take')}")
+            _, _, attempt, audio, params, reason = min(rejected[index], key=lambda take: take[:3])
+            logger.warning("Keeping attempt %d of %s (%.2fs, %s): no attempt passed its checks",
+                           attempt + 1, ids[index], len(audio) / 1000, reason)
+            takes.append((audio, params, _BAD_CLIP_RETRIES + 1, reason))
+        return takes
+
+    def _check_breeze_batch(self, batch: List[int], takes: list, units: List[tuple], ids: List[str], seed: int,
+                            attempt: int, label: str, checker) -> list:
+        """(unit index, outcome, detail) for each take of one batch, run in the checking thread:
+        "error" (detail: the server's message), "pass" (detail: the finished take) or "reject"
+        (detail: the tuple _breeze_takes ranks the unit's rejected takes by). A near-silent take
+        ranks last, so it is kept only when nothing else exists."""
+        outcomes = []
+        for index, take in zip(batch, takes):
+            unit, chunk_id = units[index][1], ids[index]
+            if isinstance(take, str):
+                logger.warning("Breeze made no audio for %s (%s): %s", chunk_id, label, take)
+                outcomes.append((index, "error", take))
+                continue
+            params = {"seed": seed}
+            silent_ms = _long_silence_ms(take)
+            if silent_ms >= _BAD_CLIP_SILENCE_MS:
+                logger.warning("Breeze returned %.1fs of near-silence for %s (%s)",
+                               silent_ms / 1000, chunk_id, label)
+                outcomes.append((index, "reject", (2, silent_ms, attempt, take, params, "near-silent audio")))
+                continue
+            heard = self._hear(checker, take, chunk_id) if checker is not None else None
+            params, verdict = self._verdict(take, unit, params, heard, chunk_id, label)
+            if verdict is None:
+                outcomes.append((index, "pass", (take, params, attempt + 1, None)))
+            else:
+                outcomes.append((index, "reject", (verdict[0], verdict[1], attempt, take, params, verdict[2])))
+        return outcomes
 
     def _speak_take(self, request_kwargs: dict, unit: str,
                     chunk_id: str) -> Tuple[AudioSegment, dict, int, Optional[str]]:
@@ -1219,7 +1344,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                       audio_format: Tuple[int, int, int]) -> None:
         """Last touches on each unit's audio before the chapter is joined (pauses are left alone).
 
-        Tone matching (Chatterbox, on unless the book turned it off): every voice is turned down
+        Tone matching (Chatterbox and Breeze, on unless the book turned it off): every voice is turned down
         wherever it comes out brighter than its own reference clip, measured over all of that
         voice's speech so far in this book (core/tone_match.py).
 
@@ -1229,7 +1354,7 @@ class OpenAITTSProvider(BaseTTSProvider):
         decoding to 16 bits clips. Adaptive delivery already guarded its own units; now every unit is.
         """
         rate, channels, width = audio_format
-        match = self._is_chatterbox_engine() and self.config.tone_match is not False
+        match = (self._is_chatterbox_engine() or self._is_breeze_engine()) and self.config.tone_match is not False
         guard = self.config.output_format in _LOSSY_FORMATS
         if channels != 1 or width != 2 or not (match or guard):
             return

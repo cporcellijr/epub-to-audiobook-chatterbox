@@ -261,6 +261,11 @@ def save_voice_gender(voice: str, gender: Optional[str], path: Optional[str] = N
     return genders
 
 
+def voice_library(engine: str) -> str:
+    """The engine whose voices an engine speaks with: Breeze clones from Chatterbox's voice files."""
+    return "chatterbox" if engine == "breeze" else engine
+
+
 def voice_gender(engine: str, voice: str, chatterbox_genders: Optional[Dict[str, str]] = None) -> str:
     """female/male/neutral for a voice of the given engine. A Chatterbox voice with no recorded
     gender is neutral: it can be suggested for anyone."""

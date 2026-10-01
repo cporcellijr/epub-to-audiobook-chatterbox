@@ -2142,3 +2142,91 @@ to be specific: the treble sounds turned up and there is a faint hiss. Neither c
 
 **Deployment.** Deployed 2026-10-01 03:17 with the queue empty; the five changed files in `/app_src`
 match the working tree, and the app starts with tone matching on and 96k. Not yet committed.
+
+## 35. Breeze TTS 2 replaces Chatterbox: a batched engine (2026-10-01)
+
+The owner asked whether newer models would help. Qwen3.8 27B for the cast LLM was dropped: its
+4-bit build (18 GB) doesn't fit the 12 GB card. OmniVoice (k2-fsa, 0.6B) was weighed and set aside
+for Breeze TTS 2 (BreezeBlue, 3B), which leads the open-weight models in Artificial Analysis's
+blind-vote arena (1,215 Elo, #6 of 100+ overall).
+
+### 35.1 Bake-off on this machine
+
+Same lines, voices and book settings on both engines; listening page in the session, samples in
+`data/diagnostics/bakeoff/`.
+- **Words:** Whisper heard every word from both engines on the test lines, whispers and shouts.
+- **Tone:** Breeze is also brighter than the clips (Adrian +4 to +9 dB from 2.9 kHz, Maya +5 to
+  +12 dB above 5 kHz), so §34's tone matching applies to it too.
+- **Designed voices:** from the cast profiles' own words, Breeze made Emera a child (354 Hz;
+  Teen.mp3, the voice she had, is 218 Hz), Charra the huskiest of three (HNR 9.2), Marielle
+  medium-low (172 Hz). Chatterbox cloned the designed clips without trouble. The owner: "the
+  generated voices are better than my uploaded", and Breeze's speech "sounds sooo much better".
+- **Speed, one request at a time:** 0.43x real time (eager path, 8.3 GiB). Its CUDA-graph fast path
+  needs 14.4 GiB; the decode-only graphs that fit gained under 10% (0.45-0.48x). Chatterbox: 2.5x.
+- **Speed, batched** through the model's own `generate()` with a list of requests, one voice:
+  1 = 0.39x, 4 = 1.38x, 8 = 1.88x, 16 = 3.94x, 32 = 7.14x real time, peak 8.2 GiB. All 24 batched
+  takes checked were word-perfect by Whisper. This is what made Breeze viable.
+- **Not usable as a clip:** Teen.mp3. Whisper hears only "Hello. Hello. …" in it, and Breeze needs a
+  clip's exact words.
+
+### 35.2 What was built
+
+- **`breeze/`: the server** (FastAPI, its own container, model volume `breeze-models`).
+  - It starts with no model and loads on demand (~26 s) or on `POST /api/load`; `POST /api/unload`
+    frees the GPU.
+  - `POST /v1/batch` groups items by template and cfg, sorts them by length and runs chunks of up to
+    32. Each chunk gets its own seed. Runaway length is capped at 3x the expected length (12.5 codec
+    frames/s, read from the tokenizer config). An out-of-memory chunk is split in half and retried.
+  - `repetition_penalty` is not passed: in `generate()` it trips a CUDA device-side assert.
+  - Breeze's code is pinned at commit 58ec70c. flash-attn isn't built: inference uses eager attention.
+- **App: engine `breeze`** (shown and made the default when `BREEZE_BASE_URL` is set).
+  - `_speak_units` now only assembles a chapter. `_unit_takes` produces the audio: per unit for
+    Chatterbox and Kokoro, unchanged, or in batches of 32 for Breeze (`_breeze_takes`).
+  - A worker thread checks one batch (near-silence, then `_verdict` with Whisper, for every take,
+    not only short ones) while the next batch generates.
+  - Failed units are sent again together with a new seed for up to two more rounds, and the best
+    take is kept, as `_speak_take` does. A unit fails the chapter only if the server never returned
+    audio for it.
+  - Tone matching and the peak guard apply to Breeze. No adaptive delivery yet: moods are to become
+    spoken instructions (phase 4).
+- **`voice_transcripts.py`:** each clip's words, transcribed once by the speech check's Whisper and
+  cached by file signature.
+- **`engine_gpu.py`:** the queue's readiness check never blocks. A background thread unloads
+  Chatterbox and loads Breeze before a Breeze book (or the reverse), and a cast analysis now unloads
+  Breeze as well as Chatterbox.
+- **Retired:** Chatterbox moved to the compose profile `chatterbox` and was stopped (image kept).
+  The app no longer depends on it at startup. Kokoro was commented out of `.env`.
+- **Written by two Sonnet subagents** from specs, reviewed here. Their open choices, kept:
+  - a unit whose every take is near-silent is kept and flagged (ranked last) rather than failing
+    the chapter;
+  - Breeze's unload before the LLM follows `LLM_UNLOAD_CHATTERBOX`;
+  - a book waits while the Breeze server is unreachable.
+
+### 35.3 Live evidence
+
+- **Server, one mixed batch:** 32 Adrian and Maya units ran at 4.98x real time; a designed voice
+  alone at cfg 4 ran at 0.22x. Order and format were right, with no errors.
+- **A real chapter**, Goblin Stepsister Obsession Chapter 1, made by the app's own generator in cast
+  mode (scratch cast):
+  - 105 units in 4 batches, all passing on the first attempt (lowest Whisper match 0.86);
+  - tone matching cut Maya by up to 7.4 dB from 3.6 kHz and Abigail by up to 3.6 dB;
+  - an M4B in 206 s for 11.1 min of audio;
+  - the same voices and unit count as Chatterbox's version of the chapter, so cast handling is
+    unchanged.
+- **Completeness**, whole chapter by Whisper against the book text: Breeze 94.9% of 1,658 words,
+  Chatterbox 95.4%. Neither drops a run of 4+ words.
+- **Pace:** Breeze reads it in 11.1 min where Chatterbox took 15.8 min, about 30% faster speech.
+  The owner's ear decides whether that's too quick; the Speed slider slows a book.
+- **Tests:** 772 pass (§34's 713, plus 59 for Breeze); the server's 19 pass on CPU.
+
+### 35.4 Not verified, and what still needs Chatterbox
+
+- **Not run yet:** a whole book through the queue (the handover, the speed estimate of 4x real
+  time, retries at scale), and a cast analysis with Breeze loaded.
+- **Still on Chatterbox, so broken while it is stopped:**
+  - voice measuring for the automatic voice picks (it speaks a test line through Chatterbox);
+  - the Voice lab's play and tune;
+  - adaptive delivery.
+  Those, designed voices for unmatched characters, and a usable clip for Teen are phases 3-4.
+- **Long clips:** "andor request.wav" and "good morning.wav" run 25 s, so every request using them
+  carries a long reference. Trimming isn't measured.
