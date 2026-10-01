@@ -94,6 +94,33 @@ def _relationship_owner(name: str) -> Optional[str]:
             return name.split(marker, 1)[0]
     return None
 
+
+_LOCAL_REFERENCE_WORDS = frozenset({
+    "adult", "attacker", "boy", "child", "companion", "customer", "doctor", "driver", "elder",
+    "elderly", "female", "friend", "guy", "guys", "girl", "guard", "individual", "kid", "lady",
+    "man", "male", "mystery", "neighbor", "nurse", "old", "one", "officer", "patient", "people",
+    "person", "policeman", "policewoman", "soldier", "stranger", "teen", "teenager", "unknown",
+    "unnamed", "visitor", "waiter", "woman", "women", "young",
+})
+_REFERENCE_FILLER = frozenset({"a", "an", "at", "in", "of", "the", "with"})
+
+
+def _reference_key(name: str) -> str:
+    """Key a chapter-local description without stripping descriptor words such as "young"."""
+    words = titled_name(name).split()
+    while words and words[0] in {"a", "an", "the"}:
+        words.pop(0)
+    return " ".join(words)
+
+
+def _local_reference(name: str) -> bool:
+    """Descriptions and relationship labels identify someone only in their current chapter."""
+    relation = re.search(r"(?:'s|’s)\s+(.+)$", name)
+    label = relation.group(1) if relation else name
+    words = _reference_key(label).split()
+    words = [word for word in words if word not in _REFERENCE_FILLER]
+    return bool(words) and all(word in _LOCAL_REFERENCE_WORDS for word in words)
+
 PROMPTS = {
     "system": (
         "You identify who speaks each line of dialogue in a passage from a novel. "
@@ -458,23 +485,30 @@ class Roster:
         self.characters: Dict[str, dict] = {}
         self.aliases: Dict[str, str] = {}  # normalized alias -> key
         self.chapter_aliases: Dict[str, str] = {}  # narrator and family references, this chapter only
+        self.local_aliases: Dict[str, str] = {}  # descriptive references, this scene only
         self.chapter_narrator: Optional[str] = None
         self._anonymous_narrators = set()
         self._replaced: Dict[str, str] = {}
         for key, character in (characters or {}).items():
             self.characters[key] = dict(character)
-            self.aliases[key] = key
+            if not _local_reference(character["name"]):
+                self.aliases[key] = key
             owner = _relationship_owner(character["name"])
             for alias in character.get("aliases", []):
                 norm = normalize_name(alias)
-                if (not family_word(alias) and norm not in _NARRATOR_REFERENCES
+                if (not family_word(alias) and not _local_reference(alias) and norm not in _NARRATOR_REFERENCES
                         and norm != normalize_name(owner or "")):
                     self.aliases[normalize_name(alias)] = key
 
     def new_chapter(self) -> None:
         """Forget chapter-local narrator and family aliases."""
         self.chapter_aliases = {}
+        self.local_aliases = {}
         self.chapter_narrator = None
+
+    def new_scene(self) -> None:
+        """Forget descriptive labels when the source explicitly starts a new scene/person."""
+        self.local_aliases = {}
 
     def set_chapter_narrator(self, narrator: Optional[str], aliases: Collection[str] = ()) -> Optional[str]:
         """Bind first-person references and supplied aliases to this chapter's resolved narrator."""
@@ -526,6 +560,8 @@ class Roster:
         found = []
         for key, character in self.characters.items():
             key_words = normalize_name(character["name"]).split() or key.split()
+            if _local_reference(character["name"]):
+                continue  # a description is never evidence for a proper name
             owner = _relationship_owner(character["name"])
             if owner and _same_person(words[0], normalize_name(owner).split()[0]):
                 continue  # "Jimmy's companion" is not the first-name character Jimmy
@@ -551,6 +587,13 @@ class Roster:
             return None
         if norm in _NARRATOR_REFERENCES:
             return self.chapter_aliases.get(norm) or self.chapter_narrator
+        reference = _reference_key(name)
+        if reference in self.local_aliases:
+            return self.local_aliases[reference]
+        if reference in self.chapter_aliases:
+            return self.chapter_aliases[reference]
+        if _local_reference(name):
+            return None
         if gender == "unknown":
             gender = title_gender(name)
         titled = titled_name(name)
@@ -584,6 +627,25 @@ class Roster:
                 if norm in _NARRATOR_REFERENCES and self.chapter_aliases.get(norm) in (None, key):
                     self.chapter_aliases[norm] = key
             return key
+        if _local_reference(name):
+            reference = _reference_key(name)
+            key = self.local_aliases.get(reference)
+            if key and gender not in ("unknown", self._gender(key)) and self._gender(key) != "unknown":
+                key = None
+            if key is None:
+                key = self._new_key(name)
+                self.characters[key] = {"name": display_name(name), "aliases": [], "gender": "unknown",
+                                        "age": "unknown", "lines": 0, "reference_scope": "chapter"}
+                if reference not in self.local_aliases:
+                    self.local_aliases[reference] = key
+            character = self.characters[key]
+            if gender in GENDERS and gender != "unknown" and character["gender"] == "unknown":
+                character["gender"] = gender
+            if age in AGES and age != "unknown" and character["age"] == "unknown":
+                character["age"] = age
+            for alias in aliases or []:
+                self._alias(key, alias)
+            return key
         key = self.resolve(name, gender)
         if gender not in GENDERS or gender == "unknown":
             gender = title_gender(name)
@@ -607,6 +669,17 @@ class Roster:
             character["age"] = age
         return key
 
+    def name_reference(self, key: str, name: str) -> None:
+        """A chapter-local description ("Rob's companion") turns out to have a name: the name becomes
+        the display name and, unlike the old label (kept as a local alias), is known in later chapters."""
+        key = self.canonical_key(key)
+        character = self.characters[key]
+        old, character["name"] = character["name"], display_name(name)
+        character.pop("reference_scope", None)
+        self._anonymous_narrators.discard(key)  # an unnamed "I" who gives their name is that person
+        self._alias(key, old)
+        self._alias(key, name)
+
     def _new_key(self, name: str) -> str:
         """The normalized name, or when someone else already has it (a "Mr. Smith" before this "Mrs.
         Smith"), the name with its titles, else a number."""
@@ -621,7 +694,14 @@ class Roster:
     def _alias(self, key: str, alias: str) -> None:
         key = self.canonical_key(key)
         norm = normalize_name(alias)
-        if not norm or self.aliases.get(norm) not in (None, key):
+        if not norm:
+            return
+        reference = _reference_key(alias)
+        if _local_reference(alias):
+            if reference in self.local_aliases or reference not in self.chapter_aliases:
+                self.local_aliases.setdefault(reference, key)
+            return
+        if self.aliases.get(norm) not in (None, key):
             return  # an alias already owned by another character stays theirs
         owner = _relationship_owner(self.characters[key]["name"])
         if owner and norm == normalize_name(owner):
@@ -660,7 +740,7 @@ class Roster:
         self._anonymous_narrators.discard(source)
         if self.chapter_narrator == source:
             self.chapter_narrator = target
-        for table in (self.aliases, self.chapter_aliases):
+        for table in (self.aliases, self.chapter_aliases, self.local_aliases):
             for norm, key in list(table.items()):
                 if key == source:
                     table[norm] = target
@@ -708,6 +788,23 @@ _SELF_NAMED = re.compile(r"(?:^|[.!?]\s+)(?:[Aa]nd\s+)?(?:[Pp]lease,?\s+)?(?:[Yy
                          r"((?:(?:Mrs?|Ms|Miss|Dr)\.?\s+)?[A-Z][\w'’-]+)")
 
 
+_ASKS_NAME = re.compile(r"your name|who are you|what do (?:they|people|we|you|folks) call you", re.I)
+_I_AM = re.compile(r"(?:I['’]m|I am)\s+([A-Z][\w'’-]+)")
+_BARE_NAME = re.compile(r"[A-Z][\w'’]+")
+
+
+def _bare_name(text: str) -> Optional[str]:
+    """The name a whole line consists of ("Dex", "T-Tom", "D-D-Dex"), stutter prefixes removed."""
+    whole = text.strip(" .,!?…\"'“”‘’")
+    parts = whole.split("-")
+    last = parts[-1]
+    # A stutter repeats the name's start ("D-D-Dex"); "Jo-Ann" is a whole hyphenated name.
+    stutter = all(re.fullmatch(r"[A-Za-z]{1,3}", p) and last.lower().startswith(p.lower()) for p in parts[:-1])
+    if _BARE_NAME.fullmatch(last) and stutter:
+        return last
+    return whole if re.fullmatch(r"[A-Z][\w'’]+(?:-[A-Z][\w'’]+)+", whole) else None
+
+
 INTRODUCTION_CONTEXT = 8  # paragraphs before a self-introduction whose speakers it may be a new name for
 
 
@@ -752,7 +849,8 @@ def merge_self_introductions(paragraphs: List[List[Segment]], result: Dict[int, 
     asks to be called, in two voices, §30), the model is asked whether that name belongs to someone
     who spoke just before; "new" (a newcomer introducing themselves) changes nothing. result is
     updated in place; family words never count."""
-    for line in (s for p in paragraphs for s in p if s.kind == DIALOGUE):
+    dialogue = [s for p in paragraphs for s in p if s.kind == DIALOGUE]
+    for n, line in enumerate(dialogue):
         speaker = result.get(line.line_id)
         if not speaker or speaker not in roster.characters:
             continue
@@ -767,15 +865,30 @@ def merge_self_introductions(paragraphs: List[List[Segment]], result: Dict[int, 
         if any(kind == DIALOGUE for style in ("single", "double")
                for kind, _ in split_paragraph(text, style)[0]):
             continue
-        for match in _SELF_NAMED.finditer(text):
-            name = match.group(1)
+        names = [match.group(1) for match in _SELF_NAMED.finditer(text)]
+        previous = dialogue[n - 1] if n else None
+        if (previous and result.get(previous.line_id) not in (None, speaker)
+                and _ASKS_NAME.search(previous.text) and _bare_name(text)):
+            names.append(_bare_name(text))  # an answer to "what's your name?" that is only the name
+        elif len(text.split()) <= 4 and _I_AM.fullmatch(text.strip(" .,!")):
+            names.append(_I_AM.fullmatch(text.strip(" .,!")).group(1))
+        for name in names:
             if family_word(name) or not usable_alias(name):
                 continue
             other = roster.resolve(name, roster.characters[speaker].get("gender", "unknown"))
+            # A speaker known only as a description or as this chapter's unnamed "I" has no name of
+            # their own to keep: the name they give wins, even when it is someone met earlier.
+            nameless = (roster.is_scoped_narrator(speaker)
+                        or roster.characters[speaker].get("reference_scope") == "chapter")
             if other is None:
-                roster._alias(speaker, name)
+                if nameless:
+                    roster.name_reference(speaker, name)  # "Rob's companion" is Dex from now on
+                else:
+                    roster._alias(speaker, name)
                 continue
-            if roster.characters[other].get("lines", 0):
+            if nameless and other != speaker:
+                other, speaker = speaker, other
+            elif roster.characters[other].get("lines", 0):
                 continue  # someone met in an earlier chapter
             if other == speaker:
                 first = min(i for i, key in result.items() if key == speaker)
@@ -786,6 +899,8 @@ def merge_self_introductions(paragraphs: List[List[Segment]], result: Dict[int, 
                     continue
                 other, speaker = speaker, target
             roster.merge(other, speaker)
+            if roster.characters[speaker].get("reference_scope") == "chapter":
+                roster.name_reference(speaker, name)
             for line_id, key in result.items():
                 if key == other:
                     result[line_id] = speaker
@@ -797,8 +912,9 @@ def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str
                  roster: Roster, chat: Chat, stats: dict, log: logging.Logger = logger, label: str = "",
                  narrator: Optional[str] = None, narrator_aliases: Collection[str] = ()) -> None:
     """Ask once more, with wider context, about the lines core.cast_review flags. A reply that names
-    someone replaces the first pass's answer; "unknown" keeps it; an unusable reply changes nothing
-    (logged, counted in stats["review_unusable"]). result is updated in place."""
+    someone replaces the first pass's answer unless the line's own text rules that character out
+    (pronoun tag of the other gender, "I said" given to a non-narrator: stats["review_rejected"]);
+    "unknown" keeps it; an unusable reply changes nothing (logged, counted in stats["review_unusable"]). result is updated in place."""
     if narrator:
         roster.set_chapter_narrator(narrator, narrator_aliases)
     flags = cast_review.flag_lines(paragraphs, result, anchors, roster.characters,
@@ -838,6 +954,12 @@ def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str
         for line_id in ids:
             if speakers.get(line_id):
                 key = roster.add(speakers[line_id])
+                broken = cast_review.hard_violation(paragraphs, line_id, key, roster.characters, narrator_key)
+                if broken:
+                    stats["review_rejected"] = stats.get("review_rejected", 0) + 1
+                    log.info(f"Cast{label}: review answer {roster.characters[key]['name']} for line {line_id} "
+                             f"rejected ({broken}); first answer kept")
+                    continue
                 if key != result.get(line_id):
                     result[line_id] = key
                     changed.append(line_id)

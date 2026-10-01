@@ -50,6 +50,23 @@ def _around(segments: List[Segment], i: int) -> Tuple[str, str]:
     return before, after
 
 
+def hard_violation(paragraphs: List[List[Segment]], line_id: int, key: Optional[str],
+                   characters: Dict[str, dict], narrator: Optional[str] = None) -> Optional[str]:
+    """Why `key` cannot speak this line by what its own text says (flag_lines' GENDER and NARRATOR
+    checks, applied to a proposed answer), else None."""
+    for segments in paragraphs:
+        for i, piece in enumerate(segments):
+            if piece.kind != DIALOGUE or piece.line_id != line_id or piece.continues:
+                continue
+            pronoun = speech_tags.tag_pronoun(*_around(segments, i))
+            gender = (characters.get(key) or {}).get("gender")
+            if pronoun in _GENDER_OF and gender in _GENDER_OF.values() and _GENDER_OF[pronoun] != gender:
+                return GENDER
+            if line_id in speech_tags.first_person_tagged(paragraphs) and narrator and key != narrator:
+                return NARRATOR
+    return None
+
+
 def flag_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]], anchors: Dict[int, str],
                characters: Dict[str, dict], narrator: Optional[str] = None) -> Dict[int, List[str]]:
     """{line id: reasons} for the lines to ask again. Anchored (tag-named) and continued lines are

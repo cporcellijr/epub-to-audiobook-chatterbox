@@ -5,7 +5,7 @@ import logging
 import unittest
 from unittest.mock import patch
 
-from audiobook_generator.core import cast_llm as cast_llm_module
+from audiobook_generator.core import cast_llm as cast_llm_module, cast_review
 from audiobook_generator.core.cast_llm import (
     PROMPTS, WINDOW_LINES, AttributionError, Roster, attribute_chapter, build_windows, parse_reply,
 )
@@ -222,10 +222,12 @@ class TestRoster(unittest.TestCase):
             restored = Roster({companion_key: {
                 "name": label, "aliases": ["Jimmy"], "gender": "male", "lines": 1
             }})
+            self.assertIsNone(restored.resolve(label))  # relationship labels are chapter-local
             companion = restored.add(label, "male")
             jimmy = restored.add("Jimmy", "male")
-            self.assertEqual(companion, companion_key)
+            self.assertNotEqual(companion, companion_key)  # a fresh chapter-local character
             self.assertNotEqual(jimmy, companion)
+            self.assertNotEqual(jimmy, companion_key)
             self.assertEqual(restored.aliases["jimmy"], jimmy)
 
     def test_words_anyone_may_be_called_are_never_aliases(self):
@@ -440,6 +442,129 @@ class TestOnePersonPerName(unittest.TestCase):
                 self.assertEqual(chat.prompts, [])
 
 
+class TestLocalReferences(unittest.TestCase):
+    """Descriptions ("the young woman") name someone only within their chapter."""
+
+    def setUp(self):
+        self.log = logging.getLogger("test-cast")
+
+    def test_a_declared_description_alias_is_the_named_character_in_its_chapter_only(self):
+        text = f'"Wait for me," said the young woman.{M}"Hurry," the young woman called.'
+        reply = _reply({1: "young woman", 2: "young woman"},
+                       [{"name": "Mara", "gender": "female", "aliases": ["young woman"]}])
+        roster = Roster()
+        lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(reply), {}, self.log)
+        self.assertEqual(lines, {1: "mara", 2: "mara"})
+        self.assertEqual(set(roster.characters), {"mara"})
+        later, _ = attribute_chapter(chapter_segments('"Please," said the young woman.'), roster,
+                                     ScriptedChat(_reply({1: "young woman"})), {}, self.log)
+        self.assertNotEqual(later[1], "mara")
+        self.assertEqual(roster.characters["mara"]["lines"], 2)
+
+    def test_the_same_description_in_two_chapters_is_two_characters(self):
+        roster = Roster()
+        first = roster.add("one of the guys", "male")
+        self.assertEqual(roster.add("One of the guys"), first)
+        roster.new_chapter()
+        self.assertNotEqual(roster.add("one of the guys", "male"), first)
+
+    def test_a_description_never_absorbs_a_proper_name(self):
+        roster = Roster()
+        man = roster.add("the man", "male")
+        ray = roster.add("Man Ray", "male")  # same first word as the description, still not it
+        self.assertNotEqual(ray, man)
+        self.assertEqual(roster._candidates("man"), [ray])
+        self.assertEqual(roster.add("the man"), man)
+
+
+class TestLaterIntroductions(unittest.TestCase):
+    """A name given in answer to "what's your name?" or "I'm X", after the speaker spoke as a description."""
+
+    def test_a_stutter_repeats_the_names_start_and_a_hyphenated_name_stays_whole(self):
+        bare = cast_llm_module._bare_name
+        self.assertEqual([bare(t) for t in ("D-D-Dex,", "T-Tom.", "Jo-Ann", "Dex!", "G-G-Dex", "dex")],
+                         ["Dex", "Tom", "Jo-Ann", "Dex", None, None])
+
+    SCENE = (f'"Look, man, I didn\'t agree to this," the man stutters to Rob.{M}'
+             f'The corridor smelled of old rain and wet wool.{M}'
+             f'"You first, tell me your name," I say to the mystery man.{M}'
+             '"D-D-Dex," he stutters.')
+    PEOPLE = [{"name": "Rob", "gender": "male"}, {"name": "Rob's companion", "gender": "male"}]
+
+    def setUp(self):
+        self.log = logging.getLogger("test-cast")
+
+    def _earlier_chapter(self, roster):
+        roster.add("Rob", "male")
+        roster.add("one of the guys", "male")
+        roster.new_chapter()
+
+    def test_a_description_learns_its_name_from_the_answer_to_a_name_question(self):
+        roster, stats = Roster(), {}
+        self._earlier_chapter(roster)
+        guy = next(k for k, c in roster.characters.items() if c["name"] == "one of the guys")
+        chat = ScriptedChat(_reply({1: "Rob's companion", 3: "Rob's companion"}, self.PEOPLE))
+        lines, _ = attribute_chapter(chapter_segments(self.SCENE), roster, chat, stats, self.log)
+        key = lines[1]
+        self.assertEqual(lines[3], key)
+        self.assertEqual(roster.characters[key]["name"], "Dex")
+        self.assertNotIn("reference_scope", roster.characters[key])
+        self.assertEqual(roster.aliases["dex"], key)
+        self.assertNotEqual(key, guy)
+        self.assertEqual(roster.characters[guy]["name"], "one of the guys")
+        roster.new_chapter()
+        self.assertEqual(roster.resolve("Dex"), key)
+        self.assertIsNone(roster.resolve("Rob's companion"))
+
+    def test_a_reply_given_to_the_name_asks_whether_it_is_the_earlier_description(self):
+        roster, stats = Roster(), {}
+        self._earlier_chapter(roster)
+        chat = ScriptedChat(_reply({1: "Rob's companion", 3: "Dex"}, self.PEOPLE + [{"name": "Dex", "gender": "male"}]),
+                            {"same_as": "Rob's companion"})
+        lines, _ = attribute_chapter(chapter_segments(self.SCENE), roster, chat, stats, self.log)
+        self.assertEqual(lines[1], lines[3])
+        self.assertEqual(roster.characters[lines[1]]["name"], "Dex")
+        self.assertEqual((stats["identity_questions"], stats["merged_introductions"]), (1, 1))
+        self.assertNotIn("dex", [k for k in roster.characters if k != lines[1]])
+
+    def test_a_bare_name_that_answers_nothing_is_not_an_introduction(self):
+        text = (f'"Look, man, I didn\'t agree to this," the man stutters to Rob.{M}'
+                f'"Hey, over here," I say to the mystery man.{M}'
+                '"Dex!" he shouts.')
+        roster, stats = Roster(), {}
+        chat = ScriptedChat(_reply({1: "Rob's companion", 3: "Rob's companion"}, self.PEOPLE))
+        lines, _ = attribute_chapter(chapter_segments(text), roster, chat, stats, self.log)
+        self.assertEqual(roster.characters[lines[1]]["name"], "Rob's companion")
+        self.assertNotIn("dex", roster.aliases)
+
+    def test_i_am_with_a_name_introduces_the_speaker(self):
+        text = f'"I\'m Dex," the man says.{M}"Nice to meet you," said Rob.'
+        roster = Roster()
+        chat = ScriptedChat(_reply({1: "the man", 2: "Rob"}, [{"name": "Rob", "gender": "male"}]))
+        lines, _ = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)
+        self.assertEqual(roster.characters[lines[1]]["name"], "Dex")
+
+    def test_an_unnamed_i_who_gives_a_known_name_becomes_that_character(self):
+        # Seen replaying a real book: the narrator's "Call me ..." line was tagged "I say", so it went
+        # to the chapter's unnamed "I", and the named narrator was folded into "The Narrator".
+        text = f'"Hello," Wren said.{M}"Call me Wren," I say.{M}"Fine," said Rob.'
+        roster = Roster()
+        chat = ScriptedChat(_reply({1: "Wren", 3: "Rob"}, [{"name": "Wren", "gender": "female"},
+                                                           {"name": "Rob", "gender": "male"}]))
+        lines, _ = attribute_chapter(chapter_segments(text), roster, chat, {}, self.log)
+        self.assertEqual(lines[2], lines[1])
+        self.assertEqual(roster.characters[lines[2]]["name"], "Wren")
+        self.assertNotIn("The Narrator", [c["name"] for c in roster.characters.values()])
+        self.assertEqual(roster.add("I"), lines[1])  # this chapter's "I" is Wren now
+
+    def test_an_unnamed_i_who_gives_a_new_name_takes_it(self):
+        text = f'"Call me Wren," I say.{M}"Fine," said Rob.'
+        roster = Roster()
+        lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(), {}, self.log)
+        self.assertEqual(roster.characters[lines[1]]["name"], "Wren")
+        self.assertFalse(roster.is_scoped_narrator(lines[1]))
+
+
 class TestAttributeChapter(unittest.TestCase):
 
     def setUp(self):
@@ -562,6 +687,49 @@ class TestReview(unittest.TestCase):
         stats = {}
         attribute_chapter(chapter_segments('"Hello," Ada smiled.'), Roster(), chat, stats, self.log)
         self.assertEqual((len(chat.prompts), stats.get("review_requests", 0)), (1, 0))
+
+
+class TestReviewIsAccountable(unittest.TestCase):
+    """A review answer the line's own text rules out never replaces the first answer."""
+
+    TEXT = f'"No! Do not!" he cries out.{M}"Quiet," said Ada.'
+    PEOPLE = [{"name": "Ada", "gender": "female"}, {"name": "Ben", "gender": "male"}]
+
+    def setUp(self):
+        self.log = logging.getLogger("test-cast")
+
+    def _run(self, first, second=None):
+        chat = ScriptedChat(*[_reply(r, self.PEOPLE) for r in (first, second) if r])
+        roster, stats = Roster(), {}
+        paragraphs = chapter_segments(self.TEXT)
+        lines, _ = attribute_chapter(paragraphs, roster, chat, stats, self.log)
+        return paragraphs, roster, stats, lines, chat
+
+    def test_a_review_answer_against_the_pronoun_tag_is_rejected(self):
+        paragraphs, roster, stats, lines, _ = self._run({1: "Ada"}, {1: "Ada"})
+        self.assertEqual((lines[1], stats["review_rejected"], stats["review_changed"]), ("ada", 1, 0))
+        flags = cast_review.flag_lines(paragraphs, lines, {}, roster.characters)
+        self.assertIn("pronoun gender", flags[1])
+
+    def test_a_review_answer_matching_the_pronoun_tag_is_accepted(self):
+        _, roster, stats, lines, _ = self._run({1: "Ada"}, {1: "Ben"})
+        self.assertEqual((lines[1], stats.get("review_rejected", 0), stats["review_changed"]), ("ben", 0, 1))
+
+    def test_a_correct_first_answer_is_never_asked_again(self):
+        _, _, stats, lines, chat = self._run({1: "Ben"})
+        self.assertEqual((lines[1], len(chat.prompts), stats.get("review_requests", 0)), ("ben", 1, 0))
+
+    def test_i_said_is_not_given_to_a_review_answer_other_than_the_narrator(self):
+        text = f'"Morning," I said.{M}"Coffee?" I said.{M}"Sure," said Ada.{M}"Fine," I said.'
+        first = {3: "Ada"}
+        chat = ScriptedChat(_reply(first, self.PEOPLE))
+        roster, stats = Roster(), {}
+        lines, _ = attribute_chapter(chapter_segments(text), roster, chat, stats, self.log, narrator="Ben")
+        self.assertEqual(set(lines[i] for i in (1, 2, 4)), {"ben"})
+        paragraphs = chapter_segments(text)
+        self.assertEqual(cast_review.hard_violation(paragraphs, 2, "ada", roster.characters, "ben"),
+                         "I-tag not the narrator")
+        self.assertIsNone(cast_review.hard_violation(paragraphs, 2, "ben", roster.characters, "ben"))
 
 
 class TestTaggedLines(unittest.TestCase):
