@@ -2820,3 +2820,56 @@ ch17, which now sit with ch17's narrator. That error class is the next prompt-tu
 model never learns that ch17's narrator is William Davis, so his voice is chosen without a name.
 
 - Tests: 928 app tests pass in the container. Not deployed yet.
+
+## 45. The remaining errors: what code could fix, and a narrator risk (2026-10-01)
+
+The 103 wrong lines left across the three test sets (You Like It Darker 93, Apex Prey 3 8, Six Wakes 2)
+were sorted by cause from the text and the model's raw replies. Evidence:
+`data/diagnostics/*/runs/{phaseA,phaseAB,w16_*}`.
+
+### 45.1 Kept
+
+- **`7545c2c`, "I told her..." is a reply.** A paragraph opening with a first-person speech verb after
+  someone's quotation had handed that quotation to the narrator. Over the three answer keys this was
+  right 2 times and wrong 12, so the rule is gone; '"...," I said, and he repeated "..."' no longer
+  gives "..." to the narrator either.
+- **`44792d3`, turn-taking.** Runs of one-quotation paragraphs between two people, anchored by a
+  tagged line, are reassigned by strict alternation when the model's answers break it. Measured
+  offline on two saved runs of each set: 5 and 8 lines fixed, none broken (one early version broke
+  two lines because a next paragraph that opens with a beat was taken as the next turn; fixed).
+
+### 45.2 Measured and not done
+
+- **A name in the line is not its speaker.** About 1 line in 10 that names someone is spoken by them
+  (self-introductions: "Polly," to "what's your name?", "Vic, please"), so it is used only to block
+  turn-taking changes, never as a rule of its own.
+- **The narrator's "twin."** In Pelley's interview the model used both "The Narrator" and "Vic Trenton";
+  of 70 lines under "Vic Trenton" 51 really are Vic's, so the two labels cannot be told apart.
+- **Long untagged interviews** (Pelley, Elgin) have no tagged line to anchor turn-taking and King
+  breaks strict alternation often; they remain the model's.
+
+### 45.3 Results and run-to-run spread
+
+| You Like It Darker run | Wrong of 910 |
+|---|---|
+| Before (`21c85fc` code, §44) | 93 (88 with turn-taking offline) |
+| Phase A live | 108; phases A+B live 100 (= offline estimate) |
+
+Removing a rule changes what the model sees, and the model's errors move: phase A fixed 25 lines and
+broke 40 elsewhere (Pelley's interview collapsed in another stretch). Single paired runs differ by
++/-15 lines for this reason, so a change must beat that margin on all three sets to count. Apex Prey 3
+and Six Wakes were unchanged (8, 2).
+
+### 45.4 Narrator risk found (not fixed)
+
+Two further runs with 16 lines per request instead of 20 (a deliberate perturbation, both rule
+variants) made **Alita Bell, a woman in Rattlesnakes, narrator of both its chapters**: 292 and 382 of
+910 wrong. When no chapter of a first-person story gets a named "I said" vote, the book-tone guess
+still decides, and it can name someone the narrator talks to. It happened in 3 of the 6 runs of this
+book (the baseline's chapter 15 too). Apex Prey 3 has not shown it because the model names Polly.
+Checked and rejected as fixes: "she converses with the I" (Polly does too, as the narrator continues
+into the next paragraph) and "most addressed person" per chapter (Polly addresses her victims). Summed
+over a story the most-addressed person points the right way (Vic 36, Polly 9 vs Jimmy 5) but with
+thin margins; this needs its own design and measurement before anything ships.
+
+- Tests: 933 app tests pass in the container. Not deployed.
