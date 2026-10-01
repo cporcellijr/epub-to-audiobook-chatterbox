@@ -50,7 +50,7 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
     path = settings["cast_file"]
     previous = cast_store.load_cast(path)  # an earlier analysis of this book: its voice picks carry over
     engine = cast_store.voice_library(settings.get("engine", "chatterbox"))
-    if previous and previous.get("engine") != engine:
+    if previous and cast_store.voice_library(previous.get("engine", "")) != engine:
         previous = None  # another engine's voices can't be used
     cast = cast_store.new_cast(key, settings["input_file"], parser.get_book_title(), parser.get_book_author(),
                                engine, settings.get("voice"), selection)

@@ -112,6 +112,23 @@ class TestAnalyseBook(unittest.TestCase):
         self.assertEqual(redone["characters"]["ada marsh"]["voice"], "Picked.wav")
         self.assertIsNone(redone["characters"]["tom"].get("voice"))
 
+    def test_breeze_reanalysis_keeps_picked_and_designed_voices(self):
+        settings = dict(self.settings, engine="breeze", auto_pick_voices=True)
+        replies = ({"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}},
+                   {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}})
+        analyse_book(settings, chat=ScriptedChat(*replies))
+        cast = cast_store.load_cast(settings["cast_file"])
+        cast["engine"] = "breeze"  # Existing casts may store the UI engine name.
+        cast["characters"]["ada marsh"].update(voice="Picked.wav", voice_picked=True)
+        cast["characters"]["tom"].update(voice="Designed.wav", voice_design={"status": "done"})
+        cast_store.save_cast(settings["cast_file"], cast)
+
+        redone = analyse_book(settings, chat=ScriptedChat(*replies))
+
+        self.assertEqual(redone["characters"]["ada marsh"]["voice"], "Picked.wav")
+        self.assertEqual(redone["characters"]["tom"]["voice"], "Designed.wav")
+        self.assertEqual(redone["characters"]["tom"]["voice_design"], {"status": "done"})
+
     def test_auto_pick_keeps_only_the_voices_the_owner_saved(self):
         replies = ({"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}}, {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}})
         analyse_book(self.settings, chat=ScriptedChat(*replies))
