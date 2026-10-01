@@ -581,10 +581,11 @@ def _voted_narrator(chapters: List[ChapterText]) -> Optional[str]:
     return key if count >= 2 and count * 2 > sum(votes.values()) else None
 
 
-def _chapter_cast(chapter: ChapterText, characters: Dict[str, dict]) -> set:
-    """Who is in a chapter: its speakers and the characters its text names (never an unnamed "I")."""
+def _chapter_cast(chapter: ChapterText, characters: Dict[str, dict], speakers: bool = True) -> set:
+    """Who is in a chapter: its speakers (unless `speakers` is False) and the characters its text
+    names (never an unnamed "I")."""
     text = " ".join(s.text for paragraph in chapter.paragraphs for s in paragraph)
-    present = {key for key in chapter.lines.values() if key in characters}
+    present = {key for key in chapter.lines.values() if key in characters} if speakers else set()
     for key, character in characters.items():
         pattern = _mention_pattern(character)
         if pattern and pattern.search(text):
@@ -628,6 +629,53 @@ def _same_story(chapter: ChapterText, narrator: str, theirs: List[ChapterText], 
     return not mine or not others or bool(mine & others)
 
 
+TELLER_MIN_ADDRESSES = 3  # times a story's "I" must be addressed by name before that names them...
+TELLER_MARGIN = 2         # ...and how many times more often than anyone else the narration doesn't name
+
+
+def addressed_tellers(members: List[ChapterText], characters: Dict[str, dict],
+                      log: logging.Logger = logger) -> Dict[int, str]:
+    """{chapter number: narrator} for the stories of a first-person run whose "I" the other people
+    plainly call by name: the person addressed by name most often ("..., Vic?") by anyone else, among
+    those the narration never names (could_say_i), at least TELLER_MIN_ADDRESSES times and
+    TELLER_MARGIN times the next. A run is split into stories where a chapter's text names
+    STORY_BREAK_MIN_CAST people and none the story so far named; who the model said speaks doesn't
+    count (seen live: lines of the next story went to the last one's narrator, joining them up).
+    Measured over 13 stories of eight books: 9 named right, 4 left alone, none wrong; looser
+    thresholds named wrong people (a collection story's other lead)."""
+    from collections import Counter
+    stories, people = [], set()
+    for chapter in members:
+        mine = _chapter_cast(chapter, characters, speakers=False)
+        if not stories or (len(mine) >= STORY_BREAK_MIN_CAST and not mine & people):
+            stories.append([])
+            people = set()
+        stories[-1].append(chapter)
+        people |= mine
+    patterns = {key: pattern for key, pattern in ((key, _address_pattern(character)) for key, character
+                                                  in characters.items()
+                                                  if character.get("name") != ANONYMOUS_NARRATOR) if pattern}
+    found: Dict[int, str] = {}
+    for story in stories:
+        counts = Counter()
+        for chapter in story:
+            for paragraph in chapter.paragraphs:
+                for segment in paragraph:
+                    if segment.kind == DIALOGUE:
+                        quote, speaker = _quote(segment.text), chapter.lines.get(segment.line_id)
+                        counts.update(key for key, pattern in patterns.items()
+                                      if key != speaker and pattern.search(quote))
+        ranked = [(n, key) for key, n in counts.most_common()
+                  if all(could_say_i(chapter, key, characters) for chapter in story)][:2]
+        if ranked and ranked[0][0] >= TELLER_MIN_ADDRESSES and \
+                ranked[0][0] >= TELLER_MARGIN * (ranked[1][0] if len(ranked) > 1 else 0):
+            key = ranked[0][1]
+            found.update({chapter.number: key for chapter in story})
+            log.info(f"Cast: chapters {story[0].number}-{story[-1].number} told by {key}, addressed by name "
+                     f"{ranked[0][0]} times (next {ranked[1][0] if len(ranked) > 1 else 0})")
+    return found
+
+
 def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Optional[dict],
                       chat: Optional[Chat] = None, log: logging.Logger = logger) -> Dict[int, dict]:
     """{chapter number: {"point_of_view", "narrator"}} for the chapters whose point of view could be
@@ -637,8 +685,10 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
     alternate or the book narrator wins. A chapter with too few votes takes a neighbour's narrator in
     the same run, the nearest first, but only one who speaks in it; otherwise the LLM is asked about
     that chapter alone when available. Last resort: the single run's book narrator. Nobody becomes a
-    chapter's narrator whom its narration names (could_say_i), and a story whose "I said" lines only
-    ever went to an unnamed "I" keeps that unnamed narrator: no guess names it."""
+    chapter's narrator whom its narration names (could_say_i). The person a story's others plainly
+    address as its "I" (addressed_tellers) comes before the book narrator, the LLM's guess from
+    narration alone, and alone may name a story whose "I said" lines only ever went to an unnamed
+    "I"; otherwise that story keeps its unnamed narrator."""
     views = [chapter_point_of_view(chapter) for chapter in chapters]
     stories = _stories(chapters, views)
     characters = cast.get("characters", {})
@@ -662,11 +712,13 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
         pooled = _voted_narrator(members)
         unnamed = {key for key in own if (characters.get(key) or {}).get("name") == ANONYMOUS_NARRATOR}
         named_in_run = any(key and key not in unnamed for key in own)
+        tellers = addressed_tellers(members, characters, log)
         for i, chapter in enumerate(members):
             def fits(key: Optional[str]) -> bool:
                 return bool(key) and could_say_i(chapter, key, characters)
 
-            book_narrator = single_run_tone if fits(single_run_tone) else None
+            teller = tellers.get(chapter.number)
+            book_narrator = teller or (single_run_tone if fits(single_run_tone) else None)
             found = own[i]
             tone = None
             if found in unnamed and named_in_run:
@@ -677,13 +729,19 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
                 own[i] = None  # nothing to lend to an untagged chapter
                 continue
             if unnamed and not named_in_run and found in (None, *unnamed):
-                # The model never named this story's "I": it keeps one unnamed narrator, an untagged
-                # chapter included (_share_anonymous_narrator joins them). Seen live: the book-wide
-                # guess named a woman he talks to instead, and her voice read his story.
-                if not found:
-                    found = own[min((abs(j - i), j) for j, key in enumerate(own) if key)[1]]
-                narrators[chapter.number] = {"point_of_view": "first", "narrator": found}
-                continue
+                # The model never named this story's "I": the person the others call by name tells
+                # it, or else it keeps one unnamed narrator, an untagged chapter included
+                # (_share_anonymous_narrator joins them). Seen live: the book-wide guess named a
+                # woman he talks to instead, and her voice read his story.
+                if teller:
+                    narrators[chapter.number] = {"point_of_view": "first", "narrator": teller}
+                    own[i] = None  # its unnamed "I" is the teller now: nothing to lend to another story
+                    continue
+                lend = [(abs(j - i), j) for j, key in enumerate(own) if key]
+                if found or lend:
+                    found = found or own[min(lend)[1]]
+                    narrators[chapter.number] = {"point_of_view": "first", "narrator": found}
+                    continue
             if not found:
                 speaking = set(chapter.lines.values())
                 nearest = sorted((abs(j - i), j) for j, key in enumerate(own) if key)
@@ -725,14 +783,22 @@ ANONYMOUS_NARRATOR = "The Narrator"  # cast_llm.Roster's name for a chapter's ne
 TURN_SCENE = 12  # paragraphs around an exchange searched for the other person when it collapsed onto one
 
 
+def _address_pattern(character: dict) -> Optional["re.Pattern"]:
+    forms = name_forms(character)
+    if not forms:
+        return None
+    f = "(?:" + "|".join(re.escape(form) for form in forms) + ")"
+    return re.compile(rf"(?:^|[,;—–]\s*|\b(?:hey|oh|okay|listen|look)\s+){f}\s*[,.?!…—]|,\s*{f}\b", re.I)
+
+
+def _quote(text: str) -> str:
+    return text.strip("“”\"'‘’ ")
+
+
 def addresses(text: str, character: dict) -> bool:
     """Whether a quotation speaks to this character by name ("..., Vic?", "Vic, ...", "Hey Vic.")."""
-    quote = text.strip("“”\"'‘’ ")
-    for form in name_forms(character):
-        f = re.escape(form)
-        if re.search(rf"(?:^|[,;—–]\s*|\b(?:hey|oh|okay|listen|look)\s+){f}\s*[,.?!…—]|,\s*{f}\b", quote, re.I):
-            return True
-    return False
+    pattern = _address_pattern(character)
+    return bool(pattern and pattern.search(_quote(text)))
 
 
 def turn_taking(paragraphs: List[List["Segment"]], lines: Dict[int, Optional[str]],

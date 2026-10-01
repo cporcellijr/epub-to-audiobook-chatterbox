@@ -5,7 +5,7 @@ import logging
 import unittest
 
 from audiobook_generator.core.cast_profiles import (
-    ChapterText, Passage, ProfileError, _ask_tone, _spread, apply_chapter_narrators, chapter_narrators, chapter_point_of_view,
+    ChapterText, Passage, ProfileError, _ask_tone, _spread, addressed_tellers, apply_chapter_narrators, chapter_narrators, chapter_point_of_view,
     character_passages, could_say_i, describe_book, drop_unsupported_accents, first_lines, name_forms, narration_passages,
     parse_profile, parse_tone, profile_cast, profile_candidates, render_excerpts, select_passages,
     turn_taking,
@@ -286,6 +286,7 @@ _FIRST_PERSON = (f"I walked her home along the river, and my hands would not sta
                  + f'"I know," I told her.{M}'
                  + f'"Stay a while," I said.{M}'
                  + f"Bettie laughed at me, and I did not mind at all. " * 10)
+_UNADDRESSED = _FIRST_PERSON.replace(", Oliver,", ",")  # the same, but nobody calls him by name
 _THIRD_PERSON = (f"The sea rose against the harbour wall while Tom mended the nets. " * 25 + M
                  + f'"Storm coming," said Tom.{M}'
                  + f'"Then we sail at dawn," he said.')
@@ -376,8 +377,8 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertEqual(len(chat.prompts), 1)
         self.assertIn("(Chapter 2)", chat.prompts[0][1]["content"])
 
-    def _anonymous_story(self, number, key):
-        return _story(number, _FIRST_PERSON, {1: "bettie", 2: key, 3: key})
+    def _anonymous_story(self, number, key, text=_UNADDRESSED):
+        return _story(number, text, {1: "bettie", 2: key, 3: key})
 
     def _anonymous_cast(self, keys, numbers):
         cast = self._cast(*numbers)
@@ -418,7 +419,7 @@ class TestChapterNarrators(unittest.TestCase):
     def test_a_story_that_only_ever_says_i_keeps_one_unnamed_narrator_whatever_the_guess(self):
         # Seen live: the model never named a story's "I", and the book-wide guess (a woman he talks to)
         # was made its narrator; her voice read his story. The guess no longer names an unnamed "I".
-        untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
+        untagged = _UNADDRESSED.replace(" I told her", "").replace(" I said", "")
         cast = self._anonymous_cast(["narrator", "narrator 2"], (1, 2))
         cast["chapters"]["h3"] = {"number": 3, "lines": {"1": "bettie", "2": "oliver", "3": "oliver"}}
         chapters = [self._anonymous_story(n, key) for n, key in zip((1, 2), ("narrator", "narrator 2"))]
@@ -431,6 +432,54 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertNotIn("narrator 2", cast["characters"])
         self.assertEqual(cast["book_tone"]["pov_key"], "narrator")
         self.assertEqual(chat.prompts, [])
+
+    def test_the_person_the_others_call_by_name_tells_a_story_that_only_says_i(self):
+        keys = ["narrator", "narrator 2", "narrator 3"]
+        cast = self._anonymous_cast(keys, (1, 2, 3))
+        chapters = [self._anonymous_story(n, key, _FIRST_PERSON) for n, key in zip((1, 2, 3), keys)]
+        chat = ScriptedChat()
+        found = chapter_narrators(cast, chapters, self._book_tone("Bettie"), chat)
+        apply_chapter_narrators(cast, chapters, found)
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3)], ["oliver"] * 3)
+        self.assertEqual([dict(c.lines) for c in chapters], [{1: "bettie", 2: "oliver", 3: "oliver"}] * 3)
+        self.assertFalse(set(keys) & set(cast["characters"]))
+        self.assertEqual(cast["book_tone"]["pov_key"], "oliver")
+        self.assertEqual(chat.prompts, [])
+
+    def test_an_untagged_story_after_one_its_teller_named_is_not_lent_its_unnamed_i(self):
+        keys = ["narrator", "narrator 2", "narrator 3"]
+        cast = self._anonymous_cast(keys, (1, 2, 3))
+        for key in ("elgin", "mabel", "dora"):
+            cast["characters"][key] = {"name": key.title(), "aliases": [], "gender": "unknown", "lines": 1}
+        text = (f"I walked into the lab at dawn and the machines hummed. " * 20 + M
+                + f'"Sit down," Elgin said.{M}"Coffee?" Mabel asked.{M}"Fine," said Dora.')
+        chapters = [self._anonymous_story(n, key, _FIRST_PERSON) for n, key in zip((1, 2, 3), keys)]
+        chapters.append(_story(4, text, {1: "elgin", 2: "mabel", 3: "dora"}))
+        cast["chapters"]["h4"] = {"number": 4, "lines": {"1": "elgin", "2": "mabel", "3": "dora"}}
+        found = chapter_narrators(cast, chapters, None)
+        self.assertEqual([found[n]["narrator"] for n in (1, 2, 3, 4)], ["oliver", "oliver", "oliver", None])
+
+    def test_a_teller_needs_three_addresses_twice_anyone_elses_and_a_narration_that_never_names_them(self):
+        def story(*extra):
+            text = _FIRST_PERSON + "".join(M + line for line in extra)
+            return [_story(n, text, {}) for n in (1, 2, 3)]
+
+        characters = {k: dict(v) for k, v in _ANTHOLOGY_CHARACTERS.items()}
+        self.assertEqual(addressed_tellers(story(), characters), {1: "oliver", 2: "oliver", 3: "oliver"})
+        self.assertEqual(addressed_tellers(story()[:2], characters), {})  # twice is not enough
+        self.assertEqual(addressed_tellers(story('"Hush, Bettie."'), characters), {})  # as often as her
+        named = story(*[f"Oliver walked on alone, as Oliver always did." for _ in range(5)])
+        self.assertEqual(addressed_tellers(named, characters), {})  # the narration calls him by name
+
+    def test_a_story_break_ignores_whom_the_model_gave_the_lines_to(self):
+        # Seen live: lines of the next story went to the last story's narrator, joining them up.
+        cast, chapters = self._collection()
+        third = _story(3, _FIRST_PERSON, dict(self.FIRST))
+        other = chapters[2]
+        chapters = chapters[:2] + [third, ChapterText(4, other.paragraphs, other.lines)]
+        for key in ("elgin", "mabel", "dora"):
+            cast["characters"][key]["name"] = key.title()
+        self.assertEqual(addressed_tellers(chapters, cast["characters"]), {1: "oliver", 2: "oliver", 3: "oliver"})
 
     def _she_is_named(self, lines, tagged_to):
         """A first-person chapter whose narration names Bettie in six paragraphs (and never Oliver),
