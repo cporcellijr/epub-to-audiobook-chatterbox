@@ -14,7 +14,7 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import speech_check, voice_design, voice_measure, voice_transcripts
+from audiobook_generator.core import engine_gpu, speech_check, voice_design, voice_measure, voice_transcripts
 from audiobook_generator.core.audiobook_generator import AudiobookGenerator
 from audiobook_generator.ui import chatterbox_ui
 
@@ -580,6 +580,63 @@ class TestDesignHandlers(Workspace):
     def _design(self, jobs=(), engine="breeze", description="A young girl.", key="emera"):
         return chatterbox_ui.design_character_voice("k", key, description, engine, list(jobs))
 
+    def _handler(self, name, queue=None):
+        ui = chatterbox_ui.build_ui(queue)
+        return next(fn.fn for fn in ui.fns.values() if getattr(fn.fn, "__name__", None) == name)
+
+    def test_custom_voice_maker_needs_no_cast_and_updates_the_library(self):
+        handler = self._handler("design_custom")
+        description = "A blue-collar mechanic with a lilting Irish accent, warm and low."
+        outputs = []
+        for engine in ("breeze", "kokoro"):
+            with patch.object(engine_gpu, "prepare_breeze"):
+                output = handler("Mara", description, engine)
+            outputs.append(output)
+            status, lab, make, own, dialogue, preview = output
+            file_name = "Mara (designed).wav"
+            self.assertIn("Mara", status)
+            self.assertEqual(lab["value"], file_name)
+            self.assertIn(file_name, [value for _, value in lab["choices"]])
+            self.assertIn(file_name, [value for _, value in own["choices"]])
+            self.assertTrue(os.path.isfile(os.path.join(self.voices, file_name)))
+            self.assertTrue(os.path.isfile(preview))
+            if engine == "breeze":
+                self.assertEqual(make["value"], file_name)
+                self.assertIn(file_name, [value for _, value in make["choices"]])
+                self.assertIn(file_name, [value for _, value in dialogue["choices"]])
+            else:
+                self.assertNotIn("value", make)
+                self.assertNotIn("choices", make)
+                self.assertNotIn("value", dialogue)
+                self.assertNotIn("choices", dialogue)
+        self.assertEqual(self.designs, [("Mara", description, "unknown", "unknown")] * 2)
+        for *_, preview in outputs:
+            if os.path.isfile(preview):
+                os.remove(preview)
+
+    def test_custom_voice_maker_validates_inputs_before_breeze_handover(self):
+        handler = self._handler("design_custom")
+        with patch.object(engine_gpu, "prepare_breeze") as prepare:
+            for name, description in (("  ", "A clear voice."), ("Mara", "  ")):
+                with self.assertRaises(gr.Error):
+                    handler(name, description, "breeze")
+        prepare.assert_not_called()
+        self.assertEqual(self.designs, [])
+
+    def test_custom_voice_maker_rejects_a_running_cast(self):
+        queue = chatterbox_ui.JobQueue(self.path("queue.json"), lambda **s: s, lambda: "log")
+        handler = self._handler("design_custom", queue)
+        job = {"status": "running", "kind": "cast", "settings": {}}
+        queue._data["jobs"].append(job)
+        try:
+            with patch.object(engine_gpu, "prepare_breeze") as prepare:
+                with self.assertRaisesRegex(gr.Error, "cast analysis"):
+                    handler("Mara", "A clear voice.", "breeze")
+            prepare.assert_not_called()
+            self.assertEqual(self.designs, [])
+        finally:
+            queue._data["jobs"].remove(job)
+
     def test_the_description_box_is_prefilled_from_the_profile_or_the_stored_design(self):
         shown = chatterbox_ui.design_description_for("k", "emera")["value"]
         self.assertEqual(shown, voice_design.describe(cast_store.load_cast(chatterbox_ui.cast_file_for("k"))["characters"]["emera"]))
@@ -717,10 +774,12 @@ class TestLayout(Workspace):
 
     def test_the_design_controls_are_wired_when_breeze_is_set_up(self):
         names = self._handlers("http://breeze:8005")
-        self.assertTrue({"design_for_character", "design_starters", "design_description_for"} <= names)
+        self.assertTrue({"design_custom", "design_for_character", "design_starters", "design_description_for"} <= names)
 
-    def test_without_breeze_there_is_no_starter_button_and_the_ui_still_builds(self):
-        self.assertNotIn("design_starters", self._handlers(""))
+    def test_without_breeze_there_are_no_design_buttons_and_the_ui_still_builds(self):
+        names = self._handlers("")
+        self.assertNotIn("design_starters", names)
+        self.assertNotIn("design_custom", names)
 
 
 if __name__ == "__main__":

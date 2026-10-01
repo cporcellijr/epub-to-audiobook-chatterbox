@@ -2220,6 +2220,22 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         return (gr.update(choices=choices), gr.update(choices=choices), gr.update(choices=own_voice_choices()),
                 gr.update(choices=dialogue_voice_choices(choices)))
 
+    def design_custom(name, description, engine) -> tuple:
+        if not (name or "").strip():
+            raise gr.Error("Give the voice a name first.")
+        if not (description or "").strip():
+            raise gr.Error("Describe the voice first.")
+        file_name, _ = design_one(name.strip(), description.strip(), "unknown", "unknown")
+        make_update, lab_update, own_update, dialogue_update = voice_lists_after_design()
+        lab_update["value"] = file_name
+        if engine in FILE_VOICE_ENGINES:
+            make_update["value"] = file_name
+        else:
+            make_update, dialogue_update = gr.update(), gr.update()
+        clip = AudioSegment.from_file(os.path.join(os.environ["TTS_VOICES_DIR"], file_name))
+        return (f"Created **{os.path.splitext(file_name)[0]}** and saved it to your voice library.",
+                lab_update, make_update, own_update, dialogue_update, _save_preview(clip))
+
     def select_job(ids: list, evt: gr.SelectData) -> tuple:
         row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
         job = next((j for j in queue.jobs() if 0 <= row < len(ids) and j["id"] == ids[row]), None)
@@ -2419,6 +2435,18 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             Log(str(web_ui.webui_log_file.absolute()), dark=True, xterm_font_size=12)
 
         with gr.Tab("Voice lab"):
+            if breeze_client.configured():
+                with gr.Group():
+                    gr.Markdown("### Create a custom voice\nDescribe how someone sounds in plain English. "
+                                "Breeze creates a sample and saves the voice for your books (about 40 s).")
+                    custom_voice_name = gr.Textbox(label="Name for your new voice")
+                    custom_voice_description = gr.Textbox(
+                        label="Describe the voice", lines=3,
+                        placeholder="An older man with a deep, slightly raspy British voice and a warm, calm manner.",
+                        info="Include age, accent, pitch, texture and delivery. No recording needed.")
+                    custom_voice_button = gr.Button("Create voice", variant="primary")
+                    custom_voice_status = gr.Markdown()
+                    custom_voice_audio = gr.Audio(label="New voice preview", autoplay=True, interactive=False)
             gr.Markdown("Try voices and tune delivery. **Save** applies the sliders to every book "
                         "(including one in progress). While a book is generating, a preview or "
                         "**Save** waits for the current chunk to finish (up to about a minute): "
@@ -2589,6 +2617,10 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         measure_button.click(measure_all, inputs=None, outputs=measure_status) \
             .then(voice_sound_text, inputs=lab_voice, outputs=lab_sound)
         if breeze_client.configured():
+            custom_voice_button.click(design_custom,
+                                      inputs=[custom_voice_name, custom_voice_description, engine],
+                                      outputs=[custom_voice_status, lab_voice, voice, delete_voice_dropdown,
+                                               dialogue_voice, custom_voice_audio])
             design_starters_button.click(design_starters, inputs=None, outputs=design_starters_status) \
                 .then(voice_lists_after_design, inputs=None,
                       outputs=[voice, lab_voice, delete_voice_dropdown, dialogue_voice])
