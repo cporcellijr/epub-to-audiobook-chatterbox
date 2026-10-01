@@ -581,6 +581,26 @@ def _voted_narrator(chapters: List[ChapterText]) -> Optional[str]:
     return key if count >= 2 and count * 2 > sum(votes.values()) else None
 
 
+def _chapter_cast(chapter: ChapterText, characters: Dict[str, dict]) -> set:
+    """Who is in a chapter: its speakers and the characters its text names (never an unnamed "I")."""
+    text = " ".join(s.text for paragraph in chapter.paragraphs for s in paragraph)
+    present = {key for key in chapter.lines.values() if key in characters}
+    for key, character in characters.items():
+        pattern = _mention_pattern(character)
+        if pattern and pattern.search(text):
+            present.add(key)
+    return {key for key in present if characters[key].get("name") != ANONYMOUS_NARRATOR}
+
+
+def _same_story(chapter: ChapterText, narrator: str, theirs: List[ChapterText], characters: Dict[str, dict]) -> bool:
+    """Whether a chapter is part of the story `narrator` tells in `theirs`: besides the narrator, it
+    shares someone with those chapters (seen live: a collection's next story, sharing nobody with
+    the last one, had been handed the last story's narrator). No one else to compare: yes."""
+    mine = _chapter_cast(chapter, characters) - {narrator}
+    others = set().union(*(_chapter_cast(c, characters) for c in theirs if c is not chapter)) - {narrator}
+    return not mine or not others or bool(mine & others)
+
+
 def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Optional[dict],
                       chat: Optional[Chat] = None, log: logging.Logger = logger) -> Dict[int, dict]:
     """{chapter number: {"point_of_view", "narrator"}} for the chapters whose point of view could be
@@ -604,9 +624,18 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
         # collection (seen live), each with its own "I".
         own = [_voted_narrator([chapter]) for chapter in members]
         pooled = _voted_narrator(members)
+        unnamed = {key for key in own if (cast.get("characters", {}).get(key) or {}).get("name") == ANONYMOUS_NARRATOR}
+        named_in_run = any(key and key not in unnamed for key in own)
         for i, chapter in enumerate(members):
             found = own[i]
             tone = None
+            if found in unnamed and named_in_run:
+                # The model left this chapter's "I" unnamed while others in the run are named: which
+                # story it belongs to is settled by who else is in it (_share_anonymous_narrator),
+                # not by asking again -- asked, the model named whoever it was offered (seen live).
+                narrators[chapter.number] = {"point_of_view": "first", "narrator": found}
+                own[i] = None  # nothing to lend to an untagged chapter
+                continue
             if not found:
                 speaking = set(chapter.lines.values())
                 nearest = sorted((abs(j - i), j) for j, key in enumerate(own) if key)
@@ -645,6 +674,44 @@ def _drop_unused(cast: dict, keys, entries: dict) -> None:
 ANONYMOUS_NARRATOR = "The Narrator"  # cast_llm.Roster's name for a chapter's never-named "I"
 
 
+STORY_BREAK_MIN_CAST = 3  # other named people a chapter needs before sharing none of them can split a story
+
+
+def _split_story_breaks(cast: dict, chapters: List[ChapterText], narrators: Dict[int, dict], entries: dict) -> set:
+    """A chapter "narrated" by someone who belongs to another story gets its own unnamed narrator.
+    Seen live: in a collection, the model gave the next story's "I said" lines to the previous story's
+    narrator, a man who is never named in it and whose people never appear in it. The signs, all
+    needed: at least STORY_BREAK_MIN_CAST other named people in the chapter, none of them in the
+    narrator's other chapters, and the narrator's name nowhere in its text. Their lines there move to
+    a new "The Narrator" of that chapter. Returns the keys whose lines changed."""
+    characters = cast.get("characters", {})
+    changed = set()
+    for chapter in chapters:
+        found = narrators.get(chapter.number) or {}
+        key, entry = found.get("narrator"), entries.get(chapter.number)
+        if found.get("point_of_view") != "first" or key not in characters or entry is None:
+            continue
+        if characters[key].get("name") == ANONYMOUS_NARRATOR:
+            continue
+        theirs = [c for c in chapters if c is not chapter and (narrators.get(c.number) or {}).get("narrator") == key]
+        mine = _chapter_cast(chapter, characters) - {key}
+        text = " ".join(s.text for paragraph in chapter.paragraphs for s in paragraph)
+        pattern = _mention_pattern(characters[key])
+        if not theirs or len(mine) < STORY_BREAK_MIN_CAST or (pattern and pattern.search(text)):
+            continue
+        if not _same_story(chapter, key, theirs, characters):
+            new = f"narrator of chapter {chapter.number}"
+            characters[new] = {"name": ANONYMOUS_NARRATOR, "aliases": [], "gender": "unknown", "age": "unknown",
+                               "lines": 0}
+            for lines in (chapter.lines, entry.get("lines", {})):
+                for line_id, speaker in lines.items():
+                    if speaker == key:
+                        lines[line_id] = new
+            found["narrator"] = entry["narrator"] = entry["narrator_reference"] = new
+            changed |= {key, new}
+    return changed
+
+
 def _share_anonymous_narrator(cast: dict, chapters: List[ChapterText], narrators: Dict[int, dict],
                               entries: dict) -> set:
     """One first-person story has one "I": a chapter whose narrator the model never named (an anonymous
@@ -670,12 +737,14 @@ def _share_anonymous_narrator(cast: dict, chapters: List[ChapterText], narrators
         # book's narrator split in two). Only a run that never names its "I" keeps an unnamed one.
         named = [(n, (narrators.get(c.number) or {}).get("narrator")) for n, (c, _) in enumerate(members)
                  if c.number not in final and (narrators.get(c.number) or {}).get("narrator") in characters]
+        theirs = {key: [members[n][0] for n, k in named if k == key] for _, key in named}
         unnamed = next(final[c.number] for c, _ in members if c.number in final)
         for n, (chapter, entry) in enumerate(members):
             old = final.get(chapter.number)
             if old is None:
                 continue
-            shared = min(named, key=lambda item: (abs(item[0] - n), item[0] > n))[1] if named else unnamed
+            fitting = [item for item in named if _same_story(chapter, item[1], theirs[item[1]], characters)]
+            shared = min(fitting, key=lambda item: (abs(item[0] - n), item[0] > n))[1] if fitting else unnamed
             if old != shared:
                 for line_id, speaker in chapter.lines.items():
                     if speaker == old:
@@ -741,6 +810,7 @@ def apply_chapter_narrators(cast: dict, chapters: List[ChapterText], narrators: 
         entry["unknown"] = sum(speaker is None for speaker in entry.get("lines", {}).values())
     if "stats" in cast:
         cast["stats"]["unknown_lines"] = sum(entry["unknown"] for entry in entries.values())
+    changed |= _split_story_breaks(cast, chapters, narrators, entries)
     changed |= _share_anonymous_narrator(cast, chapters, narrators, entries)
     for key in changed:
         characters.get(key, {}).pop("profile", None)

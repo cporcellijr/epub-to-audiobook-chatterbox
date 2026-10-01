@@ -462,6 +462,49 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertNotIn("The Narrator", chat.prompts[0][1]["content"])
         self.assertIsNone(tone["pov_key"])
 
+    def _other_story(self, mention=""):
+        """A first-person story whose "I said" lines the model gave to Oliver, with people of its own."""
+        text = (f"I walked into the lab at dawn and the machines hummed. {mention}" * 20 + M
+                + f'"Sit down," Elgin said.{M}"Why?" I asked.{M}"Because," Elgin said.{M}'
+                + f'"Coffee?" Mabel asked.{M}"Later," I said.{M}"Fine," said Dora.')
+        chapter = _story(3, text, {})
+        ids = [seg.line_id for p in chapter.paragraphs for seg in p if seg.kind == "dialogue"]
+        chapter.lines.update(dict(zip(ids, ["elgin", "oliver", "elgin", "mabel", "oliver", "dora"])))
+        return chapter
+
+    def _collection(self, mention=""):
+        cast = self._cast(1, 2, 3)
+        for key in ("elgin", "mabel", "dora"):
+            cast["characters"][key] = {"name": key.title(), "aliases": [], "gender": "unknown", "lines": 1}
+        chapters = [_story(1, _FIRST_PERSON, dict(self.FIRST)), _story(2, _FIRST_PERSON, dict(self.FIRST)),
+                    self._other_story(mention)]
+        for chapter in chapters:
+            cast["chapters"][f"h{chapter.number}"]["lines"] = {str(k): v for k, v in chapter.lines.items()}
+        return cast, chapters
+
+    def test_the_next_story_in_a_collection_gets_its_own_narrator(self):
+        # Seen live: the model gave the next story's "I said" lines to the last story's narrator.
+        cast, chapters = self._collection()
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+        narrators = [cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3)]
+        self.assertEqual(narrators[:2], ["oliver", "oliver"])
+        self.assertNotEqual(narrators[2], "oliver")
+        self.assertEqual(cast["characters"][narrators[2]]["name"], "The Narrator")
+        self.assertEqual(sorted({v for v in cast["chapters"]["h3"]["lines"].values()}),
+                         sorted({"elgin", "mabel", "dora", narrators[2]}))
+        self.assertEqual(cast["book_tone"]["pov_key"], "oliver")
+
+    def test_a_narrator_named_in_the_chapter_or_too_few_others_keeps_it(self):
+        cast, chapters = self._collection(mention="Oliver, they called me. ")
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+        self.assertEqual(cast["chapters"]["h3"]["narrator"], "oliver")
+        cast, chapters = self._collection()
+        for key in ("mabel", "dora"):
+            del cast["characters"][key]
+        chapters[2].lines.update({k: "elgin" for k, v in chapters[2].lines.items() if v in ("mabel", "dora")})
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+        self.assertEqual(cast["chapters"]["h3"]["narrator"], "oliver")  # one other person proves nothing
+
     def test_conflicting_chapter_vote_is_corrected_by_narration_only(self):
         cast, chapter, tagged = self._disputed_chapter()
         chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Polly")))
