@@ -338,8 +338,8 @@ def design_pending_voices(cast_file: str, saved_path: Optional[str] = None,
                           designer: Callable[..., Tuple[str, dict]] = design_voice) -> int:
     """Design every voice the cast marked pending, in the book's own process after Breeze is loaded and
     before the provider reads the cast. The job's snapshot (cast_file) and the saved cast it came from
-    (saved_path, default: the snapshot's key in the casts folder) both get the new voice, so the cast
-    editor shows it and later books reuse it. A failed design leaves the matcher's suggestion as the
+    (saved_path, default: the snapshot's key in the casts folder) both get the new voice while the same
+    request is pending in the saved cast. A failed design leaves the matcher's suggestion as the
     voice (status "failed" and the reason are kept). A voice the saved cast already has designed (an
     earlier queued book got there first) is adopted, not designed again. Returns how many were designed."""
     cast = cast_store.load_cast(cast_file)
@@ -353,6 +353,7 @@ def design_pending_voices(cast_file: str, saved_path: Optional[str] = None,
     saved_path = saved_path or cast_store.cast_path(cast.get("key", ""))
     designed = 0
     for key, character in pending:
+        request = dict(_design_of(character))
         saved = cast_store.load_cast(saved_path)
         theirs = ((saved or {}).get("characters") or {}).get(key)
         description = _design_of(character).get("description") or describe(character)
@@ -370,7 +371,9 @@ def design_pending_voices(cast_file: str, saved_path: Optional[str] = None,
                 _record(character, file_name, description)
                 designed += 1
         cast_store.save_cast(cast_file, cast)
-        if theirs and not theirs.get("voice_picked") and _design_of(theirs).get("status") != DONE:
+        saved = cast_store.load_cast(saved_path)
+        theirs = ((saved or {}).get("characters") or {}).get(key)
+        if theirs and not theirs.get("voice_picked") and _design_of(theirs) == request:
             theirs["voice"], theirs["voice_design"] = character["voice"], dict(character["voice_design"])
             cast_store.save_cast(saved_path, saved)
     return designed

@@ -444,6 +444,37 @@ class TestDesignPendingVoices(Workspace):
         kept = cast_store.load_cast(self.saved_path)["characters"]["emera"]
         self.assertEqual((kept["voice"], "voice_design" in kept), ("Bea.wav", False))
 
+    def test_edits_during_design_survive_in_the_saved_cast_only(self):
+        design = self._designer()
+
+        def edit_then_design(name, description, gender, age):
+            if name in ("Emera", "Bea"):
+                saved = cast_store.load_cast(self.saved_path)
+                character = saved["characters"][name.lower()]
+                if name == "Emera":
+                    character.update(voice="Owner.wav", voice_picked=True, delivery="whisper")
+                    character.pop("voice_design")
+                else:
+                    character["voice_design"] = {"status": "pending", "description": "Owner replacement."}
+                cast_store.save_cast(self.saved_path, saved)
+            return design(name, description, gender, age)
+
+        count = voice_design.design_pending_voices(self.snapshot, self.saved_path, edit_then_design)
+
+        self.assertEqual(count, 2)
+        saved = cast_store.load_cast(self.saved_path)["characters"]
+        self.assertEqual((saved["emera"]["voice"], saved["emera"]["voice_picked"],
+                          saved["emera"]["delivery"]), ("Owner.wav", True, "whisper"))
+        self.assertNotIn("voice_design", saved["emera"])
+        self.assertEqual(saved["bea"]["voice"], "Ada.wav")
+        self.assertEqual(saved["bea"]["voice_design"],
+                         {"status": "pending", "description": "Owner replacement."})
+        self.assertEqual(saved["anna"]["voice"], "Ada.wav")
+        snapshot = cast_store.load_cast(self.snapshot)["characters"]
+        self.assertEqual(snapshot["emera"]["voice"], "Emera (designed).wav")
+        self.assertEqual(snapshot["emera"]["voice_design"]["description"], "A emera.")
+        self.assertEqual(snapshot["bea"]["voice"], "Bea (designed).wav")
+
     def test_the_default_saved_cast_is_the_snapshot_s_key_in_the_casts_folder(self):
         with patch.object(cast_store, "CASTS_FOLDER", self.path("casts")), \
                 patch.object(voice_design.cast_store, "cast_path", lambda key: self.path(f"casts/{key}.json")):
