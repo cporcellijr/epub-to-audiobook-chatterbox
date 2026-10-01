@@ -508,6 +508,26 @@ class TestBreezeInTheUi(unittest.TestCase):
             with self.assertRaises(gr.Error):
                 chatterbox_ui.sample_voice("breeze", "Elena.wav", 1.0)
 
+    def test_breeze_make_and_cast_samples_use_selected_speed(self):
+        take = AudioSegment.silent(1000, frame_rate=24000)
+        make = lambda speed: chatterbox_ui.sample_voice("breeze", "Elena.wav", speed)
+        cast = lambda speed: chatterbox_ui.sample_character(None, None, "breeze", "Elena.wav", "auto", speed,
+                                                             0.7, 0.5, 0.61)
+        with patch.dict(os.environ, BASE), \
+                patch.object(voice_transcripts, "transcript", return_value="clip words"), \
+                patch.object(breeze_client, "synthesize_batch", return_value=[take]) as batch:
+            for sample in (make, cast):
+                for speed in (0.5, 1.0, 2.0):
+                    path = sample(speed)
+                    try:
+                        preview = AudioSegment.from_file(path)
+                        self.assertEqual(preview.frame_rate, 24000)
+                        self.assertAlmostEqual(len(preview) / 1000, 1 / speed, delta=0.08)
+                    finally:
+                        if os.path.exists(path):
+                            os.remove(path)
+        self.assertEqual(batch.call_count, 6)
+
 
 if __name__ == "__main__":
     unittest.main()

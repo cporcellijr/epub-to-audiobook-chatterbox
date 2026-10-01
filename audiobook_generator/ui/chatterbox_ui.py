@@ -53,7 +53,7 @@ from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.core.chatterbox_control import chatterbox_url
 from audiobook_generator.core.dialogue import dialogue_lines
 from audiobook_generator.tts_providers.openai_tts_provider import (
-    PARAGRAPH_MARK, VOICE_MODE_CAST, VOICE_MODE_DIALOGUE, VOICE_MODE_SINGLE, VOICE_MODES,
+    PARAGRAPH_MARK, VOICE_MODE_CAST, VOICE_MODE_DIALOGUE, VOICE_MODE_SINGLE, VOICE_MODES, _stretch_pcm,
 )
 from audiobook_generator.ui import library_index, web_ui
 from audiobook_generator.ui.job_queue import BOOK, CAST, DONE, FAILED, QUEUED, RUNNING, UPLOAD_KEYS, JobQueue, job_kind
@@ -347,7 +347,7 @@ def _save_preview(audio: AudioSegment) -> str:
     return path
 
 
-def _breeze_sample(voice: str) -> str:
+def _breeze_sample(voice: str, speed: float) -> str:
     """One-off Breeze sample of PREVIEW_PHRASE in a voice file, as one item of a batch."""
     if not breeze_client.configured():
         raise gr.Error("Breeze is not configured (BREEZE_BASE_URL).")
@@ -362,7 +362,9 @@ def _breeze_sample(voice: str) -> str:
         raise gr.Error(f"Could not reach Breeze: {e}")
     if isinstance(take, str):
         raise gr.Error(f"Breeze could not make the sample: {take}")
-    return _save_preview(take)
+    pcm = _stretch_pcm(take.raw_data, take.frame_rate, take.channels, take.sample_width, float(speed))
+    return _save_preview(AudioSegment(data=pcm, sample_width=take.sample_width,
+                                      frame_rate=take.frame_rate, channels=take.channels))
 
 
 def _kokoro_sample(voice: str, speed: float) -> str:
@@ -404,7 +406,7 @@ def sample_voice(engine: str, voice: str, speed: float) -> str:
     if engine == "kokoro":
         return _kokoro_sample(voice, speed)
     if engine == "breeze":
-        return _breeze_sample(voice)
+        return _breeze_sample(voice, speed)
     settings = read_saved_settings()
     return preview_voice(voice, PREVIEW_PHRASE, settings["exaggeration"], settings["cfg_weight"],
                          settings["temperature"], speed)
@@ -1422,7 +1424,7 @@ def sample_character(cast_key: Optional[str], character_key: Optional[str], engi
     if engine == "kokoro":
         return _kokoro_sample(voice, speed)
     if engine == "breeze":
-        return _breeze_sample(voice)
+        return _breeze_sample(voice, speed)
     cast = (cast_store.load_cast(cast_file_for(cast_key)) if cast_key else None) or {"characters": {}}
     character = dict(cast["characters"].get(character_key or "") or {})
     character["delivery"] = delivery_choice or "auto"
