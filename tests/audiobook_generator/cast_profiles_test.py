@@ -8,6 +8,7 @@ from audiobook_generator.core.cast_profiles import (
     ChapterText, Passage, ProfileError, _ask_tone, _spread, apply_chapter_narrators, chapter_narrators, chapter_point_of_view,
     character_passages, describe_book, drop_unsupported_accents, first_lines, name_forms, narration_passages,
     parse_profile, parse_tone, profile_cast, profile_candidates, render_excerpts, select_passages,
+    turn_taking,
 )
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
@@ -638,3 +639,36 @@ class TestChapterNarrators(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTurnTaking(unittest.TestCase):
+    """Two people take turns in paragraphs that are one bare quotation each."""
+
+    CHARACTERS = {"ada": {"name": "Ada", "aliases": []}, "tom": {"name": "Tom", "aliases": []},
+                  "kit": {"name": "Kit", "aliases": []}}
+
+    def _fix(self, text, answers):
+        paragraphs = chapter_segments(text)
+        ids = [s.line_id for p in paragraphs for s in p if s.kind == "dialogue"]
+        return turn_taking(paragraphs, dict(zip(ids, answers)), self.CHARACTERS)
+
+    def test_an_exchange_shifted_by_one_line_is_put_back(self):
+        text = M.join(['"Ready?" Ada asked.', '"Yes."', '"Then go."', '"Going."', '"Wait," Ada said.'])
+        # the model slipped one turn: Tom's "Yes." and Ada's "Then go." swapped
+        self.assertEqual(self._fix(text, ["ada", "ada", "tom", "tom", "ada"]), {2: "tom", 3: "ada"})
+
+    def test_an_exchange_collapsed_onto_one_person_gets_the_other_back(self):
+        text = M.join(['"Morning," Tom said.', 'The kettle hissed.', '"Sit," Ada said.', '"Why?"', '"Because."', '"Fine."'])
+        self.assertEqual(self._fix(text, ["tom", "ada", "ada", "ada", "ada"]), {3: "tom", 5: "tom"})
+
+    def test_left_alone_with_a_third_speaker_a_contradicting_far_end_or_a_new_beat(self):
+        third = M.join(['"Ready?" Ada asked.', '"Yes."', '"Me too."', '"Go."'])
+        self.assertEqual(self._fix(third, ["ada", "tom", "kit", "tom"]), {})
+        far = M.join(['"Ready?" Ada asked.', '"Yes."', '"Go."', '"Now," Ada said.'])
+        self.assertEqual(self._fix(far, ["ada", "ada", "ada", "ada"]), {})  # Ada twice in a row at the end
+        beat = M.join(['"One."', '"Two."', 'He nodded, and they went in. "Look," Tom said.'])
+        self.assertEqual(self._fix(beat, ["tom", "tom", "tom"]), {})
+
+    def test_a_line_never_goes_to_the_person_it_addresses(self):
+        text = M.join(['"Ready?" Ada asked.', '"Yes, Tom."', '"Go."'])
+        self.assertEqual(self._fix(text, ["ada", "ada", "ada"]), {})

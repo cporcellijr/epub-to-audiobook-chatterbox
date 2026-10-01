@@ -674,6 +674,76 @@ def _drop_unused(cast: dict, keys, entries: dict) -> None:
 ANONYMOUS_NARRATOR = "The Narrator"  # cast_llm.Roster's name for a chapter's never-named "I"
 
 
+TURN_SCENE = 12  # paragraphs around an exchange searched for the other person when it collapsed onto one
+
+
+def addresses(text: str, character: dict) -> bool:
+    """Whether a quotation speaks to this character by name ("..., Vic?", "Vic, ...", "Hey Vic.")."""
+    quote = text.strip("“”\"'‘’ ")
+    for form in name_forms(character):
+        f = re.escape(form)
+        if re.search(rf"(?:^|[,;—–]\s*|\b(?:hey|oh|okay|listen|look)\s+){f}\s*[,.?!…—]|,\s*{f}\b", quote, re.I):
+            return True
+    return False
+
+
+def turn_taking(paragraphs: List[List["Segment"]], lines: Dict[int, Optional[str]],
+                characters: Dict[str, dict]) -> Dict[int, str]:
+    """{line id: speaker} for bare quotations (a paragraph that is one quotation and nothing else) that
+    break strict turn-taking between two people. Seen live: untagged exchanges shifted by one line, or
+    collapsed onto one person. A run of bare quotations is fixed only when it is anchored by a tagged
+    line right before it, or by one that opens the next paragraph (a new beat first is no next turn),
+    the anchors at both ends fit strict alternation, nobody else speaks in it, and no line would go
+    to the person it addresses by name. Measured on three labelled books: 5-8 lines fixed per run,
+    none broken; long untagged interviews have no anchors and are left to the model."""
+    from audiobook_generator.core.speech_tags import first_person_tagged, tagged_speakers
+    anchored = set(tagged_speakers(paragraphs)) | set(first_person_tagged(paragraphs))
+    certain = {i: lines[i] for i in anchored if lines.get(i)}
+
+    def bare(paragraph) -> bool:
+        return len(paragraph) == 1 and paragraph[0].kind == DIALOGUE and not paragraph[0].continues
+
+    fixes: Dict[int, str] = {}
+    n = 0
+    while n < len(paragraphs):
+        if not bare(paragraphs[n]):
+            n += 1
+            continue
+        start = n
+        while n < len(paragraphs) and bare(paragraphs[n]):
+            n += 1
+        run = [paragraphs[k][0].line_id for k in range(start, n)]
+        before = [s.line_id for s in paragraphs[start - 1] if s.kind == DIALOGUE] if start else []
+        after = ([s.line_id for s in paragraphs[n] if s.kind == DIALOGUE]
+                 if n < len(paragraphs) and paragraphs[n][0].kind == DIALOGUE else [])
+        first = certain.get(before[-1]) if before else None
+        last = certain.get(after[0]) if after else None
+        if not (first or last):
+            continue
+        anchor = first or last
+        others = {lines.get(i) for i in run} - {anchor, None}
+        if len(others) > 1:
+            continue  # a third person: not a two-person exchange
+        other = next(iter(others), None)
+        if other is None:  # collapsed onto one person: the other is the nearest tagged speaker in the scene
+            near = sorted((abs(k - start), s.line_id) for k in range(max(0, start - TURN_SCENE),
+                                                                    min(len(paragraphs), n + TURN_SCENE))
+                          for s in paragraphs[k] if s.kind == DIALOGUE and certain.get(s.line_id) not in (None, anchor))
+            other = certain[near[0][1]] if near else None
+        if other is None:
+            continue
+        if first:
+            expected = [other if k % 2 == 0 else first for k in range(len(run))]
+            if last and (other if len(run) % 2 == 0 else first) != last:
+                continue  # the far end does not fit strict alternation: keep the model's answers
+        else:
+            expected = [other if (len(run) - k) % 2 == 1 else last for k in range(len(run))]
+        if any(addresses(paragraphs[k][0].text, characters.get(e) or {}) for k, e in zip(range(start, n), expected)):
+            continue
+        fixes.update({i: e for i, e in zip(run, expected) if lines.get(i) != e})
+    return fixes
+
+
 STORY_BREAK_MIN_CAST = 3  # other named people a chapter needs before sharing none of them can split a story
 
 

@@ -14,7 +14,7 @@ from audiobook_generator.core import chatterbox_control, engine_gpu
 from audiobook_generator.core import cast_review
 from audiobook_generator.core.cast_llm import ChatClient, Chat, Roster, attribute_chapter, llm_api_key, llm_base_url, \
     llm_model
-from audiobook_generator.core.cast_profiles import ChapterText, describe_book, profile_cast
+from audiobook_generator.core.cast_profiles import ChapterText, describe_book, profile_cast, turn_taking
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK, chapter_segments
 from audiobook_generator.utils.log_handler import setup_logging
 
@@ -42,6 +42,21 @@ def drop_empty_placeholders(cast: dict) -> None:
         owned = character.get("voice_picked") or (character.get("voice_design") or {}).get("status") == "done"
         if placeholder and not character.get("lines") and not owned and key != pov:
             del cast["characters"][key]
+
+
+def follow_turns(cast: dict, chapters: List[ChapterText]) -> None:
+    """Put back strict turn-taking in anchored two-person runs of bare quotations (cast_profiles.turn_taking)."""
+    entries = {entry.get("number"): entry for entry in cast["chapters"].values()}
+    changed = 0
+    for chapter in chapters:
+        fixes = turn_taking(chapter.paragraphs, chapter.lines, cast["characters"])
+        entry = entries.get(chapter.number, {})
+        for line_id, speaker in fixes.items():
+            chapter.lines[line_id] = speaker
+            if str(line_id) in entry.get("lines", {}):
+                entry["lines"][str(line_id)] = speaker
+        changed += len(fixes)
+    cast.setdefault("stats", {})["turn_fixes"] = changed
 
 
 def reconcile_lines(cast: dict, chapters: List[ChapterText]) -> None:
@@ -125,6 +140,7 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
                      f"{stats['unknown_lines']} of {stats['lines']} lines unknown so far, "
                      f"{stats.get('review_lines', 0)} asked again ({stats.get('review_changed', 0)} changed)")
         describe_book(cast, analysed, chat, log)
+        follow_turns(cast, analysed)
         reconcile_lines(cast, analysed)
         cast_store.refresh_cast_counts(cast)
         drop_empty_placeholders(cast)
