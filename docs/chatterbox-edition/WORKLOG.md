@@ -2713,3 +2713,57 @@ fixture and the scorer's tests. The old history is on the local branch `backup/b
   loads and summarises unchanged; no cast, queue or audio was changed. Breeze was left unloaded by
   the reruns and loads again when a book starts.
 - README: a line whose tag contradicts its speaker reads in the dialogue voice and is listed.
+
+## 43. A larger cast: Six Wakes test chapters (2026-10-01)
+
+The owner chose *Six Wakes* (Mur Lafferty) to tune attribution on a bigger cast: six crew members,
+the ship's AI, clones, and per-character flashback chapters, all in the third person.
+
+### 43.1 Test set and reference
+
+- **Chapters** (parser numbers): 5, 17, 21 and 28; 512 dialogue lines. Chosen for a crowded waking
+  scene, a 7-speaker scene, a flashback with few tags, and long untagged two-person exchanges.
+  Evidence: `data/diagnostics/six_wakes_2026-10-01` (chapter exports without predictions, the
+  reference, every run).
+- **Reference**: two Sonnet labelers worked independently from the text and agreed on all 512 lines.
+  Agreement was not taken as proof: Claude read every line where the local model disagreed, and the
+  labelers were both wrong on ch5 lines 31-32 (the speaker asks "Do you remember anything?" and
+  Joanna answers "No": Maria speaks). Excluded from the score: 7 terms quoted inside narration
+  (not speech) and 1 genuinely ambiguous line, leaving 504 scored lines.
+
+### 43.2 Findings and fixes (`2cdd6ce`)
+
+The baseline (deployed code) had 35 wrong lines, and 31 of them were identity splits, not model
+mistakes: one man as "Hiro", "Akihiro Sato", "Akihiro Sato (the clone)" and "Akihiro Sato, Ninth of
+the line"; a detective as "Detective Natalie Lo" and "Lo". In audio, up to three voices per person.
+
+- A note the model adds after a name, in brackets or after a comma, is dropped.
+- A nickname of at least 4 letters that ends a first name ("Hiro" / "Akihiro") is a candidate for the
+  same person, under the existing one-candidate and gender checks.
+- A bare surname joins the one character with that last name; a titled form ("Mrs. Marsh") or a
+  shared surname still does not.
+- A term quoted mid-sentence in narration is not speech: never asked, no speaker, narrator's voice.
+  Over the whole book this flags 28 lines, all terms or reported speech the narrator voice suits;
+  none in Apex Prey 3.
+
+### 43.3 Live results (qwen2.5:14b)
+
+| Run | Six Wakes, 504 lines | Apex Prey 3 (held out) |
+|---|---|---|
+| Baseline (`00d08b7`) | 35 wrong | 7 wrong + 1 unassigned (§42.5) |
+| Identity + quoted-term fixes | 7 wrong | identical to §42.5 |
+| + comma qualifiers (`2cdd6ce`) | **2 wrong** (ch28 lines 24-25 swapped) | identical to §42.5 |
+
+Each Six Wakes character now has one identity. Three model errors in the baseline (ch17 lines 71
+and 90, ch21 line 87) came out right after the fixes, but only because the prompts changed when the
+quoted terms stopped being asked; they are not claimed as fixed.
+
+### 43.4 What it means for prompt tuning
+
+These four chapters are now near the ceiling (2 wrong), so they cannot show whether a prompt change
+helps. Prompt tuning needs harder chapters: the low-tag ones are 29 ("Wolfgang's Story", 42 lines,
+1 tagged), 30 ("Breakdowns", 71/8), 20 ("Yadokari", 62/15) and 26 ("Paul's Story", 71/16).
+Apex Prey 3's remaining 7 errors stay the held-out check.
+
+- Tests: 926 app tests pass in the container (1 skipped: private reference check).
+- Not deployed yet.
