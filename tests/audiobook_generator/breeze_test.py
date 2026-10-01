@@ -361,12 +361,13 @@ class TestBreezeInTheUi(unittest.TestCase):
                                                 delivery_temperature=0.8, tone_match=True)
         self.assertEqual((config.model_name, config.openai_base_url), ("breeze", None))
         self.assertEqual(config.paced_unit_mode, "sentence")
-        self.assertFalse(config.adaptive_delivery)
+        self.assertTrue(config.adaptive_delivery)  # spoken voice directions, not Chatterbox's sliders
         self.assertEqual((config.delivery_exaggeration, config.delivery_cfg_weight, config.delivery_temperature),
                          (None, None, None))
         self.assertTrue(config.tone_match)
         with patch.dict(os.environ, BASE):
             self.assertFalse(chatterbox_ui.build_config(*BOOK_ARGS, "sentence", "breeze", tone_match=False).tone_match)
+            self.assertFalse(chatterbox_ui.build_config(*BOOK_ARGS, "sentence", "breeze").adaptive_delivery)
 
     def test_build_config_for_breeze_without_a_url_raises(self):
         with patch.dict(os.environ, {"BREEZE_BASE_URL": ""}):
@@ -386,12 +387,14 @@ class TestBreezeInTheUi(unittest.TestCase):
             settings = self._queue_settings(adaptive_delivery=True, delivery_exaggeration=0.7,
                                             delivery_cfg_weight=0.5, delivery_temperature=0.8)
         self.assertEqual(settings["engine"], "breeze")
-        self.assertFalse(settings["adaptive_delivery"])
+        self.assertTrue(settings["adaptive_delivery"])
         self.assertEqual((settings["delivery_exaggeration"], settings["delivery_cfg_weight"],
                           settings["delivery_temperature"]), (None, None, None))
         self.assertTrue(settings["tone_match"])
         with patch.dict(os.environ, BASE):
-            self.assertEqual(chatterbox_ui.build_config(**settings).model_name, "breeze")
+            config = chatterbox_ui.build_config(**settings)
+            self.assertEqual((config.model_name, config.adaptive_delivery), ("breeze", True))
+            self.assertFalse(self._queue_settings(adaptive_delivery=False)["adaptive_delivery"])
 
     def test_queue_settings_refuses_breeze_when_not_configured(self):
         with patch.dict(os.environ, {"BREEZE_BASE_URL": ""}):
@@ -408,7 +411,7 @@ class TestBreezeInTheUi(unittest.TestCase):
         self.assertTrue(settings["adaptive_delivery"])
         self.assertEqual(settings["delivery_exaggeration"], 0.7)
 
-    def test_engine_changed_gives_breeze_chatterbox_voices_and_hides_delivery_controls(self):
+    def test_engine_changed_gives_breeze_chatterbox_voices_and_only_the_adaptive_checkbox(self):
         files = [("Elena", "Elena.wav")]
         with patch.object(chatterbox_ui, "openai_voice_choices", return_value=files), \
                 patch.object(chatterbox_ui, "default_openai_voice", return_value="Elena.wav"), \
@@ -416,8 +419,8 @@ class TestBreezeInTheUi(unittest.TestCase):
             voice, _, _, adaptive, baseline = chatterbox_ui.engine_changed("breeze")
         kokoro.assert_not_called()
         self.assertEqual((voice["choices"], voice["value"]), (files, "Elena.wav"))
-        self.assertFalse(adaptive["visible"])
-        self.assertFalse(baseline["visible"])
+        self.assertTrue(adaptive["visible"])  # Breeze speaks the moods as voice directions
+        self.assertFalse(baseline["visible"])  # the baseline line is Chatterbox's sliders
 
     def test_breeze_shares_the_voice_lab_and_the_voice_files(self):
         self.assertEqual(chatterbox_ui._sync_if_chatterbox("Elena.wav", "breeze")["value"], "Elena.wav")

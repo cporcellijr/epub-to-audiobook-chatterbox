@@ -18,6 +18,7 @@ from pydub.generators import Sine
 
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import speech_check, tone_match
+from audiobook_generator.core.dialogue import PARAGRAPH_MARK
 from audiobook_generator.tts_providers import openai_tts_provider
 from audiobook_generator.tts_providers.openai_tts_provider import BREEZE_BATCH_SIZE, OpenAITTSProvider
 
@@ -150,10 +151,92 @@ class TestBreezeBatches(unittest.TestCase):
         self.assertIsNone(run.error)
         self.assertEqual(len(run.server.calls[0][0]), 2)  # sentence units, not one paragraph request
 
-    def test_adaptive_delivery_is_ignored(self):
-        run = _Run(self, _text(2), adaptive_delivery=True)
+    def test_adaptive_delivery_off_sends_no_instructions_whatever_the_moods(self):
+        run = _Run(self, MOODY, adaptive_delivery=False)
         self.assertIsNone(run.error)
+        self.assertTrue(all(item["instruction"] is None for items, _ in run.server.calls for item in items))
         self.assertEqual({clip["mood"] for clip in run.clips()}, {"normal"})
+        self.assertTrue(all("instruction" not in clip for clip in run.clips()))
+
+
+MOODY = (f"{_unit_text(0)}{PARAGRAPH_MARK}"
+         f"\u201cWhere are you going to be tomorrow evening?\u201d she whispered.{PARAGRAPH_MARK}"
+         f"\u201cGet out of this house right now, all of you!\u201d he shouted.{PARAGRAPH_MARK}"
+         f"\u201cI cannot believe that you would do this to me!\u201d she said.{PARAGRAPH_MARK}"
+         f"\u201cThe weather was fine all week,\u201d said Tom.")
+
+
+class TestBreezeAdaptiveDelivery(unittest.TestCase):
+    """Moods become voice directions on the batch items; the voice is still the clip's."""
+
+    def test_only_non_normal_units_carry_an_instruction(self):
+        run = _Run(self, MOODY, adaptive_delivery=True)
+        self.assertIsNone(run.error)
+        items = run.server.calls[0][0]
+        by_mood = {clip["chunk"]: clip["mood"] for clip in run.clips()}
+        self.assertEqual({"normal", "soft", "excited", "emphatic"}, set(by_mood.values()))
+        for item in items:
+            mood = by_mood[_chunk(item)]
+            self.assertEqual(item["instruction"] is None, mood == "normal", (mood, item["text"]))
+        self.assertTrue(all(item["voice"] == "Dark.wav" and item["ref_text"] == "words of Dark.wav"
+                            and item["cfg_scale"] is None for item in items))
+
+    def test_the_tags_verb_picks_the_wording(self):
+        run = _Run(self, MOODY, adaptive_delivery=True)
+        by_text = {item["text"]: item["instruction"] for item in run.server.calls[0][0]}
+        pick = lambda words: [i for t, i in by_text.items() if words in t]
+        self.assertEqual(pick("tomorrow evening"), ["Whisper this softly."])
+        self.assertEqual(pick("right now"), ["Shout this loudly and forcefully, with intense emotion."])
+        self.assertEqual(pick("believe"), ["Say this with emphasis and energy."])
+        self.assertEqual(pick("weather"), [None])
+
+    def test_the_clip_map_records_mood_and_instruction(self):
+        run = _Run(self, MOODY, adaptive_delivery=True)
+        clips = run.clips()
+        sent = {_chunk(item): item["instruction"] for item in run.server.calls[0][0]}
+        self.assertEqual(len([c for c in clips if c["mood"] != "normal"]), 3)
+        for clip in clips:
+            if clip["mood"] == "normal":
+                self.assertNotIn("instruction", clip)
+            else:
+                self.assertEqual(clip["instruction"], sent[clip["chunk"]])
+        self.assertEqual(next(c for c in clips if c["mood"] == "soft")["instruction"], "Whisper this softly.")
+
+    def test_no_gain_or_peak_change_is_applied_to_a_directed_take(self):
+        with patch(f"{PROVIDER}.delivery.guarded_gain") as gain:
+            run = _Run(self, MOODY, adaptive_delivery=True)
+        self.assertIsNone(run.error)
+        gain.assert_not_called()
+        takes = [len(AudioSegment(data=p, frame_rate=RATE, channels=1, sample_width=2)) for p in run.pieces
+                 if len(p) > 20000]
+        self.assertEqual(takes, [1000 + n for n in range(1, len(takes) + 1)])
+
+    def test_adaptive_is_active_for_breeze_only_when_the_book_asks(self):
+        self.assertTrue(_provider(adaptive_delivery=True)._adaptive_active())
+        self.assertFalse(_provider(adaptive_delivery=False)._adaptive_active())
+
+    def test_the_mood_is_logged_with_a_rejected_take(self):
+        class Checker:
+            def transcribe(self, audio):
+                return speech_check.Heard("completely different words", [])
+        with self.assertLogs(PROVIDER, level="INFO") as logs:
+            run = _Run(self, MOODY, FakeBreeze(), checker=Checker(), adaptive_delivery=True)
+        self.assertIsNone(run.error)
+        text = "\n".join(logs.output)
+        self.assertIn("mood=soft", text)
+        self.assertIn("mood=excited", text)
+
+    def test_a_directed_unit_is_retried_with_its_instruction(self):
+        def behave(item, round):
+            return AudioSegment.silent(3500, frame_rate=RATE) if item["instruction"] and round == 1 else None
+        run = _Run(self, MOODY, FakeBreeze(behave), adaptive_delivery=True)
+        self.assertIsNone(run.error)
+        resent = run.server.calls[1][0]
+        self.assertEqual(len(resent), 3)
+        self.assertTrue(all(item["instruction"] for item in resent))
+        # (The long emphatic line's fake 1 s take also fails the length check, so it is tried again.)
+        self.assertTrue(all(c["attempts"] >= 2 for c in run.clips() if c["mood"] != "normal"))
+        self.assertTrue(all(c["attempts"] == 1 for c in run.clips() if c["mood"] == "normal"))
 
 
 class TestBreezeRetries(unittest.TestCase):

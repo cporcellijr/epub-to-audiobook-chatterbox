@@ -127,6 +127,21 @@ def _has_excited_cue(text: str) -> bool:
     return bool(text) and bool(_EXCITED_CUE.search(text))
 
 
+def _cue_word(before: str, after: str, mood: str) -> Optional[str]:
+    """The speech tag's own cue word behind a soft or excited mood ("hissed", "in a whisper"),
+    lower-cased, from the same narration mood_of reads (a lead-in, then the narration after). None
+    for other moods or when the tag has none."""
+    pattern = {MOOD_SOFT: _SOFT_CUE, MOOD_EXCITED: _EXCITED_CUE}.get(mood)
+    if pattern is None:
+        return None
+    lead_in = before if before.rstrip().endswith((",", ":")) else ""
+    for text in (lead_in, after):
+        found = pattern.search(text) if text else None
+        if found:
+            return found.group(0).lower()
+    return None
+
+
 def _ends_with_exclaim(quote_text: str) -> bool:
     """True if the quotation's last sentence ends in '!', once its own trailing quote mark(s) are
     stripped ("Go now!" -> "Go now!" -> ends with '!')."""
@@ -169,9 +184,18 @@ def segment_moods(paragraphs: List[List[Segment]]) -> Dict[int, str]:
     involved): a continued line (Segment.continues) inherits the previous line's mood; narration is
     never included; anything else uses mood_of on the narration immediately around it and the
     quotation itself."""
+    return segment_moods_and_cues(paragraphs)[0]
+
+
+def segment_moods_and_cues(paragraphs: List[List[Segment]]) -> Tuple[Dict[int, str], Dict[int, str]]:
+    """segment_moods plus {line id: the speech tag's cue word} for the lines whose soft or excited
+    mood came from one ("hissed"; a line moved by '!' alone, or one with no cue, is absent). A line
+    that inherits or borrows a mood takes that cue word along, so spoken directions (breeze_instruction)
+    can name the verb."""
     moods: Dict[int, str] = {}
+    cue_words: Dict[int, str] = {}
     for segments in paragraphs:
-        cues, untagged = set(), []
+        cues, untagged = {}, []
         for i, piece in enumerate(segments):
             if piece.kind != DIALOGUE:
                 continue
@@ -185,24 +209,98 @@ def segment_moods(paragraphs: List[List[Segment]]) -> Dict[int, str]:
                 own = mood_of(before, piece.text, after)
                 if own == MOOD_NORMAL or (own == MOOD_EMPHATIC and inherited != MOOD_NORMAL):
                     own = inherited
+                    word = cue_words.get(piece.line_id - 1)
+                else:
+                    word = _cue_word(before, after, own)
                 moods[piece.line_id] = own
+                if word:
+                    cue_words[piece.line_id] = word
                 continue
             moods[piece.line_id] = mood_of(before, piece.text, after)
             cue = _cue_mood(before, after)
             if cue:
-                cues.add(cue)
+                cues.setdefault(cue, _cue_word(before, after, cue))
             elif not has_speech_tag(before, after):
                 untagged.append(piece.line_id)
+            word = _cue_word(before, after, moods[piece.line_id])
+            if word:
+                cue_words[piece.line_id] = word
         # One speaker's manner holds for the paragraph: "Tom, are you awake?" she whispered. "Don't
         # wake Mother." reads the second quotation softly too. Only quotations with no tag of their
         # own borrow it, and only when the paragraph's cues agree. A quotation's own mood is kept,
         # except that its '!' alone is outranked by a shout ("Go!" ... "Now!" he shouted).
         if len(cues) == 1:
-            lent = next(iter(cues))
+            lent, lent_word = next(iter(cues.items()))
             for line_id in untagged:
                 if moods[line_id] == MOOD_NORMAL or (moods[line_id] == MOOD_EMPHATIC and lent == MOOD_EXCITED):
                     moods[line_id] = lent
-    return moods
+                    if lent_word:
+                        cue_words[line_id] = lent_word
+    return moods, cue_words
+
+
+# ---- Breeze's spoken direction for a mood ----
+
+class CuedMood(str):
+    """A mood that remembers the speech tag's cue word behind it (`cue`). It is the mood string
+    itself, so it compares, hashes and serializes as one and the unit tuples keep their shape."""
+    cue: Optional[str] = None
+
+    def __new__(cls, mood: str, cue: Optional[str] = None):
+        made = super().__new__(cls, mood)
+        made.cue = cue
+        return made
+
+
+# One place for every instruction Breeze is given (the voice itself comes from the reference clip, so
+# these are direction, never a description of a new voice). Wording: an imperative aimed at the line,
+# "Say this ..." in the audiobook sense, plain enough for the model's instruction prompt. The
+# soft/excited rows are keyed by a stem of the speech tag's cue word, first match wins; a mood without
+# a known cue word (cast LLM moods, '!' alone, borrowed or adverb cues) gets its default.
+_BREEZE_DEFAULTS = {
+    MOOD_SOFT: "Say this softly and quietly, close to a whisper.",
+    MOOD_EXCITED: "Say this loudly and with intense emotion, as if shouting.",
+    MOOD_EMPHATIC: "Say this with emphasis and energy.",
+}
+_BREEZE_CUE_DIRECTIONS = {
+    MOOD_SOFT: (
+        ("whisper", "Whisper this softly."),
+        ("hiss", "Hiss this through clenched teeth, quietly."),
+        ("mutter", "Mutter this under your breath."),
+        ("mumble", "Mutter this under your breath."),
+        ("murmur", "Murmur this softly and quietly."),
+        ("breathed", "Breathe this out softly, barely above a whisper."),
+        ("under", "Say this under your breath, very quietly."),
+    ),
+    MOOD_EXCITED: (
+        ("scream", "Scream this at the top of your lungs, raw with fear and urgency."),
+        ("shriek", "Shriek this at the top of your lungs, raw with fear and urgency."),
+        ("roar", "Roar this in a deep, booming voice, furious and forceful."),
+        ("bellow", "Roar this in a deep, booming voice, furious and forceful."),
+        ("yell", "Yell this loudly and forcefully."),
+        ("shout", "Shout this loudly and forcefully, with intense emotion."),
+        ("cried", "Cry this out loudly, with raw emotion."),
+        ("exclaim", "Exclaim this loudly and excitedly."),
+        ("furious", "Say this furiously, loudly, raw with anger."),
+        ("angr", "Say this angrily, loudly and forcefully."),
+    ),
+}
+
+
+def breeze_instruction(mood: str, unit_text: str, cue: Optional[str] = None) -> Optional[str]:
+    """The voice direction Breeze speaks one unit with, or None for normal speech (and any unknown
+    mood). `cue` is the speech tag's cue word for the unit's line (segment_moods_and_cues); a known
+    verb gets its own direction, otherwise the mood's default applies. Every non-normal unit is
+    directed whatever its length: `unit_text` is not used yet, it is here so a short-line rule can
+    live in this one place if listening shows Breeze needs one."""
+    default = _BREEZE_DEFAULTS.get(mood)
+    if default is None:
+        return None
+    word = (cue or "").lower()
+    for stem, direction in _BREEZE_CUE_DIRECTIONS.get(mood, ()):
+        if stem in word:
+            return direction
+    return default
 
 
 # ---- the book's baseline: a config override, else Chatterbox's saved defaults, else APPROVED_BASELINE ----

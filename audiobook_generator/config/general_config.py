@@ -50,7 +50,7 @@ class GeneralConfig:
         self.voice_mode = getattr(args, 'voice_mode', None)
         self.dialogue_voice = getattr(args, 'dialogue_voice', None)
         self.cast_file = getattr(args, 'cast_file', None)
-        # Adaptive delivery (Chatterbox only): whispered/shouted-style dialogue (by rule, or the
+        # Adaptive delivery (Chatterbox sliders; Breeze spoken directions): whispered/shouted-style dialogue (by rule, or the
         # cast's saved moods in cast mode) is read softer/more excited around this book's baseline
         # sliders. The three delivery_* sliders are None = use Chatterbox's saved generation
         # defaults (today's behaviour); when any is set, every request sends the resolved baseline

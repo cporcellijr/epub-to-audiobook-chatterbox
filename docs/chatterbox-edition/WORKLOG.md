@@ -2273,3 +2273,41 @@ random artifacts): 677 units, 49 min of audio, cast mode, through the queue.
 - **Tests:** 828 pass (§35's 772, plus 56).
 - **Not verified live:** a book start with a pending design, the starter-voices run (about 15 min),
   and the pitch limits on male and low female voices.
+
+## 37. Moods as spoken direction for Breeze; three clips archived (2026-10-01)
+
+### 37.1 Adaptive delivery on Breeze (phase 4; written by a Sonnet subagent, reviewed here)
+
+- A dialogue unit whose mood isn't normal goes to Breeze with an instruction and still clones the
+  character's voice; normal units stay plain. The server batches directed units apart from plain
+  ones (cfg 4 against 1), and they cost about twice as much.
+- **Wording:** `delivery.breeze_instruction(mood, text, cue)`. Each mood has a default:
+  - soft: "Say this softly and quietly, close to a whisper."
+  - excited: "…loudly and with intense emotion, as if shouting."
+  - emphatic: "…with emphasis and energy."
+  A rule cue's verb picks a closer one: whisper, hiss, mutter or mumble, murmur, breathed,
+  scream or shriek, roar or bellow, yell, shout, cried, exclaim, furiously, angrily.
+- **How the verb gets there:** `segment_moods_and_cues` carries the speech-tag verb through to
+  `CuedMood`, a str subclass. The cast LLM's moods have no verb and get the default.
+- **No gain for Breeze:** the model sets loudness, and the peak guard still caps it. Every directed
+  unit is directed whatever its length, and the clip map records the mood and instruction.
+- **Live**, 7 lines, plain against directed, Maya and Michael. Whisper matched 1.00 on all 14.
+  Directed loudness against plain:
+  - whispered -11 dB, muttered -15 dB, hissed unchanged;
+  - shouted +1 dB, screamed +10 dB, roared +18 dB;
+  - a plain "!" -5 dB.
+  The directed roar stretches its line from 3.4 to 7.1 s. Left to the owner's ear: how quiet the
+  whispers are (about -37 dB against about -25 dB for plain speech), and the long roar.
+- **Tests:** 846 pass (§36's 828, plus 18).
+
+### 37.2 Archived clips
+
+At the owner's request, love poem.wav, andor request.wav and Teen.mp3 moved to
+`C:\Server\stacks\chatterbox\voices_archive` (out of the library, not deleted), and their
+measurements and genders were dropped.
+- 19 characters in 11 saved casts used them; the casts were backed up first to
+  `data/cast_backups/before-voice-archive-2026-10-01`.
+- Emera got `Emera (designed).wav`. Every other character got a fallback suggestion plus a pending
+  design, except Andrew (Apex Prey 2), who has no profile to describe.
+- Forbidden Fire 2's saved narrator voice was one of the clips.
+- The owner is re-analysing every cast anyway.

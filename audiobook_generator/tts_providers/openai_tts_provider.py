@@ -743,7 +743,7 @@ class OpenAITTSProvider(BaseTTSProvider):
         analysis) -- the same precedence core.cast_llm.attribute_chapter applies at analysis time.
         """
         paragraphs = chapter_segments(text)
-        rule_moods = delivery.segment_moods(paragraphs)
+        rule_moods, rule_cues = delivery.segment_moods_and_cues(paragraphs)
         cast_moods: dict = {}
         if self.cast is not None:
             chapter = cast_store.chapter_moods(self.cast, hashlib.sha1(text.encode("utf-8")).hexdigest())
@@ -755,7 +755,8 @@ class OpenAITTSProvider(BaseTTSProvider):
                 return delivery.MOOD_NORMAL
             rule_mood = rule_moods.get(piece.line_id, delivery.MOOD_NORMAL)
             if rule_mood != delivery.MOOD_NORMAL:
-                return rule_mood
+                # The speech tag's verb rides along for Breeze's spoken direction.
+                return delivery.CuedMood(rule_mood, rule_cues.get(piece.line_id))
             return cast_moods.get(piece.line_id, delivery.MOOD_NORMAL)
         return mood_of
 
@@ -771,7 +772,9 @@ class OpenAITTSProvider(BaseTTSProvider):
         return self.config.model_name == "breeze"
 
     def _adaptive_active(self) -> bool:
-        return bool(self.config.adaptive_delivery) and self._is_chatterbox_engine()
+        """Adaptive delivery is on for this book and the engine has a way to use it: Chatterbox's
+        sliders and gain, or Breeze's spoken direction (Kokoro has neither)."""
+        return bool(self.config.adaptive_delivery) and (self._is_chatterbox_engine() or self._is_breeze_engine())
 
     def _has_custom_baseline(self) -> bool:
         return any(value is not None for value in
@@ -934,7 +937,7 @@ class OpenAITTSProvider(BaseTTSProvider):
 
         Single voice mode sends exactly the units of paced_units() with the one configured voice;
         the other voice modes build units inside the narration/dialogue segments (voiced_units)
-        and send each with its own voice. Adaptive delivery (Chatterbox only) always builds units
+        and send each with its own voice. Adaptive delivery (Chatterbox and Breeze) always builds units
         inside segments (single voice mode included, with the narrator voice for every segment) so
         each unit can carry its segment's mood.
         """
@@ -986,8 +989,9 @@ class OpenAITTSProvider(BaseTTSProvider):
 
         Producing a unit's audio is separate from assembling the chapter: Chatterbox and Kokoro make
         takes one request at a time, Breeze makes them in batches, and the assembly below is the same
-        for all of them. Adaptive delivery (Chatterbox only) applies the unit's mood preset's gain plus
-        the peak guard to the decoded audio before it is joined with the pauses.
+        for all of them. Adaptive delivery for Chatterbox applies the unit's mood preset's gain plus
+        the peak guard to the decoded audio before it is joined with the pauses (Breeze is directed
+        in its request instead, see _breeze_takes).
         """
         speed = float(self.config.speed or 1.0)
         sentence_gap_ms = int(self.config.sentence_pause_ms or 0)
@@ -1011,7 +1015,7 @@ class OpenAITTSProvider(BaseTTSProvider):
             audio, params, attempts, flagged = take
             if sentence_count > 1 and sentence_gap_ms > 0:
                 audio = _stretch_sentence_gaps(audio, sentence_count - 1, sentence_gap_ms)
-            if adaptive:
+            if adaptive and self._is_chatterbox_engine():  # Breeze's model does its own loudness
                 audio = delivery.guarded_gain(audio, delivery.unit_preset(
                     mood, self._voice_baseline(speaker, unit, baseline), unit)[3])
             if audio_format is None:
@@ -1033,13 +1037,14 @@ class OpenAITTSProvider(BaseTTSProvider):
             if mapped:
                 clip_entries.append({
                     "chunk": number, "text_sha1": hashlib.sha1(unit.encode("utf-8")).hexdigest(),
-                    "text_length": len(unit), "voice": voice, "mood": mood,
+                    "text_length": len(unit), "voice": voice, "mood": str(mood),
                     "start_ms": round(start_frame * 1000 / audio_format[0] / speed),
                     "end_ms": round(timeline_frames * 1000 / audio_format[0] / speed),
                     "seed": params.get("seed"), "attempts": attempts,
                     **({"context_trim_ms": params["_context_trim_ms"]}
                        if "_context_trim_ms" in params else {}),
                     **({"match": params["_match"]} if "_match" in params else {}),
+                    **({"instruction": params["_instruction"]} if params.get("_instruction") else {}),
                     "settings": {key: params[key] for key in ("exaggeration", "cfg_weight", "temperature")
                                  if key in params},
                     **({"flagged": flagged} if flagged else {}),
@@ -1107,18 +1112,26 @@ class OpenAITTSProvider(BaseTTSProvider):
         more than one batch ahead of the checks. Units that fail are sent again together, in new
         batches with a new seed, for up to _BAD_CLIP_RETRIES more rounds; the best take is kept
         when none passes (as _speak_take does), and a unit fails the chapter only when the server
-        never made any audio for it."""
+        never made any audio for it.
+
+        With adaptive delivery on, every unit whose mood is not normal is sent with its voice
+        direction (delivery.breeze_instruction), still cloning its voice; normal units stay plain.
+        Short lines are directed like any other: Breeze is autoregressive too, but nothing in its
+        server's behaviour calls for a cut-off yet, and a live listening test decides."""
         total = len(units)
+        adaptive = self._adaptive_active()
         ids = [f"chapter-{audio_tags.idx}_{audio_tags.title}_chunk_{n}_of_{total}" for n in range(1, total + 1)]
         items = []
-        for number, (_, unit, _, _, voice, _, _) in enumerate(units):
+        for number, (_, unit, _, _, voice, mood, _) in enumerate(units):
             ref_text = voice_transcripts.transcript(voice)
             if not ref_text:
                 raise ValueError(f"Breeze needs the words spoken in the voice clip {voice} and could not get "
                                  "them (the speech check's Whisper model, SPEECH_CHECK_MODEL, transcribes it)")
             # The EPUB's quote repairs are not specific to Chatterbox.
+            instruction = (delivery.breeze_instruction(mood, unit, getattr(mood, "cue", None))
+                           if adaptive else None)
             items.append({"id": ids[number], "text": _chatterbox_input(unit), "voice": voice,
-                          "ref_text": ref_text, "instruction": None, "cfg_scale": None})
+                          "ref_text": ref_text, "instruction": instruction, "cfg_scale": None})
         checker = speech_check.get()
         kept: dict = {}                            # unit index -> the take that passed
         rejected = {n: [] for n in range(total)}   # unit index -> (kind, badness, attempt, audio, params, reason)
@@ -1137,7 +1150,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                     logger.info("Breeze %s, batch %d of %d: %d units, seed=%d", label, number, len(batches),
                                 len(batch), seed)
                     takes = breeze_client.synthesize_batch([items[i] for i in batch], seed)
-                    futures.append(checks.submit(self._check_breeze_batch, batch, takes, units, ids, seed,
+                    futures.append(checks.submit(self._check_breeze_batch, batch, takes, units, items, ids, seed,
                                                  attempt, label, checker))
                 results = [future.result() for future in futures]
             pending = []
@@ -1167,12 +1180,14 @@ class OpenAITTSProvider(BaseTTSProvider):
             takes.append((audio, params, _BAD_CLIP_RETRIES + 1, reason))
         return takes
 
-    def _check_breeze_batch(self, batch: List[int], takes: list, units: List[tuple], ids: List[str], seed: int,
-                            attempt: int, label: str, checker) -> list:
+    def _check_breeze_batch(self, batch: List[int], takes: list, units: List[tuple], items: List[dict],
+                            ids: List[str], seed: int, attempt: int, label: str, checker) -> list:
         """(unit index, outcome, detail) for each take of one batch, run in the checking thread:
         "error" (detail: the server's message), "pass" (detail: the finished take) or "reject"
         (detail: the tuple _breeze_takes ranks the unit's rejected takes by). A near-silent take
-        ranks last, so it is kept only when nothing else exists."""
+        ranks last, so it is kept only when nothing else exists. A directed take's instruction goes
+        into its params (the clip map records it), and a rejected one is logged with its mood so a
+        listening test can see whether whispers or shouts fail the checks more often."""
         outcomes = []
         for index, take in zip(batch, takes):
             unit, chunk_id = units[index][1], ids[index]
@@ -1180,11 +1195,14 @@ class OpenAITTSProvider(BaseTTSProvider):
                 logger.warning("Breeze made no audio for %s (%s): %s", chunk_id, label, take)
                 outcomes.append((index, "error", take))
                 continue
+            mood = units[index][5]
             params = {"seed": seed}
+            if items[index]["instruction"]:
+                params["_instruction"] = items[index]["instruction"]
             silent_ms = _long_silence_ms(take)
             if silent_ms >= _BAD_CLIP_SILENCE_MS:
-                logger.warning("Breeze returned %.1fs of near-silence for %s (%s)",
-                               silent_ms / 1000, chunk_id, label)
+                logger.warning("Breeze returned %.1fs of near-silence for %s (%s, mood=%s)",
+                               silent_ms / 1000, chunk_id, label, mood)
                 outcomes.append((index, "reject", (2, silent_ms, attempt, take, params, "near-silent audio")))
                 continue
             heard = self._hear(checker, take, chunk_id) if checker is not None else None
@@ -1192,6 +1210,7 @@ class OpenAITTSProvider(BaseTTSProvider):
             if verdict is None:
                 outcomes.append((index, "pass", (take, params, attempt + 1, None)))
             else:
+                logger.info("Breeze rejected %s (%s, mood=%s): %s", chunk_id, label, mood, verdict[2])
                 outcomes.append((index, "reject", (verdict[0], verdict[1], attempt, take, params, verdict[2])))
         return outcomes
 

@@ -12,7 +12,7 @@ from pydub import AudioSegment
 from audiobook_generator.core import delivery
 from audiobook_generator.core.delivery import (
     APPROVED_BASELINE, MOOD_EMPHATIC, MOOD_EXCITED, MOOD_NORMAL, MOOD_SOFT, Baseline, mood_of, peak_guard, preset,
-    saved_chatterbox_defaults, segment_moods,
+    saved_chatterbox_defaults, segment_moods, segment_moods_and_cues,
 )
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
 
@@ -228,6 +228,83 @@ class TestParagraphMood(unittest.TestCase):
     def test_a_cue_does_not_cross_into_the_next_paragraph(self):
         text = f'\u201cHush,\u201d she whispered.{M}\u201cWhat?\u201d'
         self.assertEqual(self.moods(text), {1: "soft", 2: "normal"})
+
+
+class TestSegmentCues(unittest.TestCase):
+    """The speech tag's cue word travels with a line's mood, for Breeze's per-verb directions."""
+
+    def _cues(self, text):
+        return segment_moods_and_cues(chapter_segments(text))[1]
+
+    def test_the_tags_verb_is_found_after_or_before_the_line(self):
+        self.assertEqual(self._cues('"Shh," she Hissed.'), {1: "hissed"})
+        self.assertEqual(self._cues('He roared, "Get out!"'), {1: "roared"})
+        self.assertEqual(self._cues('"Go," she said in a whisper.'), {1: "in a whisper"})
+
+    def test_no_cue_word_for_normal_or_punctuation_only_lines(self):
+        self.assertEqual(self._cues(f'"Fine," she said.{M}"Get out!" she said.'), {})
+
+    def test_moods_are_the_same_as_segment_moods(self):
+        text = f'"Tom?" she whispered. "Quiet."{M}"Go!" he shouted.{M}"Now!" she said.{M}He hissed, "Stay,{M}"down!"'
+        self.assertEqual(segment_moods_and_cues(chapter_segments(text))[0], segment_moods(chapter_segments(text)))
+
+    def test_a_borrowed_mood_borrows_the_cue_word(self):
+        self.assertEqual(self._cues('"Tom?" she muttered. "Do not wake Mother."'), {1: "muttered", 2: "muttered"})
+
+    def test_a_continued_line_inherits_the_cue_word_or_takes_its_own(self):
+        self.assertEqual(self._cues(f'He hissed, "Stay down, I mean it,{M}"and stay quiet."'),
+                         {1: "hissed", 2: "hissed"})
+        self.assertEqual(self._cues(f'He hissed, "Stay down, I mean it,{M}"and run!" he shouted.'),
+                         {1: "hissed", 2: "shouted"})
+
+
+class TestBreezeInstruction(unittest.TestCase):
+
+    def test_normal_and_unknown_moods_are_not_directed(self):
+        self.assertIsNone(delivery.breeze_instruction(MOOD_NORMAL, "Hello there, friend."))
+        self.assertIsNone(delivery.breeze_instruction(MOOD_NORMAL, "Hello there, friend.", "whispered"))
+        self.assertIsNone(delivery.breeze_instruction("sleepy", "Hello there, friend."))
+
+    def test_each_mood_has_a_default_direction(self):
+        self.assertEqual(delivery.breeze_instruction(MOOD_SOFT, "Hello."),
+                         "Say this softly and quietly, close to a whisper.")
+        self.assertEqual(delivery.breeze_instruction(MOOD_EXCITED, "Hello."),
+                         "Say this loudly and with intense emotion, as if shouting.")
+        self.assertEqual(delivery.breeze_instruction(MOOD_EMPHATIC, "Hello."), "Say this with emphasis and energy.")
+
+    def test_a_known_verb_gets_its_own_direction(self):
+        soft = {"whispered": "Whisper this softly.", "HISSED": "Hiss this through clenched teeth, quietly.",
+                "muttered": "Mutter this under your breath.", "mumbled": "Mutter this under your breath.",
+                "in a whisper": "Whisper this softly.",
+                "under his breath": "Say this under your breath, very quietly."}
+        for cue, expected in soft.items():
+            self.assertEqual(delivery.breeze_instruction(MOOD_SOFT, "Hello.", cue), expected, cue)
+        excited = {"screamed": "Scream", "shrieked": "Shriek", "roared": "Roar", "bellowed": "Roar",
+                   "yelled": "Yell", "shouted": "Shout", "cried out": "Cry", "exclaimed": "Exclaim",
+                   "furiously": "Say this furiously", "angrily": "Say this angrily"}
+        for cue, start in excited.items():
+            self.assertTrue(delivery.breeze_instruction(MOOD_EXCITED, "Hello.", cue).startswith(start), cue)
+
+    def test_an_unlisted_cue_or_one_of_the_other_moods_falls_back_to_the_default(self):
+        self.assertEqual(delivery.breeze_instruction(MOOD_SOFT, "Hello.", "softly"),
+                         delivery.breeze_instruction(MOOD_SOFT, "Hello."))
+        self.assertEqual(delivery.breeze_instruction(MOOD_SOFT, "Hello.", "shouted"),
+                         delivery.breeze_instruction(MOOD_SOFT, "Hello."))
+        self.assertEqual(delivery.breeze_instruction(MOOD_EMPHATIC, "Hello!", "whispered"),
+                         "Say this with emphasis and energy.")
+
+    def test_every_direction_is_a_short_sentence(self):
+        cues = [None, *(stem for rows in delivery._BREEZE_CUE_DIRECTIONS.values() for stem, _ in rows)]
+        for mood in (MOOD_SOFT, MOOD_EXCITED, MOOD_EMPHATIC):
+            for cue in cues:
+                text = delivery.breeze_instruction(mood, "Hello.", cue)
+                self.assertTrue(text.endswith(".") and len(text) < 80, text)
+
+    def test_a_cued_mood_is_still_its_mood_string(self):
+        mood = delivery.CuedMood(MOOD_SOFT, "hissed")
+        self.assertEqual((mood, mood.cue, {mood: 1}[MOOD_SOFT]), (MOOD_SOFT, "hissed", 1))
+        self.assertEqual(delivery.breeze_instruction(mood, "Hello.", mood.cue),
+                         "Hiss this through clenched teeth, quietly.")
 
 
 class TestSavedChatterboxDefaults(unittest.TestCase):

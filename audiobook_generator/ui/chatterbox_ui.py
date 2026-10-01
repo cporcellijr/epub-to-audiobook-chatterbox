@@ -690,8 +690,9 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
     paragraph mode's gap detector was tuned on Chatterbox audio and saves nothing on a server this
     fast (see the Narration units info text); delivery is ignored entirely for Kokoro.
 
-    Breeze is the same: sentence units, no delivery sliders or adaptive delivery (moods come later as
-    spoken instructions), tone matching as passed, and no OpenAI endpoint (it has its own client).
+    Breeze is the same except that adaptive delivery is kept as passed (moods become spoken voice
+    directions; the delivery sliders are Chatterbox's and stay unset), tone matching as passed, and
+    there is no OpenAI endpoint (it has its own client).
 
     Raises ValueError if engine is "kokoro" but KOKORO_BASE_URL isn't configured (or "breeze" without
     BREEZE_BASE_URL); queue_settings
@@ -746,7 +747,7 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
         config.model_name = "breeze"
         config.openai_base_url = None
         config.paced_unit_mode = "sentence"
-        config.adaptive_delivery = False
+        config.adaptive_delivery = bool(adaptive_delivery)
         config.delivery_exaggeration = config.delivery_cfg_weight = config.delivery_temperature = None
         config.tone_match = bool(tone_match)
     else:
@@ -938,7 +939,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         "log_level": log_level, "paced_unit_mode": paced_unit_mode or "sentence",
         "engine": engine,
         "voice_mode": voice_mode, "dialogue_voice": dialogue_voice or None, "cast_file": queued_cast_file,
-        "adaptive_delivery": bool(adaptive_delivery) and engine == "chatterbox",
+        "adaptive_delivery": bool(adaptive_delivery) and engine != "kokoro",
         "delivery_exaggeration": delivery_exaggeration if engine == "chatterbox" else None,
         "delivery_cfg_weight": delivery_cfg_weight if engine == "chatterbox" else None,
         "delivery_temperature": delivery_temperature if engine == "chatterbox" else None,
@@ -2055,8 +2056,8 @@ def engine_changed(engine: str) -> tuple:
     """Switching the Make tab's engine swaps the Voice, Dialogue voice and cast-editor voice
     dropdowns to that engine's own choices and default (Chatterbox's file list, or Kokoro's
     English voices from its live API; Breeze clones the same voice files as Chatterbox), and shows
-    the adaptive delivery checkbox and its baseline line only while Chatterbox is selected (delivery is
-    ignored entirely for Kokoro and Breeze)."""
+    the adaptive delivery checkbox for Chatterbox and Breeze (Breeze speaks the moods as voice
+    directions) but its baseline line only for Chatterbox: Kokoro has no delivery at all."""
     if engine == "kokoro":
         choices, default = kokoro_voices_and_default()
     else:
@@ -2064,7 +2065,8 @@ def engine_changed(engine: str) -> tuple:
         default = default_openai_voice(choices)
     is_chatterbox = engine not in ("kokoro", "breeze")
     return (gr.update(choices=choices, value=default), _dialogue_voice_update(choices, default),
-            gr.update(choices=choices, value=None), gr.update(visible=is_chatterbox), gr.update(visible=is_chatterbox))
+            gr.update(choices=choices, value=None), gr.update(visible=engine != "kokoro"),
+            gr.update(visible=is_chatterbox))
 
 
 def _sync_if_chatterbox(value: str, engine: str) -> dict:
@@ -2264,9 +2266,10 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                                   "found: the narrator's voice unless you pick another.")
             with gr.Row(equal_height=True):
                 adaptive_delivery = gr.Checkbox(
-                    True, label="Adaptive delivery", visible=initial_engine == "chatterbox",
+                    True, label="Adaptive delivery", visible=initial_engine != "kokoro",
                     info="Dialogue tagged whispered/shouted (and, in Cast mode, the LLM's own read) is spoken "
-                         "softer or more excited around this book's baseline, instead of one flat delivery.")
+                         "softer or more excited instead of one flat delivery: Chatterbox shifts its settings "
+                         "around this book's baseline, Breeze is given a spoken direction for the line.")
                 delivery_baseline_info = gr.Markdown(
                     delivery_baseline_text(saved["exaggeration"], saved["cfg_weight"], saved["temperature"]),
                     visible=initial_engine == "chatterbox")
