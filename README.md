@@ -1,15 +1,15 @@
-# EPUB to Audiobook — Chatterbox edition
+# EPUB to Audiobook — Breeze edition
 
 A fork of [p0n1/epub_to_audiobook](https://github.com/p0n1/epub_to_audiobook) for turning EPUBs into
-audiobooks with a self-hosted [Chatterbox-TTS-Server](https://github.com/devnen/Chatterbox-TTS-Server)
-(through its OpenAI-compatible endpoint). It adds a web UI built around that workflow, natural pacing,
-single-file M4B output and a book queue. The upstream README follows below; the command-line tool
-still works as documented there.
+audiobooks with self-hosted Breeze TTS 2 by default and optional
+[Chatterbox-TTS-Server](https://github.com/devnen/Chatterbox-TTS-Server) support. It adds a web UI,
+natural pacing, single-file M4B output and a book queue. The upstream README follows below; the
+command-line tool still works as documented there.
 
-> **Local network only.** Neither the web UI nor Chatterbox has any login. Anyone who can reach port
-> 7860 can queue books, write into your audiobook folder and add or delete voices; anyone who can reach
-> port 8004 can use and reconfigure Chatterbox. Run it on a home network or behind a VPN, never with
-> those ports open to the internet.
+> **Local network only.** The web UI, Breeze API, and optional Chatterbox service have no login.
+> Anyone who can reach port 7860 can queue books and manage voices; ports 8005 (Breeze) and 8004
+> (Chatterbox, when enabled) expose their TTS APIs. Run it on a home network or behind a VPN, never
+> with those ports open to the internet.
 
 This is a personal setup shared as-is: it is tuned for one machine (an RTX 4070 on Docker Desktop for
 Windows) and issues or pull requests may not get a response.
@@ -19,8 +19,9 @@ The repo holds the whole stack:
 | Path | What |
 |---|---|
 | repo root | The audiobook app (this fork of epub_to_audiobook) |
-| [`chatterbox/`](chatterbox/) | Chatterbox-TTS-Server, added as a git subtree at upstream commit 915ae28, plus one commit of local patches (AAC/FLAC output, cleaner speed changes, faster generation, a GPU memory-leak fix) |
-| [`docker-compose.chatterbox.yml`](docker-compose.chatterbox.yml) | Builds and runs both as two containers |
+| [`breeze/`](breeze/) | Breeze TTS 2 service used by default |
+| [`chatterbox/`](chatterbox/) | Optional Chatterbox-TTS-Server with local patches |
+| [`docker-compose.chatterbox.yml`](docker-compose.chatterbox.yml) | Runs the app and Breeze by default; Chatterbox is opt-in |
 | [`docs/chatterbox-edition/`](docs/chatterbox-edition/) | Work log, findings and the code-review brief |
 
 ## What this fork adds
@@ -126,7 +127,7 @@ The repo holds the whole stack:
 
 ## Running it
 
-Needs Docker with an NVIDIA GPU (Chatterbox's Original model uses about 4.5 GB of VRAM).
+Needs Docker with an NVIDIA GPU. Breeze is the default engine; Chatterbox is optional.
 
 1. Copy [`.env.example`](.env.example) to `.env` and set the paths. For a first run, copy
    `chatterbox/config.audiobook.yaml` **as** `config.yaml`, plus `chatterbox/voices/`, into the
@@ -136,13 +137,13 @@ Needs Docker with an NVIDIA GPU (Chatterbox's Original model uses about 4.5 GB o
    Docker created an empty directory for the missing bind-mount file; copy the file into place,
    remove that empty directory, and restart.
 2. Create the Docker network once (`docker network create tts`), or point `DOCKER_NETWORK` at an existing one.
-3. Build and start both containers:
+3. Build and start the app and Breeze:
    ```
    docker compose -f docker-compose.chatterbox.yml up -d --build
    ```
-   The first build of the Chatterbox image downloads CUDA and PyTorch and takes a while; later
-   builds only redo the layers that changed.
-4. Open http://localhost:7860 (Chatterbox's own UI and API are on port 8004).
+   Breeze downloads its model the first time it is used. To enable Chatterbox as an alternate engine,
+   start it with `--profile chatterbox`.
+4. Open http://localhost:7860 (Breeze API is on port 8005; Chatterbox's UI and API use port 8004 when enabled).
 
 Faster generation (opt-in): `TTS_COMPILE=on` in `.env` makes Chatterbox run the Original model's
 per-token step through `torch.compile` with CUDA graphs (`chatterbox/fast_t3.py`), measured about
@@ -170,7 +171,7 @@ Settings the app reads (the compose file sets them):
 | `OPENAI_BASE_URL` | Chatterbox's OpenAI endpoint, e.g. `http://chatterbox:8004/v1` |
 | `OPENAI_API_KEY` | Any non-empty value (Chatterbox has no auth) |
 | `TTS_VOICES_DIR` | Chatterbox's voices folder (writable, for the Voice lab) |
-| `BREEZE_BASE_URL` | Breeze TTS 2 server, e.g. `http://breeze:8005`. When set, Breeze is offered and is the default engine. Chatterbox then only starts with `docker compose --profile chatterbox up -d` |
+| `BREEZE_BASE_URL` | Breeze TTS 2 server, default `http://breeze:8005`. Set it blank to disable Breeze. |
 | `OPENAI_DEFAULT_VOICE` | Voice selected by default |
 | `CHATTERBOX_CONFIG` | Chatterbox's `config.yaml` (read-only), for the Voice lab sliders |
 | `CHATTERBOX_URL` | Chatterbox root URL, if it isn't `OPENAI_BASE_URL` minus `/v1` |

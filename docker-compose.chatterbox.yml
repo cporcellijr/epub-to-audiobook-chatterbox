@@ -119,8 +119,8 @@ services:
       # Optional second engine. Leave unset (the default) to hide the Engine choice entirely.
       - KOKORO_BASE_URL=${KOKORO_BASE_URL:-}
       - KOKORO_DEFAULT_VOICE=${KOKORO_DEFAULT_VOICE:-}
-      # Optional engine. Leave unset (the default) to hide it. Set to http://breeze:8005 to use Breeze TTS 2.
-      - BREEZE_BASE_URL=${BREEZE_BASE_URL:-}
+      # Breeze is the default engine; set BREEZE_BASE_URL blank in .env to disable it.
+      - BREEZE_BASE_URL=${BREEZE_BASE_URL-http://breeze:8005}
       # Optional local LLM (OpenAI-compatible chat endpoint) for multi-voice cast analysis. Leave
       # LLM_BASE_URL unset (the default) to hide the Cast voice mode entirely.
       - LLM_BASE_URL=${LLM_BASE_URL:-}
