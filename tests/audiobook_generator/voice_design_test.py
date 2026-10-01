@@ -590,9 +590,14 @@ class TestDesignHandlers(Workspace):
             self._design()
         self.assertEqual(self.designs, [])
 
-    def test_a_running_book_does_not_stop_a_single_design(self):
-        self._design(jobs=[{"status": "running", "kind": "book"}])
+    def test_a_running_breeze_book_does_not_stop_a_single_design(self):
+        self._design(jobs=[{"status": "running", "kind": "book", "settings": {"engine": "breeze"}}])
         self.assertEqual(len(self.designs), 1)
+
+    def test_a_running_chatterbox_book_stops_a_single_design(self):
+        with self.assertRaisesRegex(gr.Error, "Chatterbox book"):
+            self._design(jobs=[{"status": "running", "kind": "book", "settings": {"engine": "chatterbox"}}])
+        self.assertEqual(self.designs, [])
 
     def test_a_failed_design_is_a_clear_error_and_changes_nothing(self):
         with patch.object(chatterbox_ui.voice_design, "design_voice",

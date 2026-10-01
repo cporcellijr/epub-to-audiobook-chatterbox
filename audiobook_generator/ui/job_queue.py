@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Callable, List, Optional
 
@@ -74,6 +75,7 @@ class JobQueue:
         self._process_factory = process_factory
         self._engine_ready = engine_ready or _chatterbox_ready
         self._lock = threading.RLock()
+        self._breeze_requests = 0
         self._process = None
         self._running_id: Optional[str] = None
         self._data = self._load()
@@ -127,6 +129,26 @@ class JobQueue:
         with self._lock:
             job = self._find(self._running_id)
             return dict(job) if job else None
+
+    @contextmanager
+    def breeze_session(self):
+        """Reserve the GPU without blocking queue controls; Breeze's server serializes requests."""
+        from audiobook_generator.core.engine_gpu import prepare_breeze
+        with self._lock:
+            for job in self._data["jobs"]:
+                if job["status"] != RUNNING:
+                    continue
+                if job_kind(job) == CAST:
+                    raise RuntimeError("A cast analysis has the GPU. Try again once it has finished.")
+                if job["settings"].get("engine", "chatterbox") not in ("breeze", "kokoro"):
+                    raise RuntimeError("A Chatterbox book has the GPU. Try again once it has finished.")
+            self._breeze_requests += 1
+        try:
+            prepare_breeze()
+            yield
+        finally:
+            with self._lock:
+                self._breeze_requests -= 1
 
     @staticmethod
     def _chapter_folder(settings: dict) -> str:
@@ -323,7 +345,7 @@ class JobQueue:
                     self._finish_from_exitcode(job, self._process.exitcode)
                 self._process, self._running_id = None, None
                 self._save()
-            if self.paused:
+            if self.paused or self._breeze_requests:
                 return
             # Cast analyses go ahead of every waiting book, so all the picked books are analysed (and
             # join the queue) before the long generating starts, however early Start was pressed.

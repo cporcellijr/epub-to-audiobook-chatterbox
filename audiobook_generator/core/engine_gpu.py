@@ -32,18 +32,28 @@ def _wait_for_chatterbox_reload() -> None:
         reload_thread.join()
 
 
-def _to_breeze() -> None:
+def _to_breeze() -> bool:
     _wait_for_chatterbox_reload()
-    if chatterbox_control.model_loaded():
-        chatterbox_control.unload()
-    breeze_client.load()
+    if chatterbox_control.model_loaded() and not chatterbox_control.unload():
+        return False
+    return breeze_client.load()
+
+
+def prepare_breeze() -> None:
+    """Wait for a handover, then load Breeze for a queue-reserved standalone request."""
+    handover = _thread
+    if handover is not None and handover.is_alive():
+        handover.join()
+    with _lock:
+        if not _to_breeze():
+            raise RuntimeError("Could not give Breeze the GPU. Try again once the speech services are ready.")
 
 
 def _to_chatterbox() -> None:
     breeze_client.unload()
 
 
-def _start(engine: str, target: Callable[[], None]) -> None:
+def _start(engine: str, target: Callable[[], object]) -> None:
     """Run one handover in the background unless one is already running (then wait for it)."""
     global _thread
     with _lock:

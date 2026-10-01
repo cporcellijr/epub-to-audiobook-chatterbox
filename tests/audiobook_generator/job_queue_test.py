@@ -3,7 +3,9 @@ import multiprocessing
 import os
 import pickle
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 from audiobook_generator.ui.job_queue import (
     BOOK, CAST, DONE, FAILED, QUEUED, RUNNING, STOPPED, JobQueue, job_kind, run_cast_job, run_job,
@@ -74,6 +76,39 @@ class TestJobQueue(unittest.TestCase):
         FakeProcess.instances[0].finish(0)
         self.queue.tick()
         self.assertEqual(self._statuses(), [("A", DONE), ("B", RUNNING)])
+
+    def test_breeze_reservation_holds_new_jobs_and_releases_after_failure(self):
+        self.queue.add("Cast", _settings(self.tmp.name), 1, 1, "Ada.wav", kind=CAST)
+        with patch("audiobook_generator.core.engine_gpu.prepare_breeze"):
+            with self.assertRaisesRegex(ValueError, "sample failed"):
+                with self.queue.breeze_session():
+                    worker = threading.Thread(target=self.queue.tick)
+                    worker.start()
+                    worker.join(2)
+                    self.assertFalse(worker.is_alive())  # controls/ticks stay responsive
+                    self.assertEqual(self._statuses(), [("Cast", QUEUED)])
+                    raise ValueError("sample failed")
+        self.queue.tick()
+        self.assertEqual(self._statuses(), [("Cast", RUNNING)])
+
+    def test_breeze_refuses_running_cast_and_chatterbox_but_can_share_breeze(self):
+        with patch("audiobook_generator.core.engine_gpu.prepare_breeze") as prepare:
+            for kind, engine, allowed in [(CAST, "breeze", False), (BOOK, "chatterbox", False),
+                                          (BOOK, "breeze", True), (BOOK, "kokoro", True)]:
+                with self.subTest(kind=kind, engine=engine):
+                    queue = self._queue(engine_ready=lambda _: True)
+                    queue._data["jobs"] = []
+                    queue.add("Job", _settings(self.tmp.name, engine=engine), 1, 1, "Ada.wav", kind=kind)
+                    queue.tick()
+                    if allowed:
+                        with queue.breeze_session():
+                            self.assertEqual(queue._breeze_requests, 1)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "GPU"):
+                            with queue.breeze_session():
+                                self.fail("conflicting job admitted")
+                    self.assertEqual(queue._breeze_requests, 0)
+            self.assertEqual(prepare.call_count, 2)
 
     def test_nonzero_exit_marks_failed(self):
         self._add("A")

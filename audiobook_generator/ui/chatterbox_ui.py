@@ -428,7 +428,7 @@ def voice_name_from_sample(sample: Optional[str]) -> str:
 
 
 def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bool,
-             engine: str = "chatterbox") -> tuple:
+             engine: str = "chatterbox", measurer: Optional[Callable] = None) -> tuple:
     """Save an uploaded sample into the Chatterbox voices folder as <name>.wav.
 
     engine gates the Make-tab dropdown update only: adding a voice always affects the Chatterbox
@@ -467,7 +467,7 @@ def add_voice(sample: Optional[str], name: str, remove_pauses: bool, replace: bo
     message = f"Added **{base}** ({seconds:.1f} s of speech{', pauses removed' if remove_pauses else ''})."
     if seconds < SHORT_SAMPLE_SECONDS:
         message += " It's short: Chatterbox sounds steadier with 10-15 s of speech."
-    message += " " + _measure_after_add(file_name)
+    message += " " + _measure_after_add(file_name, measurer)
     choices = openai_voice_choices()
     make_tab_update = gr.update(choices=choices, value=file_name) if engine in FILE_VOICE_ENGINES else gr.update()
     return (message, gr.update(choices=choices, value=file_name), make_tab_update,
@@ -622,11 +622,11 @@ def voice_sound_words(voice: Optional[str]) -> str:
     return voice_measure.describe(traits.get(voice or ""), dict(voices).get(voice or "", "neutral"))
 
 
-def _measure_after_add(voice: str) -> str:
+def _measure_after_add(voice: str, measurer: Optional[Callable] = None) -> str:
     """Measure a voice just added; a failure (the engine busy, unloaded or unreachable) never
     fails the add, it only leaves the voice for Measure voices."""
     try:
-        measure_voice(voice)
+        (measurer or measure_voice)(voice)
     except Exception as e:
         logger.warning(f"Voice {voice} not measured after adding it: {e}")
         return f"Not measured yet ({_speech_engine()} couldn't be asked just now): press **Measure voices** later."
@@ -644,7 +644,7 @@ def voice_sound_text(voice: Optional[str]) -> str:
             f"measured {measurement.get('measured', '')}.")
 
 
-def measure_voices() -> str:
+def measure_voices(measurer: Optional[Callable] = None) -> str:
     """Voice lab: measure every voice not measured yet, or changed since (about 3 s each). Stops at
     the first sign that the engine can't be reached rather than timing out on every voice."""
     files = _chatterbox_voice_files()
@@ -656,7 +656,7 @@ def measure_voices() -> str:
     done, failed = 0, []
     for voice in todo:
         try:
-            measure_voice(voice)
+            (measurer or measure_voice)(voice)
             done += 1
         except urllib.error.HTTPError as e:
             failed.append(f"{os.path.splitext(voice)[0]} ({_http_error_detail(e)})")
@@ -1523,6 +1523,8 @@ def _design_blocker(jobs: List[dict], books: bool) -> str:
             continue
         if job_kind(job) == CAST:
             return "A cast analysis is running and the language model has the GPU: design voices once it has finished."
+        if job_kind(job) == BOOK and job.get("settings", {}).get("engine", "chatterbox") not in ("breeze", "kokoro"):
+            return "A Chatterbox book is generating and has the GPU: design voices once it has finished."
         if books and job_kind(job) == BOOK:
             return "A book is generating and Breeze is busy with it: design voices once it has finished."
     return ""
@@ -2174,11 +2176,41 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                         if engine in FILE_VOICE_ENGINES else gr.update())
         return message, lab_update, voice_update, gr.update(choices=own_voice_choices(), value=None)
 
+    def breeze_work(action, *args):
+        try:
+            with queue.breeze_session():
+                return action(*args)
+        except RuntimeError as error:
+            raise gr.Error(str(error)) from error
+
+    def make_sample(engine, voice, speed):
+        if engine == "breeze":
+            return breeze_work(sample_voice, engine, voice, speed)
+        return sample_voice(engine, voice, speed)
+
+    def cast_sample(cast_key, character_key, engine, voice, delivery_choice, speed, exaggeration,
+                    cfg_weight, temperature, narrator_voice):
+        args = (cast_key, character_key, engine, voice, delivery_choice, speed, exaggeration,
+                cfg_weight, temperature, narrator_voice)
+        return breeze_work(sample_character, *args) if engine == "breeze" else sample_character(*args)
+
+    def measure_one(voice):
+        return breeze_work(measure_voice, voice) if breeze_client.configured() else measure_voice(voice)
+
+    def measure_all():
+        return measure_voices(measure_one)
+
+    def add_one(sample, name, remove_pauses, replace, engine):
+        return add_voice(sample, name, remove_pauses, replace, engine, measurer=measure_one)
+
     def design_for_character(cast_key, character_key, description, engine) -> tuple:
-        return design_character_voice(cast_key, character_key, description, engine, queue.jobs())
+        return breeze_work(design_character_voice, cast_key, character_key, description, engine, queue.jobs())
+
+    def design_one(name, description, gender, age):
+        return breeze_work(voice_design.design_voice, name, description, gender, age)
 
     def design_starters() -> Iterator[str]:
-        yield from design_starter_voices(queue.jobs)
+        yield from design_starter_voices(queue.jobs, designer=design_one)
 
     def voice_lists_after_design() -> tuple:
         """New voice files in the Make tab's, the Voice lab's and the delete dropdowns, selections kept."""
@@ -2517,7 +2549,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                 inputs=[cast_key_state, cast_selected, cast_gender, cast_voice, engine, cast_delivery],
                                 outputs=[cast_table, cast_keys_state, cast_status])
         cast_sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
-            .then(sample_character, inputs=[cast_key_state, cast_selected, engine, cast_voice, cast_delivery, speed,
+            .then(cast_sample, inputs=[cast_key_state, cast_selected, engine, cast_voice, cast_delivery, speed,
                                             exaggeration, cfg_weight, temperature, voice], outputs=sample_audio)
         selection_outputs = [*queue_outputs, selected_job, selected_info]
         enqueue_button.click(enqueue, inputs=[library_book, input_file, chapter_table, chapter_stats_state, *settings],
@@ -2552,7 +2584,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         # A voice's words are relative to its gender, so they change with it.
         save_gender_button.click(save_voice_gender, inputs=[lab_voice, lab_gender], outputs=gender_status) \
             .then(voice_sound_text, inputs=lab_voice, outputs=lab_sound)
-        measure_button.click(measure_voices, inputs=None, outputs=measure_status) \
+        measure_button.click(measure_all, inputs=None, outputs=measure_status) \
             .then(voice_sound_text, inputs=lab_voice, outputs=lab_sound)
         if breeze_client.configured():
             design_starters_button.click(design_starters, inputs=None, outputs=design_starters_status) \
@@ -2560,7 +2592,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                       outputs=[voice, lab_voice, delete_voice_dropdown, dialogue_voice])
         # The player stays hidden until the first sample, then shows before the audio arrives.
         sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
-            .then(sample_voice, inputs=[engine, voice, speed], outputs=sample_audio)
+            .then(make_sample, inputs=[engine, voice, speed], outputs=sample_audio)
         play_button.click(preview_voice, inputs=[lab_voice, phrase, exaggeration, cfg_weight, temperature, speed],
                           outputs=preview_audio)
         play_delivery_button.click(preview_delivery_range,
@@ -2572,7 +2604,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         save_button.click(save_settings, inputs=[exaggeration, cfg_weight, temperature], outputs=lab_status)
         reset_button.click(load_saved_settings, inputs=None, outputs=[exaggeration, cfg_weight, temperature])
         sample.change(voice_name_from_sample, inputs=sample, outputs=new_voice_name)
-        add_button.click(add_voice, inputs=[sample, new_voice_name, remove_pauses, replace, engine],
+        add_button.click(add_one, inputs=[sample, new_voice_name, remove_pauses, replace, engine],
                          outputs=[add_status, lab_voice, voice, delete_voice_dropdown])
         delete_voice_button.click(
             delete_voice,

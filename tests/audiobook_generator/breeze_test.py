@@ -227,6 +227,24 @@ class TestEngineHandover(unittest.TestCase):
             self.assertTrue(engine_gpu.ready_for_book("kokoro"))
         loaded.assert_not_called()
 
+    def test_standalone_breeze_waits_for_handover_and_refuses_a_failed_unload(self):
+        handover = MagicMock()
+        handover.is_alive.return_value = True
+        engine_gpu._thread = handover
+        calls = []
+        with patch.object(chatterbox_control, "model_loaded", return_value=True), \
+                patch.object(chatterbox_control, "unload", side_effect=lambda: calls.append("unload") or True), \
+                patch.object(breeze_client, "load", side_effect=lambda: calls.append("load") or True):
+            engine_gpu.prepare_breeze()
+        handover.join.assert_called_once()
+        self.assertEqual(calls, ["unload", "load"])
+        with patch.object(chatterbox_control, "model_loaded", return_value=True), \
+                patch.object(chatterbox_control, "unload", return_value=False), \
+                patch.object(breeze_client, "load") as load:
+            with self.assertRaisesRegex(RuntimeError, "GPU"):
+                engine_gpu.prepare_breeze()
+        load.assert_not_called()
+
     def test_a_breeze_book_waits_while_chatterbox_holds_the_gpu_and_never_blocks(self):
         release = threading.Event()
         calls = []
@@ -353,6 +371,41 @@ SETTINGS = ("audiobook_output/out", "Elena.wav", 1.0, 0.35, 0.9, True, False, Fa
 
 
 class TestBreezeInTheUi(unittest.TestCase):
+
+    def test_standalone_ui_actions_reserve_breeze_before_making_speech(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.dict(os.environ, {**BASE, "TTS_VOICES_DIR": folder, "KOKORO_BASE_URL": ""}), \
+                patch.object(engine_gpu, "prepare_breeze") as prepare:
+            queue = job_queue.JobQueue(os.path.join(folder, "queue.json"), lambda **s: s, lambda: "log",
+                                       process_factory=MagicMock)
+            ui = chatterbox_ui.build_ui(queue)
+            handlers = {f.fn.__name__: f.fn for f in ui.fns.values() if f.fn}
+
+            def speech(*args):
+                self.assertEqual(queue._breeze_requests, 1)
+                return "speech"
+
+            with patch.object(chatterbox_ui, "sample_voice", side_effect=speech), \
+                    patch.object(chatterbox_ui, "sample_character", side_effect=speech), \
+                    patch.object(chatterbox_ui, "measure_voice", side_effect=speech), \
+                    patch.object(chatterbox_ui, "design_character_voice", side_effect=speech), \
+                    patch.object(chatterbox_ui.voice_design, "design_voice", side_effect=speech), \
+                    patch.object(chatterbox_ui.voice_design, "STARTER_VOICES", [("Ada", "female", "adult", "A woman.")]), \
+                    patch.object(chatterbox_ui, "measure_voices", side_effect=lambda measure: measure("Ada.wav")), \
+                    patch.object(chatterbox_ui, "add_voice", side_effect=lambda *a, measurer: measurer("Ada.wav")):
+                self.assertEqual(handlers["make_sample"]("breeze", "Ada.wav", 1), "speech")
+                self.assertEqual(handlers["cast_sample"]("k", "ada", "breeze", "Ada.wav", "auto", 1, .5, .5, .8, None), "speech")
+                self.assertEqual(handlers["measure_all"](), "speech")
+                self.assertEqual(handlers["add_one"]("sample", "Ada", False, False, "breeze"), "speech")
+                self.assertEqual(handlers["design_for_character"]("k", "ada", "A woman.", "breeze"), "speech")
+                self.assertIn("Designed 1 starter voice", list(handlers["design_starters"]())[-1])
+                self.assertEqual(prepare.call_count, 6)
+                self.assertEqual(queue._breeze_requests, 0)
+                queue.add("Cast", {}, 1, 1, "Ada.wav", kind=job_queue.CAST)
+                queue.tick()
+                with self.assertRaisesRegex(gr.Error, "cast analysis"):
+                    handlers["make_sample"]("breeze", "Ada.wav", 1)
+                self.assertEqual(prepare.call_count, 6)
 
     def test_build_config_for_breeze(self):
         with patch.dict(os.environ, BASE):
