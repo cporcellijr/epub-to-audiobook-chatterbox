@@ -592,6 +592,33 @@ def _chapter_cast(chapter: ChapterText, characters: Dict[str, dict]) -> set:
     return {key for key in present if characters[key].get("name") != ANONYMOUS_NARRATOR}
 
 
+NARRATED_I_MAX = 4  # narration paragraphs of a chapter that may name its own "I" (see could_say_i)
+
+
+def _named_in_narration(chapter: ChapterText, character: dict) -> int:
+    """Narration paragraphs of the chapter that name this character, leaving out framed documents and
+    message labels ("Ada: on my way"), where a first-person narrator's own name is written too."""
+    pattern = _mention_pattern(character)
+    if pattern is None:
+        return 0
+    excluded = _narration_exclusions(chapter)
+    return sum(1 for i, paragraph in enumerate(chapter.paragraphs) if i not in excluded
+               and any(s.kind == NARRATION and any(not s.text[m.end():].lstrip().startswith(":")
+                                                   for m in pattern.finditer(s.text)) for s in paragraph))
+
+
+def could_say_i(chapter: ChapterText, key: Optional[str], characters: Dict[str, dict]) -> bool:
+    """Whether this character could be the chapter's "I": first-person narration calls its teller "I",
+    not by name. Measured over 153 first-person chapters of eight books: real narrators were named in
+    0-3 narration paragraphs of their chapter (125 in none: a self-introduction, a nickname); the people
+    the model or the book-wide guess mistook for one (seen live: a woman he talks to, the stepsister he
+    talks about) in 9-54."""
+    character = characters.get(key or "")
+    if character is None:
+        return False
+    return character.get("name") == ANONYMOUS_NARRATOR or _named_in_narration(chapter, character) <= NARRATED_I_MAX
+
+
 def _same_story(chapter: ChapterText, narrator: str, theirs: List[ChapterText], characters: Dict[str, dict]) -> bool:
     """Whether a chapter is part of the story `narrator` tells in `theirs`: besides the narrator, it
     shares someone with those chapters (seen live: a collection's next story, sharing nobody with
@@ -609,24 +636,37 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
     from a single first-person run's book narrator, narration-only chapter evidence must confirm the
     alternate or the book narrator wins. A chapter with too few votes takes a neighbour's narrator in
     the same run, the nearest first, but only one who speaks in it; otherwise the LLM is asked about
-    that chapter alone when available. Last resort: the single run's book narrator."""
+    that chapter alone when available. Last resort: the single run's book narrator. Nobody becomes a
+    chapter's narrator whom its narration names (could_say_i), and a story whose "I said" lines only
+    ever went to an unnamed "I" keeps that unnamed narrator: no guess names it."""
     views = [chapter_point_of_view(chapter) for chapter in chapters]
     stories = _stories(chapters, views)
+    characters = cast.get("characters", {})
     narrators: Dict[int, dict] = {c.number: {"point_of_view": view, "narrator": None}
                                   for c, view in zip(chapters, views) if view}
     single_run_tone = (book_tone or {}).get("pov_key") if (
         len(stories) == 1 and (book_tone or {}).get("point_of_view") == "first") else None
-    if single_run_tone not in cast.get("characters", {}):
+    if single_run_tone not in characters:
         single_run_tone = None  # a key nobody in the cast has can't narrate
     for story in stories:
         members = [chapters[i] for i in story]
         # Each chapter votes on its own: two first-person stories can sit side by side in a
         # collection (seen live), each with its own "I".
-        own = [_voted_narrator([chapter]) for chapter in members]
+        own = []
+        for chapter in members:
+            vote = _voted_narrator([chapter])
+            if vote and not could_say_i(chapter, vote, characters):
+                log.info(f"Cast: chapter {chapter.number} narrator vote {vote} dropped: the narration names them")
+                vote = None
+            own.append(vote)
         pooled = _voted_narrator(members)
-        unnamed = {key for key in own if (cast.get("characters", {}).get(key) or {}).get("name") == ANONYMOUS_NARRATOR}
+        unnamed = {key for key in own if (characters.get(key) or {}).get("name") == ANONYMOUS_NARRATOR}
         named_in_run = any(key and key not in unnamed for key in own)
         for i, chapter in enumerate(members):
+            def fits(key: Optional[str]) -> bool:
+                return bool(key) and could_say_i(chapter, key, characters)
+
+            book_narrator = single_run_tone if fits(single_run_tone) else None
             found = own[i]
             tone = None
             if found in unnamed and named_in_run:
@@ -636,28 +676,36 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
                 narrators[chapter.number] = {"point_of_view": "first", "narrator": found}
                 own[i] = None  # nothing to lend to an untagged chapter
                 continue
+            if unnamed and not named_in_run and found in (None, *unnamed):
+                # The model never named this story's "I": it keeps one unnamed narrator, an untagged
+                # chapter included (_share_anonymous_narrator joins them). Seen live: the book-wide
+                # guess named a woman he talks to instead, and her voice read his story.
+                if not found:
+                    found = own[min((abs(j - i), j) for j, key in enumerate(own) if key)[1]]
+                narrators[chapter.number] = {"point_of_view": "first", "narrator": found}
+                continue
             if not found:
                 speaking = set(chapter.lines.values())
                 nearest = sorted((abs(j - i), j) for j, key in enumerate(own) if key)
-                found = next((own[j] for _, j in nearest if own[j] in speaking), None)
-                if not found and pooled in speaking:
+                found = next((own[j] for _, j in nearest if own[j] in speaking and fits(own[j])), None)
+                if not found and pooled in speaking and fits(pooled):
                     found = pooled
-                if not found and single_run_tone in speaking:  # the same question, already answered
-                    found = single_run_tone
+                if not found and book_narrator in speaking:  # the same question, already answered
+                    found = book_narrator
             if not found and chat is not None:
-                tone = _ask_tone(cast.get("characters", {}), [chapter], chat, log, label=f"chapter {chapter.number}")
+                tone = _ask_tone(characters, [chapter], chat, log, label=f"chapter {chapter.number}")
                 found = tone.get("pov_key") if tone and tone.get("point_of_view") == "first" else None
-            if found and single_run_tone and found != single_run_tone:
+                found = found if fits(found) else None
+            if found and book_narrator and found != book_narrator:
                 if tone is None and chat is not None:
-                    tone = _ask_tone(cast.get("characters", {}), [chapter], chat, log,
-                                     label=f"chapter {chapter.number}")
+                    tone = _ask_tone(characters, [chapter], chat, log, label=f"chapter {chapter.number}")
                 verified = tone.get("pov_key") if tone and tone.get("point_of_view") == "first" else None
                 if verified != found:
                     log.info(f"Cast: chapter {chapter.number} narrator vote {found} not confirmed; "
-                             f"using book narrator {single_run_tone}")
-                    found = single_run_tone
+                             f"using book narrator {book_narrator}")
+                    found = book_narrator
             own[i] = found  # lend the final narrator to later untagged chapters, like a vote
-            narrators[chapter.number] = {"point_of_view": "first", "narrator": found or single_run_tone}
+            narrators[chapter.number] = {"point_of_view": "first", "narrator": found or book_narrator}
     return narrators
 
 
@@ -747,6 +795,13 @@ def turn_taking(paragraphs: List[List["Segment"]], lines: Dict[int, Optional[str
 STORY_BREAK_MIN_CAST = 3  # other named people a chapter needs before sharing none of them can split a story
 
 
+def _new_teller(characters: Dict[str, dict], number: int) -> str:
+    """A new unnamed "The Narrator" for the story that starts at this chapter."""
+    key = f"narrator of chapter {number}"
+    characters[key] = {"name": ANONYMOUS_NARRATOR, "aliases": [], "gender": "unknown", "age": "unknown", "lines": 0}
+    return key
+
+
 def _split_story_breaks(cast: dict, chapters: List[ChapterText], narrators: Dict[int, dict], entries: dict) -> set:
     """A chapter "narrated" by someone who belongs to another story gets its own unnamed narrator.
     Seen live: in a collection, the model gave the next story's "I said" lines to the previous story's
@@ -770,9 +825,7 @@ def _split_story_breaks(cast: dict, chapters: List[ChapterText], narrators: Dict
         if not theirs or len(mine) < STORY_BREAK_MIN_CAST or (pattern and pattern.search(text)):
             continue
         if not _same_story(chapter, key, theirs, characters):
-            new = f"narrator of chapter {chapter.number}"
-            characters[new] = {"name": ANONYMOUS_NARRATOR, "aliases": [], "gender": "unknown", "age": "unknown",
-                               "lines": 0}
+            new = _new_teller(characters, chapter.number)
             for lines in (chapter.lines, entry.get("lines", {})):
                 for line_id, speaker in lines.items():
                     if speaker == key:
@@ -785,9 +838,10 @@ def _split_story_breaks(cast: dict, chapters: List[ChapterText], narrators: Dict
 def _share_anonymous_narrator(cast: dict, chapters: List[ChapterText], narrators: Dict[int, dict],
                               entries: dict) -> set:
     """One first-person story has one "I": a chapter whose narrator the model never named (an anonymous
-    "The Narrator" the roster made per chapter) takes the nearest named narrator of its run, or, in a
-    run that names no narrator, the run's first such key, so the story keeps one voice. Returns the
-    keys whose lines changed."""
+    "The Narrator" the roster made per chapter) takes the nearest named narrator of its run whose story
+    it fits, or else the unnamed narrator of the chapters before it, so the story keeps one voice; a
+    chapter that plainly starts another story (the signs _split_story_breaks needs) gets its own.
+    Returns the keys whose lines changed."""
     characters = cast.get("characters", {})
     anonymous = {e["narrator_reference"] for e in entries.values() if e.get("narrator_reference")}
     anonymous |= {k for k, c in characters.items() if c.get("name") == ANONYMOUS_NARRATOR and not c.get("voice_picked")}
@@ -808,13 +862,26 @@ def _share_anonymous_narrator(cast: dict, chapters: List[ChapterText], narrators
         named = [(n, (narrators.get(c.number) or {}).get("narrator")) for n, (c, _) in enumerate(members)
                  if c.number not in final and (narrators.get(c.number) or {}).get("narrator") in characters]
         theirs = {key: [members[n][0] for n, k in named if k == key] for _, key in named}
-        unnamed = next(final[c.number] for c, _ in members if c.number in final)
+        tellers = []  # the run's unnamed narrators that fit no named story: [key, their chapters], in order
         for n, (chapter, entry) in enumerate(members):
             old = final.get(chapter.number)
             if old is None:
                 continue
             fitting = [item for item in named if _same_story(chapter, item[1], theirs[item[1]], characters)]
-            shared = min(fitting, key=lambda item: (abs(item[0] - n), item[0] > n))[1] if fitting else unnamed
+            if fitting:
+                shared = min(fitting, key=lambda item: (abs(item[0] - n), item[0] > n))[1]
+            else:
+                # A collection's neighbouring stories can both leave their "I" unnamed (seen live);
+                # each keeps its own unnamed narrator, not one voice for both.
+                teller = tellers[-1] if tellers else None
+                if teller is None or (len(_chapter_cast(chapter, characters)) >= STORY_BREAK_MIN_CAST
+                                      and not _same_story(chapter, teller[0], teller[1], characters)):
+                    key = old if all(old != k for k, _ in tellers) else _new_teller(characters, chapter.number)
+                    anonymous.add(key)
+                    teller = [key, []]
+                    tellers.append(teller)
+                teller[1].append(chapter)
+                shared = teller[0]
             if old != shared:
                 for line_id, speaker in chapter.lines.items():
                     if speaker == old:

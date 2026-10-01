@@ -6,7 +6,7 @@ import unittest
 
 from audiobook_generator.core.cast_profiles import (
     ChapterText, Passage, ProfileError, _ask_tone, _spread, apply_chapter_narrators, chapter_narrators, chapter_point_of_view,
-    character_passages, describe_book, drop_unsupported_accents, first_lines, name_forms, narration_passages,
+    character_passages, could_say_i, describe_book, drop_unsupported_accents, first_lines, name_forms, narration_passages,
     parse_profile, parse_tone, profile_cast, profile_candidates, render_excerpts, select_passages,
     turn_taking,
 )
@@ -415,16 +415,54 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertIn("narrator 2", cast["characters"])
         self.assertEqual(cast["characters"]["narrator 2"]["lines"], 0)
 
-    def test_an_unnamed_narrators_lines_fold_into_the_named_narrator_of_the_run(self):
+    def test_a_story_that_only_ever_says_i_keeps_one_unnamed_narrator_whatever_the_guess(self):
+        # Seen live: the model never named a story's "I", and the book-wide guess (a woman he talks to)
+        # was made its narrator; her voice read his story. The guess no longer names an unnamed "I".
+        untagged = _FIRST_PERSON.replace(" I told her", "").replace(" I said", "")
         cast = self._anonymous_cast(["narrator", "narrator 2"], (1, 2))
+        cast["chapters"]["h3"] = {"number": 3, "lines": {"1": "bettie", "2": "oliver", "3": "oliver"}}
         chapters = [self._anonymous_story(n, key) for n, key in zip((1, 2), ("narrator", "narrator 2"))]
-        found = chapter_narrators(cast, chapters, self._book_tone("Oliver"))
+        chapters.append(_story(3, untagged, {1: "bettie", 2: "oliver", 3: "oliver"}))
+        chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Oliver")))
+        found = chapter_narrators(cast, chapters, self._book_tone("Oliver"), chat)
         apply_chapter_narrators(cast, chapters, found)
-        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2)], ["oliver", "oliver"])
-        self.assertEqual([dict(c.lines) for c in chapters], [{1: "bettie", 2: "oliver", 3: "oliver"}] * 2)
-        self.assertNotIn("narrator", cast["characters"])
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3)], ["narrator"] * 3)
+        self.assertEqual([dict(c.lines) for c in chapters[:2]], [{1: "bettie", 2: "narrator", 3: "narrator"}] * 2)
         self.assertNotIn("narrator 2", cast["characters"])
-        self.assertEqual(cast["book_tone"]["pov_key"], "oliver")
+        self.assertEqual(cast["book_tone"]["pov_key"], "narrator")
+        self.assertEqual(chat.prompts, [])
+
+    def _she_is_named(self, lines, tagged_to):
+        """A first-person chapter whose narration names Bettie in six paragraphs (and never Oliver),
+        with its "I said" lines given to `tagged_to`."""
+        text = f"Bettie waited for me by the gate, as she always did.{M}" * 6 + _FIRST_PERSON
+        chapter = _story(1, text, dict(lines))
+        chapter.lines.update({line_id: tagged_to for line_id in first_person_tagged(chapter.paragraphs)})
+        return chapter
+
+    def test_nobody_the_narration_names_becomes_its_narrator(self):
+        # Seen live: the "I said" lines went to the stepsister the narration talks about; and the
+        # book-wide guess (a woman he talks to, named in 25 paragraphs) overruled his own vote.
+        cast = self._cast(1)
+        chapter = self._she_is_named({}, "bettie")
+        self.assertEqual(chapter_narrators(cast, [chapter], self._book_tone("Oliver"))[1]["narrator"], "oliver")
+        chapter = self._she_is_named({}, "oliver")
+        chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Bettie")))
+        self.assertEqual(chapter_narrators(cast, [chapter], self._book_tone("Bettie"), chat)[1]["narrator"], "oliver")
+        self.assertEqual(chat.prompts, [])  # a guess the narration rules out is not worth confirming
+        untagged = self._she_is_named({}, "bettie")
+        untagged.lines.clear()
+        chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Bettie")))
+        self.assertIsNone(chapter_narrators(cast, [untagged], self._book_tone("Bettie"), chat)[1]["narrator"])
+
+    def test_message_labels_and_framed_documents_do_not_name_the_narrator(self):
+        oliver = _ANTHOLOGY_CHARACTERS["oliver"]
+        texts = f"Oliver: on my way{M}" * 6 + f"I opened the letter.{M}" + f"Dear Oliver, come home.{M}" * 3 \
+            + f"I closed the letter.{M}" + f"I walked her home along the river.{M}" * 20
+        chapter = _story(1, texts, {})
+        self.assertTrue(could_say_i(chapter, "oliver", {"oliver": oliver}))
+        chapter = _story(1, f"Oliver walked her home.{M}" * 5, {})
+        self.assertFalse(could_say_i(chapter, "oliver", {"oliver": oliver}))
 
     def test_adjacent_named_narrators_stay_distinct_beside_an_unnamed_one(self):
         cast = self._anonymous_cast(["narrator"], (3,))
@@ -494,6 +532,21 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertEqual(sorted({v for v in cast["chapters"]["h3"]["lines"].values()}),
                          sorted({"elgin", "mabel", "dora", narrators[2]}))
         self.assertEqual(cast["book_tone"]["pov_key"], "oliver")
+
+    def test_neighbouring_stories_that_never_name_their_i_keep_their_own_unnamed_narrators(self):
+        keys = ["narrator", "narrator 2", "narrator 3"]
+        cast = self._anonymous_cast(keys, (1, 2, 3))
+        for key in ("elgin", "mabel", "dora"):
+            cast["characters"][key] = {"name": key.title(), "aliases": [], "gender": "unknown", "lines": 1}
+        other = self._other_story()
+        other.lines.update({k: "narrator 3" for k, v in other.lines.items() if v == "oliver"})
+        cast["chapters"]["h3"]["lines"] = {str(k): v for k, v in other.lines.items()}
+        chapters = [self._anonymous_story(1, "narrator"), self._anonymous_story(2, "narrator 2"), other]
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3)],
+                         ["narrator", "narrator", "narrator 3"])
+        self.assertEqual(cast["characters"]["narrator 3"]["name"], "The Narrator")
+        self.assertNotIn("narrator 2", cast["characters"])
 
     def test_a_narrator_named_in_the_chapter_or_too_few_others_keeps_it(self):
         cast, chapters = self._collection(mention="Oliver, they called me. ")
