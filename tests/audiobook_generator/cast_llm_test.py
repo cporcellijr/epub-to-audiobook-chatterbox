@@ -349,8 +349,22 @@ class TestOnePersonPerName(unittest.TestCase):
         self.assertNotEqual(lines[1], lines[2])
         self.assertEqual(roster.resolve("Annie"), lines[1])
 
+    def test_offered_names_are_introductions_too(self):
+        # Seen in a real book: "You can call me <name>." (§33)
+        for speech in ("You can call me Lena.", "Just call me Lena.", "Please, call me Lena.",
+                       "Please just call me Lena."):
+            with self.subTest(speech=speech):
+                text = self.TEXT.replace("Please call me Lena.", speech)
+                roster, stats = Roster(), {}
+                lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(_reply({3: "Nora"})),
+                                             stats, self.log)
+                self.assertEqual(lines[4], lines[1])
+                self.assertNotIn("lena", roster.characters)
+                self.assertEqual(stats["merged_introductions"], 1)
+
     def test_denied_or_reported_introductions_do_not_merge_people(self):
         for speech in ("Don't ever call me Beth.", "Don't you dare call me Beth.",
+                       "You can't call me Beth.", "Don't just call me Beth.",
                        "Yesterday John told me, 'Call me Beth.'",
                        "John said, ‘Hello. My name is Beth.’", "'Call me Beth,' John said.",
                        "He said my name is Beth."):

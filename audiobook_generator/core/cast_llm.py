@@ -594,8 +594,8 @@ def _messages(window: Window, roster: Roster) -> List[dict]:
     ]
 
 
-# A speaker naming themselves: "please call me Lena", "my name is Tom".
-_SELF_NAMED = re.compile(r"(?:^|[.!?]\s+)(?:[Aa]nd\s+)?(?:[Pp]lease\s+)?"
+# A speaker naming themselves: "please call me Lena", "you can call me Ann", "my name is Tom".
+_SELF_NAMED = re.compile(r"(?:^|[.!?]\s+)(?:[Aa]nd\s+)?(?:[Pp]lease,?\s+)?(?:[Yy]ou (?:can|may)\s+|[Jj]ust\s+)?"
                          r"(?:[Cc]all me|[Mm]y name is|[Mm]y name['’]s|[Tt]he name['’]s)\s+"
                          r"((?:(?:Mrs?|Ms|Miss|Dr)\.?\s+)?[A-Z][\w'’-]+)")
 

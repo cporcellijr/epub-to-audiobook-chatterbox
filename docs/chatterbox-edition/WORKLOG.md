@@ -2014,3 +2014,47 @@ new dependency or model request was added.
 The earlier five cast fixes (§31) and this parser fix are committed separately. No services were
 rebuilt or restarted, and existing saved casts, ebooks and audio were not rewritten. Books without
 usable contents boundaries still use their original document boundaries.
+
+## 33. §31–§32 checked against §26–§30 (2026-09-30)
+
+The owner asked whether §31's fixes break any of the earlier work. Each change was checked against the
+code it touches, then on real books, the benchmark and the full suite.
+
+**§31, change by change:**
+- **Lead-in and speech check (§26): untouched.** Phase 4 only moves the line in `voice_of` that picks the
+  default dialogue voice. `_speak_take`, the carrier cut and the checker are unchanged.
+- **Narrator fallback (§29): consistent.** "The narrator's voice" now means a collection story's own
+  teller, which is what §29 meant for a first-person story.
+- **Colon introductions (§27): consistent.** Phase 2 only stops a title's period from ending the
+  sentence.
+- **Roster gender check (§29): kept, and a gap in it closed.** Before, every later mention of a name
+  shared by a man and a woman made yet another character.
+- **Introduction merge (§30): kept, one loss fixed here.** Every dialogue line naming its speaker in the
+  12 saved casts' books (22 lines) was run through both versions:
+  - the collection's doctor ("…And please call me <name>.") still merges;
+  - §31 fixed a bug in §30: the "don't call me" check knew only the straight apostrophe, so "Don’t call
+    me Lady <name>" was read as an introduction; "My name’s …" with a curly apostrophe now counts too;
+  - §31 lost "You can call me <name>." **Fixed:** "you can", "you may" or "just", and a comma after
+    "please", may come before "call me". "You can't call me X" and "Don't just call me X" still name no
+    one.
+- **Benchmark: unchanged** at 83.9% (276/329), the same on every passage, 17 windows, 2 review
+  requests.
+- **703 tests pass** (§8's command): §32's 702 plus the new introduction-forms test, which fails on
+  §31's pattern.
+
+**§32 and saved casts.** Casts find a chapter by the hash of its text, so every saved cast was checked
+against the parser before and after §32:
+- **9 of 12 unchanged**, including both collections from §22–§30.
+- **The one-chapter book §32 re-split** now reads as 8 stories. Its one-chapter cast (183 lines) covers
+  none of them, as expected.
+- **Two older collections changed too, correctly.** Each story's title page now stands apart from its
+  copyright page, and the "other stories by the author" list now stands apart from the story's last
+  chapter. That uncovers 2 analysed chapters in one cast and 1 in the other (92 lines each), and the
+  first cast's later chapters are renumbered.
+- **The editor warns about this.** `cast_coverage_gaps` reports the uncovered chapters when the book is
+  queued, where those chapters would otherwise get the dialogue voice. Re-analysing the three books fixes
+  them.
+
+**Deployment.** The running image was built at 20:14, a minute after §32's commit, so §31 and §32 are
+live, although both sections say nothing was rebuilt. This section's fix is not deployed. Private
+evidence is in `data/diagnostics/review31_2026-09-30/`.
