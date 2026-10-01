@@ -2311,3 +2311,16 @@ measurements and genders were dropped.
   design, except Andrew (Apex Prey 2), who has no profile to describe.
 - Forbidden Fire 2's saved narrator voice was one of the clips.
 - The owner is re-analysing every cast anyway.
+
+### 37.3 The owner's ear: only quiet lines are directed
+
+The owner compared the 14 takes:
+- **Directed was better** for the whisper and the hiss.
+- **Plain was better** for the mutter, the shout and the "!".
+- **The scream and roar were weak either way,** and plain was preferred. The directed scream
+  "changes the voice weird and it gets distorted", and the directed roar "sounds like he's trying to
+  be a lion".
+
+So `breeze_instruction` now directs soft speech only: whispered, hissed, murmured, breathed, under
+the breath, and the soft default. Muttered and mumbled lines, and every excited and emphatic line,
+are spoken plain. The tests changed to match; 846 pass.

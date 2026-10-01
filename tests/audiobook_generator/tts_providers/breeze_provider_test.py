@@ -169,7 +169,7 @@ MOODY = (f"{_unit_text(0)}{PARAGRAPH_MARK}"
 class TestBreezeAdaptiveDelivery(unittest.TestCase):
     """Moods become voice directions on the batch items; the voice is still the clip's."""
 
-    def test_only_non_normal_units_carry_an_instruction(self):
+    def test_only_soft_units_carry_an_instruction(self):
         run = _Run(self, MOODY, adaptive_delivery=True)
         self.assertIsNone(run.error)
         items = run.server.calls[0][0]
@@ -177,7 +177,7 @@ class TestBreezeAdaptiveDelivery(unittest.TestCase):
         self.assertEqual({"normal", "soft", "excited", "emphatic"}, set(by_mood.values()))
         for item in items:
             mood = by_mood[_chunk(item)]
-            self.assertEqual(item["instruction"] is None, mood == "normal", (mood, item["text"]))
+            self.assertEqual(item["instruction"] is None, mood != "soft", (mood, item["text"]))
         self.assertTrue(all(item["voice"] == "Dark.wav" and item["ref_text"] == "words of Dark.wav"
                             and item["cfg_scale"] is None for item in items))
 
@@ -186,8 +186,8 @@ class TestBreezeAdaptiveDelivery(unittest.TestCase):
         by_text = {item["text"]: item["instruction"] for item in run.server.calls[0][0]}
         pick = lambda words: [i for t, i in by_text.items() if words in t]
         self.assertEqual(pick("tomorrow evening"), ["Whisper this softly."])
-        self.assertEqual(pick("right now"), ["Shout this loudly and forcefully, with intense emotion."])
-        self.assertEqual(pick("believe"), ["Say this with emphasis and energy."])
+        self.assertEqual(pick("right now"), [None])  # loud lines stay plain (the owner's ear, 2026-10-01)
+        self.assertEqual(pick("believe"), [None])
         self.assertEqual(pick("weather"), [None])
 
     def test_the_clip_map_records_mood_and_instruction(self):
@@ -196,7 +196,7 @@ class TestBreezeAdaptiveDelivery(unittest.TestCase):
         sent = {_chunk(item): item["instruction"] for item in run.server.calls[0][0]}
         self.assertEqual(len([c for c in clips if c["mood"] != "normal"]), 3)
         for clip in clips:
-            if clip["mood"] == "normal":
+            if sent[clip["chunk"]] is None:
                 self.assertNotIn("instruction", clip)
             else:
                 self.assertEqual(clip["instruction"], sent[clip["chunk"]])
@@ -232,10 +232,8 @@ class TestBreezeAdaptiveDelivery(unittest.TestCase):
         run = _Run(self, MOODY, FakeBreeze(behave), adaptive_delivery=True)
         self.assertIsNone(run.error)
         resent = run.server.calls[1][0]
-        self.assertEqual(len(resent), 3)
-        self.assertTrue(all(item["instruction"] for item in resent))
-        # (The long emphatic line's fake 1 s take also fails the length check, so it is tried again.)
-        self.assertTrue(all(c["attempts"] >= 2 for c in run.clips() if c["mood"] != "normal"))
+        self.assertIn("Whisper this softly.", [item["instruction"] for item in resent])
+        self.assertTrue(all(c["attempts"] >= 2 for c in run.clips() if c["mood"] == "soft"))
         self.assertTrue(all(c["attempts"] == 1 for c in run.clips() if c["mood"] == "normal"))
 
 

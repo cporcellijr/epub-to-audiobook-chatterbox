@@ -257,32 +257,22 @@ class CuedMood(str):
 # "Say this ..." in the audiobook sense, plain enough for the model's instruction prompt. The
 # soft/excited rows are keyed by a stem of the speech tag's cue word, first match wins; a mood without
 # a known cue word (cast LLM moods, '!' alone, borrowed or adverb cues) gets its default.
+# The owner's ear, 2026-10-01 (seven lines, plain against directed): the quiet directions helped
+# (whispered, hissed) and every loud one made the line worse. A directed scream changed the voice and
+# distorted it, a roar sounded "like he's trying to be a lion", and "!" and muttering were better
+# plain. So only soft speech is directed; excited and emphatic lines, and muttering, stay plain.
 _BREEZE_DEFAULTS = {
     MOOD_SOFT: "Say this softly and quietly, close to a whisper.",
-    MOOD_EXCITED: "Say this loudly and with intense emotion, as if shouting.",
-    MOOD_EMPHATIC: "Say this with emphasis and energy.",
 }
 _BREEZE_CUE_DIRECTIONS = {
     MOOD_SOFT: (
         ("whisper", "Whisper this softly."),
         ("hiss", "Hiss this through clenched teeth, quietly."),
-        ("mutter", "Mutter this under your breath."),
-        ("mumble", "Mutter this under your breath."),
+        ("mutter", None),
+        ("mumble", None),
         ("murmur", "Murmur this softly and quietly."),
         ("breathed", "Breathe this out softly, barely above a whisper."),
         ("under", "Say this under your breath, very quietly."),
-    ),
-    MOOD_EXCITED: (
-        ("scream", "Scream this at the top of your lungs, raw with fear and urgency."),
-        ("shriek", "Shriek this at the top of your lungs, raw with fear and urgency."),
-        ("roar", "Roar this in a deep, booming voice, furious and forceful."),
-        ("bellow", "Roar this in a deep, booming voice, furious and forceful."),
-        ("yell", "Yell this loudly and forcefully."),
-        ("shout", "Shout this loudly and forcefully, with intense emotion."),
-        ("cried", "Cry this out loudly, with raw emotion."),
-        ("exclaim", "Exclaim this loudly and excitedly."),
-        ("furious", "Say this furiously, loudly, raw with anger."),
-        ("angr", "Say this angrily, loudly and forcefully."),
     ),
 }
 
@@ -290,7 +280,7 @@ _BREEZE_CUE_DIRECTIONS = {
 def breeze_instruction(mood: str, unit_text: str, cue: Optional[str] = None) -> Optional[str]:
     """The voice direction Breeze speaks one unit with, or None for normal speech (and any unknown
     mood). `cue` is the speech tag's cue word for the unit's line (segment_moods_and_cues); a known
-    verb gets its own direction, otherwise the mood's default applies. Every non-normal unit is
+    verb gets its own direction (None: that verb is spoken plain), otherwise the mood's default applies. Every non-normal unit is
     directed whatever its length: `unit_text` is not used yet, it is here so a short-line rule can
     live in this one place if listening shows Breeze needs one."""
     default = _BREEZE_DEFAULTS.get(mood)

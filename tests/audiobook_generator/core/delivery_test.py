@@ -265,40 +265,34 @@ class TestBreezeInstruction(unittest.TestCase):
         self.assertIsNone(delivery.breeze_instruction(MOOD_NORMAL, "Hello there, friend.", "whispered"))
         self.assertIsNone(delivery.breeze_instruction("sleepy", "Hello there, friend."))
 
-    def test_each_mood_has_a_default_direction(self):
+    def test_only_soft_speech_is_directed(self):
+        """The owner's ear (2026-10-01): loud directions distorted the voice; quiet ones helped."""
         self.assertEqual(delivery.breeze_instruction(MOOD_SOFT, "Hello."),
                          "Say this softly and quietly, close to a whisper.")
-        self.assertEqual(delivery.breeze_instruction(MOOD_EXCITED, "Hello."),
-                         "Say this loudly and with intense emotion, as if shouting.")
-        self.assertEqual(delivery.breeze_instruction(MOOD_EMPHATIC, "Hello."), "Say this with emphasis and energy.")
+        for mood in (MOOD_EXCITED, MOOD_EMPHATIC):
+            for cue in (None, "screamed", "roared", "shouted", "yelled", "whispered"):
+                self.assertIsNone(delivery.breeze_instruction(mood, "Hello!", cue), (mood, cue))
 
-    def test_a_known_verb_gets_its_own_direction(self):
+    def test_a_known_soft_verb_gets_its_own_direction_and_muttering_stays_plain(self):
         soft = {"whispered": "Whisper this softly.", "HISSED": "Hiss this through clenched teeth, quietly.",
-                "muttered": "Mutter this under your breath.", "mumbled": "Mutter this under your breath.",
-                "in a whisper": "Whisper this softly.",
+                "in a whisper": "Whisper this softly.", "murmured": "Murmur this softly and quietly.",
                 "under his breath": "Say this under your breath, very quietly."}
         for cue, expected in soft.items():
             self.assertEqual(delivery.breeze_instruction(MOOD_SOFT, "Hello.", cue), expected, cue)
-        excited = {"screamed": "Scream", "shrieked": "Shriek", "roared": "Roar", "bellowed": "Roar",
-                   "yelled": "Yell", "shouted": "Shout", "cried out": "Cry", "exclaimed": "Exclaim",
-                   "furiously": "Say this furiously", "angrily": "Say this angrily"}
-        for cue, start in excited.items():
-            self.assertTrue(delivery.breeze_instruction(MOOD_EXCITED, "Hello.", cue).startswith(start), cue)
+        for cue in ("muttered", "mumbled"):
+            self.assertIsNone(delivery.breeze_instruction(MOOD_SOFT, "Hello.", cue), cue)
 
-    def test_an_unlisted_cue_or_one_of_the_other_moods_falls_back_to_the_default(self):
+    def test_an_unlisted_cue_falls_back_to_the_soft_default(self):
         self.assertEqual(delivery.breeze_instruction(MOOD_SOFT, "Hello.", "softly"),
                          delivery.breeze_instruction(MOOD_SOFT, "Hello."))
         self.assertEqual(delivery.breeze_instruction(MOOD_SOFT, "Hello.", "shouted"),
                          delivery.breeze_instruction(MOOD_SOFT, "Hello."))
-        self.assertEqual(delivery.breeze_instruction(MOOD_EMPHATIC, "Hello!", "whispered"),
-                         "Say this with emphasis and energy.")
 
     def test_every_direction_is_a_short_sentence(self):
         cues = [None, *(stem for rows in delivery._BREEZE_CUE_DIRECTIONS.values() for stem, _ in rows)]
-        for mood in (MOOD_SOFT, MOOD_EXCITED, MOOD_EMPHATIC):
-            for cue in cues:
-                text = delivery.breeze_instruction(mood, "Hello.", cue)
-                self.assertTrue(text.endswith(".") and len(text) < 80, text)
+        for cue in cues:
+            text = delivery.breeze_instruction(MOOD_SOFT, "Hello.", cue)
+            self.assertTrue(text is None or (text.endswith(".") and len(text) < 80), text)
 
     def test_a_cued_mood_is_still_its_mood_string(self):
         mood = delivery.CuedMood(MOOD_SOFT, "hissed")
