@@ -1254,11 +1254,30 @@ def resuggest_cast_voices(cast_key: Optional[str], engine: str, narrator_voice: 
     return (gr.update(value=rows, visible=True), keys, message, *_narrator_updates(suggestion))
 
 
+def _issue_parts(issues: list) -> list:
+    """Summary parts for the advisory cast issues: lines the text contradicts (left to the dialogue
+    voice) and lines whose tags contradict each other (kept)."""
+    def where(found: list) -> str:
+        shown = ", ".join(f"chapter {i['chapter']} line {i['line']}" for i in found[:5])
+        return shown + (", …" if len(found) > 5 else "")
+
+    left = [i for i in issues if i.get("reason") == "pronoun gender"]
+    tangled = [i for i in issues if i.get("reason") == "contradictory tags"]
+    parts = []
+    if left:
+        parts.append(f"{len(left)} line{'' if len(left) == 1 else 's'} left to the dialogue voice because "
+                     f"the text contradicts the speaker ({where(left)})")
+    if tangled:
+        parts.append(f"{len(tangled)} with contradictory speaker tags, kept as attributed ({where(tangled)})")
+    return parts
+
+
 def _cast_summary(cast: dict, auto_pick: bool = False) -> str:
     stats = cast.get("stats", {})
     lines, unknown = int(stats.get("lines", 0)), int(stats.get("unknown_lines", 0))
     known = lines - unknown
     parts = [f"**Cast ready**: {len(cast['characters'])} characters, {known} of {lines} lines attributed"]
+    parts.extend(_issue_parts(cast_store.casting_issues(cast)))
     if unknown:
         parts.append(f"{unknown} with no speaker found (read by the Dialogue voice setting: the narrator's "
                      "voice unless you pick another)")

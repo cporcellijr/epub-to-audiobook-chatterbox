@@ -1461,7 +1461,7 @@ class TestCastPanel(unittest.TestCase):
         self.assertEqual((list(saved["characters"]), keys), (["lena"], ["lena"]))
         self.assertEqual(saved["chapters"]["h"]["lines"], {"1": "lena", "2": "lena", "3": None})
         kept = saved["characters"]["lena"]
-        self.assertEqual((kept["lines"], kept["aliases"], kept["voice"]), (81, ["Dr. Hale"], "Ada.wav"))
+        self.assertEqual((kept["lines"], kept["aliases"], kept["voice"]), (2, ["Dr. Hale"], "Ada.wav"))
         self.assertEqual((message, selected), ("Merged **Dr. Hale** into **Lena**: their lines now use Lena's voice.",
                                                None))
         with self.assertRaises(gr.Error):
@@ -1676,6 +1676,33 @@ class TestCastPanel(unittest.TestCase):
         snapshot = self.cast_store.load_cast(settings["cast_file"])
         self.assertEqual(snapshot["characters"]["anne"]["voice"], "Ada.wav")
         chatterbox_ui.build_config(**settings)  # a book the queue can start
+
+    def _issued_cast(self, count=1):
+        self._toned_cast()
+        path = chatterbox_ui.cast_file_for("k")
+        cast = self.cast_store.load_cast(path)
+        cast["issues"] = [{"chapter": 1, "line": 19 + n, "reason": "pronoun gender", "was": "anne"}
+                          for n in range(count)]
+        self.cast_store.save_cast(path, cast)
+
+    def test_a_cast_with_issues_still_gets_its_voice_suggestions_and_queues(self):
+        self._issued_cast()
+        table, keys, status, _, voice, *rest = chatterbox_ui.cast_panel_update("k", "chatterbox", "Elena.wav", None, True)
+        self.assertEqual((keys, voice["value"]), (["anne"], "Bea.wav"))
+        self.assertIn("**Cast ready**", status)
+        self.assertIn("1 line left to the dialogue voice because the text contradicts the speaker "
+                      "(chapter 1 line 19)", status)
+        note, queue = self._after_cast(self._analysis_job())
+        self.assertEqual(note, "book added to the queue")
+        self.assertEqual(self.cast_store.load_cast(queue.add.call_args.args[1]["cast_file"])
+                         ["characters"]["anne"]["voice"], "Ada.wav")
+
+    def test_the_issue_summary_lists_at_most_five_lines(self):
+        self._issued_cast(7)
+        status = chatterbox_ui.cast_panel_update("k", "chatterbox", "Elena.wav", None, False)[2]
+        self.assertIn("7 lines left to the dialogue voice", status)
+        self.assertIn("chapter 1 line 23, …)", status)
+        self.assertNotIn("line 24", status)
 
     def test_without_auto_pick_or_with_a_clash_the_book_is_not_queued(self):
         self._toned_cast()

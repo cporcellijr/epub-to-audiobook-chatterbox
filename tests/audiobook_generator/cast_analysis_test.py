@@ -11,7 +11,7 @@ from ebooklib import epub
 
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import chatterbox_control
-from audiobook_generator.core.cast_analysis import analyse_book, run_cast_analysis
+from audiobook_generator.core.cast_analysis import analyse_book, drop_empty_placeholders, run_cast_analysis
 
 CHAPTERS = [
     ("One", ['Ada Marsh put the lamp down. "You left the gate open," she said.',
@@ -146,6 +146,30 @@ class TestAnalyseBook(unittest.TestCase):
         self.assertEqual([ch["number"] for ch in cast["chapters"].values()], [2])
 
     @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 2)
+    def test_a_gender_contradicted_line_is_left_unattributed_and_noted_but_profiles_still_run(self):
+        _write_epub(self.book, [("One", ['"Where is the key?" asked Ivy Lark.', '"Under the mat," she said.',
+                                           '"On the hook," he said.', '"Thank you," said Ivy Lark.'])])
+        self.settings["chapter_selection"] = [1]
+        wrong = {"speakers": {"1": "Ivy Lark", "2": "Ivy Lark", "3": "Ivy Lark", "4": "Ivy Lark"},
+                 "characters": [{"name": "Ivy Lark", "gender": "female", "age": "adult"}]}
+        tone = {"point_of_view": "third", "tone": "quiet", "narrator_gender": "female"}
+        profile = {"role": "protagonist", "gender": "female", "age": "adult", "description": "Looks for a key.",
+                   "relationships": "", "voice": "calm"}
+        chat = ScriptedChat(wrong, {"speakers": {"3": "Ivy Lark"}}, tone, profile)
+        cast = analyse_book(self.settings, chat=chat)
+        self.assertEqual(cast["status"], "done")
+        chapter = next(iter(cast["chapters"].values()))
+        self.assertEqual(chapter["lines"], {"1": "ivy lark", "2": "ivy lark", "3": None, "4": "ivy lark"})
+        self.assertEqual(cast["issues"], [{"chapter": 1, "line": 3, "reason": "pronoun gender", "was": "ivy lark"}])
+        self.assertEqual((chapter["unknown"], cast["stats"]["unknown_lines"]), (1, 1))
+        self.assertEqual(cast["characters"]["ivy lark"]["lines"], 3)
+        self.assertEqual(cast["characters"]["ivy lark"]["profile"]["description"], "Looks for a key.")
+        profile_prompt = chat.prompts[-1][1]["content"]
+        self.assertIn("Under the mat", profile_prompt)
+        self.assertNotIn("On the hook", profile_prompt)
+        self.assertEqual(cast_store.load_cast(self.settings["cast_file"])["issues"], cast["issues"])
+
+    @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 2)
     def test_profiles_are_written_after_the_chapters_and_an_llm_error_there_still_finishes(self):
         attribution = [{"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"},
                         "characters": [{"name": "Tom", "gender": "unknown", "age": "unknown"}]},
@@ -178,22 +202,21 @@ class TestAnalyseBook(unittest.TestCase):
         self.settings["chapter_selection"] = [1]
         tone = {"point_of_view": "first", "pov_character": "Sally", "tone": "quiet",
                 "narrator_gender": "female"}
-        profile = {"description": "Sally tells the story.", "gender": "female", "age": "adult"}
-        chat = ScriptedChat(
-            {"speakers": {"2": "Tom", "3": "Tom", "4": "unknown"},
-             "characters": [{"name": "Sally", "gender": "female"}]},
-            {"speakers": {"4": "unknown"}}, tone, tone, profile)
+        # Explicit first-person tags are attributed deterministically; only tone confirmation and
+        # the chapter POV checks need scripted replies. A tone guess alone cannot name the narrator.
+        chat = ScriptedChat(tone, tone, {"role": "protagonist", "gender": "female", "age": "adult",
+                                         "description": "Tells the story.", "relationships": "", "voice": "calm"})
 
         cast = analyse_book(self.settings, chat=chat)
 
         self.assertEqual(cast["status"], "done")
         chapter = next(iter(cast["chapters"].values()))
-        self.assertEqual(chapter["lines"], {"1": "tom", "2": "sally", "3": "sally", "4": "sally"})
+        self.assertEqual(chapter["lines"], {"1": "tom", "2": "narrator", "3": "narrator", "4": "narrator"})
         self.assertEqual((chapter["unknown"], cast["stats"]["unknown_lines"]), (0, 0))
-        self.assertEqual((cast["characters"]["sally"]["lines"], cast["characters"]["tom"]["lines"]), (3, 1))
-        self.assertEqual(cast["characters"]["sally"]["profile"]["first_line"]["text"], '"I am coming,"')
+        self.assertEqual((cast["characters"]["narrator"]["lines"], cast["characters"]["tom"]["lines"]), (3, 1))
+        self.assertEqual(cast["issues"], [])
+        self.assertEqual(cast["book_tone"]["pov_key"], "narrator")  # the unnamed "I" is the book's narrator
         self.assertEqual(cast["profiles_total"], 1)
-        self.assertNotIn("description", cast["characters"]["tom"]["profile"])
         self.assertEqual(cast_store.load_cast(self.settings["cast_file"])["stats"]["unknown_lines"], 0)
 
     @patch("audiobook_generator.core.cast_llm.ASK_LLM_FOR_MOODS", True)
@@ -209,6 +232,21 @@ class TestAnalyseBook(unittest.TestCase):
         self.assertEqual(chapter_one["moods"], {"1": "excited", "2": "normal", "3": "normal"})
         saved = cast_store.load_cast(self.settings["cast_file"])
         self.assertEqual(saved["chapters"], cast["chapters"])
+
+
+class TestDropEmptyPlaceholders(unittest.TestCase):
+
+    def test_only_unspoken_unnamed_placeholders_nobody_picked_are_dropped(self):
+        cast = {"book_tone": {"pov_key": "narrator 3"}, "characters": {
+            "narrator": {"name": "The Narrator", "lines": 0},
+            "narrator 2": {"name": "The Narrator", "lines": 4},
+            "narrator 3": {"name": "The Narrator", "lines": 0},
+            "woman": {"name": "unnamed woman", "lines": 0, "reference_scope": "chapter"},
+            "guy": {"name": "one of the guys", "lines": 0, "reference_scope": "chapter", "voice_picked": True},
+            "ada": {"name": "Ada", "lines": 0},
+        }}
+        drop_empty_placeholders(cast)
+        self.assertEqual(sorted(cast["characters"]), ["ada", "guy", "narrator 2", "narrator 3"])
 
 
 class TestRunCastAnalysisOrder(unittest.TestCase):

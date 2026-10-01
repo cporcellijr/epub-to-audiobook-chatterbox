@@ -8,6 +8,7 @@ from audiobook_generator.core.cast_profiles import (
     character_passages, describe_book, drop_unsupported_accents, first_lines, name_forms, narration_passages,
     parse_profile, parse_tone, profile_cast, profile_candidates, render_excerpts, select_passages,
 )
+from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
 from audiobook_generator.core.speech_tags import first_person_tagged
 
@@ -102,6 +103,40 @@ class TestPassages(unittest.TestCase):
         lines = first_lines(_chapters())
         self.assertEqual(lines["tom"], {"chapter": 1, "text": '"I did not,"'})
         self.assertEqual(lines["marsh"]["text"], '"Both of you, out,"')
+
+    def test_pov_samples_skip_only_explicitly_framed_inset_documents(self):
+        framing = "I enter the study. " + ("She watches the fire in silence. " * 24)
+        opening = "I begin to browse through the notebook and stop at an entry."
+        inset = "I loved him, I wrote to him, I hoped he would answer. " * 20
+        closing = "Jesus Christ. I slam the notebook with a loud clap."
+        chapter = ChapterText(1, chapter_segments(M.join((framing, opening, inset, closing))), {})
+        self.assertEqual([p.paragraph for p in narration_passages([chapter])], [0, 1, 3])
+        self.assertEqual(chapter_point_of_view(chapter), "third")
+
+    def test_unframed_diary_and_later_anthology_chapter_remain_eligible(self):
+        diary = ChapterText(1, chapter_segments("I wrote to my sister before dawn."), {})
+        story = ChapterText(2, chapter_segments("I woke in a different town with no memory."), {})
+        self.assertEqual([p.chapter for p in narration_passages([diary, story])], [0, 1])
+
+    def test_explicit_backmatter_heading_excludes_the_remaining_document(self):
+        text = M.join(("She crossed the yard and closed the door.", "About the Author",
+                       "I grew up near the sea and wrote my first book at twenty."))
+        chapter = ChapterText(1, chapter_segments(text), {})
+        self.assertEqual([p.paragraph for p in narration_passages([chapter])], [0])
+
+    def test_unclosed_document_frame_excludes_nothing_and_does_not_hide_the_chapter_pov(self):
+        text = M.join(("She walks through the quiet house. " * 30,
+                       "I open the diary and begin to read.", "I loved him and hoped he would return. " * 30))
+        chapter = ChapterText(1, chapter_segments(text), {})
+        self.assertEqual(chapter_point_of_view(chapter), "first")  # the unframed diary counts as evidence
+        self.assertEqual([p.paragraph for p in narration_passages([chapter])], [0, 1, 2])
+
+    def test_a_stray_open_with_a_close_far_later_excludes_nothing(self):
+        filler = ["She watched the rain and counted the hours until morning. " * 3] * 29
+        text = M.join(("I open the letter and set it down again.", *filler,
+                       "Mara closes the letter and puts it away."))
+        chapter = ChapterText(1, chapter_segments(text), {})
+        self.assertEqual(len(narration_passages([chapter])), 31)
 
     def test_candidates_are_the_most_spoken_with_enough_lines(self):
         self.assertEqual(profile_candidates(_characters(), min_lines=3, limit=15), ["ada marsh", "tom"])
@@ -339,6 +374,68 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertEqual(len(chat.prompts), 1)
         self.assertIn("(Chapter 2)", chat.prompts[0][1]["content"])
 
+    def _anonymous_story(self, number, key):
+        return _story(number, _FIRST_PERSON, {1: "bettie", 2: key, 3: key})
+
+    def _anonymous_cast(self, keys, numbers):
+        cast = self._cast(*numbers)
+        for key in keys:
+            cast["characters"][key] = {"name": "The Narrator", "aliases": [], "gender": "unknown",
+                                       "age": "unknown", "lines": 2}
+        for n, key in zip(numbers, keys):
+            cast["chapters"][f"h{n}"].update(narrator_reference=key, lines={"1": "bettie", "2": key, "3": key})
+        return cast
+
+    def test_an_unnamed_narrator_stays_one_identity_across_a_first_person_run(self):
+        keys = ["narrator", "narrator 2", "narrator 3"]
+        cast = self._anonymous_cast(keys, (1, 2, 3))
+        chapters = [self._anonymous_story(n, key) for n, key in zip((1, 2, 3), keys)]
+        found = chapter_narrators(cast, chapters, None)
+        apply_chapter_narrators(cast, chapters, found)
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3)], ["narrator"] * 3)
+        self.assertEqual([found[n]["narrator"] for n in (1, 2, 3)], ["narrator"] * 3)
+        self.assertEqual([dict(c.lines) for c in chapters], [{1: "bettie", 2: "narrator", 3: "narrator"}] * 3)
+        self.assertEqual(cast["chapters"]["h3"]["lines"], {"1": "bettie", "2": "narrator", "3": "narrator"})
+        self.assertNotIn("narrator 2", cast["characters"])
+        self.assertNotIn("narrator 3", cast["characters"])
+        self.assertEqual(cast["characters"]["narrator"]["lines"], 6)
+        self.assertEqual(cast["book_tone"]["pov_key"], "narrator")
+        self.assertEqual(cast_store.narrating_character(cast), "narrator")
+        self.assertNotIn("issues", cast)
+
+    def test_an_owner_voiced_unnamed_narrator_is_kept_but_its_lines_still_fold(self):
+        keys = ["narrator", "narrator 2"]
+        cast = self._anonymous_cast(keys, (1, 2))
+        cast["characters"]["narrator 2"].update(voice="Mine.wav", voice_picked=True)
+        chapters = [self._anonymous_story(n, key) for n, key in zip((1, 2), keys)]
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+        self.assertEqual(cast["chapters"]["h2"]["narrator"], "narrator")
+        self.assertIn("narrator 2", cast["characters"])
+        self.assertEqual(cast["characters"]["narrator 2"]["lines"], 0)
+
+    def test_an_unnamed_narrators_lines_fold_into_the_named_narrator_of_the_run(self):
+        cast = self._anonymous_cast(["narrator", "narrator 2"], (1, 2))
+        chapters = [self._anonymous_story(n, key) for n, key in zip((1, 2), ("narrator", "narrator 2"))]
+        found = chapter_narrators(cast, chapters, self._book_tone("Oliver"))
+        apply_chapter_narrators(cast, chapters, found)
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2)], ["oliver", "oliver"])
+        self.assertEqual([dict(c.lines) for c in chapters], [{1: "bettie", 2: "oliver", 3: "oliver"}] * 2)
+        self.assertNotIn("narrator", cast["characters"])
+        self.assertNotIn("narrator 2", cast["characters"])
+        self.assertEqual(cast["book_tone"]["pov_key"], "oliver")
+
+    def test_adjacent_named_narrators_stay_distinct_beside_an_unnamed_one(self):
+        cast = self._anonymous_cast(["narrator"], (3,))
+        chapters = [_story(1, _FIRST_PERSON, {1: "oliver", 2: "bettie", 3: "bettie"}),
+                    _story(2, _FIRST_PERSON, {1: "bettie", 2: "oliver", 3: "oliver"}),
+                    self._anonymous_story(3, "narrator")]
+        for n in (1, 2):
+            cast["chapters"][f"h{n}"] = {"number": n, "lines": {}}
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3)], ["bettie", "oliver", "narrator"])
+        self.assertIn("bettie", cast["characters"])
+        self.assertIn("oliver", cast["characters"])
+
     def test_conflicting_chapter_vote_is_corrected_by_narration_only(self):
         cast, chapter, tagged = self._disputed_chapter()
         chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Polly")))
@@ -380,6 +477,8 @@ class TestChapterNarrators(unittest.TestCase):
     def test_applying_narrator_corrects_tagged_lines_and_continuations_once(self):
         cast = self._cast(1)
         cast["characters"]["dermatologist"] = {"name": "Self-proclaimed dermatologist", "lines": 0}
+        cast["characters"]["dermatologist"]["profile"] = {"description": "stale"}
+        cast["characters"]["oliver"]["profile"] = {"description": "stale"}
         cast["characters"]["oliver"]["lines"] = 0
         text = (f'“Stay, I told her,” I said, “and then took the long way home{M}'
                 f'“past the river and back again.”{M}'
@@ -406,6 +505,8 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertEqual(cast["chapters"]["h1"]["lines"][str(unrelated)], "bettie")
         self.assertEqual(cast["characters"]["dermatologist"]["lines"], 0)
         self.assertEqual(cast["characters"]["oliver"]["lines"], len(expected))
+        self.assertNotIn("profile", cast["characters"]["dermatologist"])
+        self.assertNotIn("profile", cast["characters"]["oliver"])
         counts = {key: value["lines"] for key, value in cast["characters"].items()}
         apply_chapter_narrators(cast, [chapter], found)
         self.assertEqual({key: value["lines"] for key, value in cast["characters"].items()}, counts)

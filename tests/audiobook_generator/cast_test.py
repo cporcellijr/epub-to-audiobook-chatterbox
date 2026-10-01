@@ -103,7 +103,7 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(list(cast["characters"]), ["jon"])
         kept = cast["characters"]["jon"]
         self.assertEqual((kept["aliases"], kept["lines"], kept["voice"], kept["age"]),
-                         (["Jon", "Jonathan"], 27, "Axel.wav", "adult"))
+                         (["Jon", "Jonathan"], 3, "Axel.wav", "adult"))
         self.assertEqual((cast["chapters"]["a"]["lines"], cast["chapters"]["b"]["lines"]),
                          ({"1": "jon", "2": "jon"}, {"1": "jon"}))
         self.assertEqual((cast["chapters"]["a"]["narrator"], cast["book_tone"]["pov_key"]), ("jon", "jon"))
@@ -474,4 +474,50 @@ class TestEngineCheck(unittest.TestCase):
         self.assertEqual(cast_store.normalize_name("Mr. Thomas  Baker"), "thomas baker")
         self.assertEqual(cast_store.normalize_name("MRS MARSH"), "marsh")
         self.assertEqual(cast_store.normalize_name("O'Brien"), "o'brien")
+        self.assertEqual(cast_store.normalize_name("D’Angelo"), cast_store.normalize_name("D'Angelo"))
         self.assertEqual(cast_store.normalize_name("  "), "")
+
+
+class TestCastIssuesAndCounts(unittest.TestCase):
+
+    def test_issues_are_advisory_and_absent_in_older_casts(self):
+        self.assertEqual(cast_store.casting_issues({}), [])
+        issues = [{"chapter": 2, "line": 4, "reason": "pronoun gender", "was": "ivy"}]
+        self.assertEqual(cast_store.casting_issues({"issues": issues}), issues)
+        self.assertFalse(hasattr(cast_store, "casting_ready"))  # nothing is held back by issues
+
+    def test_final_maps_refresh_unknown_and_character_counts(self):
+        cast = _cast({"wren": (99, "female", "Narrator.wav"), "rob": (99, "male", "Rob.wav")})
+        cast["chapters"] = {"h": {"number": 1, "lines": {"1": "wren", "2": None, "3": "rob"},
+                                   "unknown": 99}}
+        cast_store.refresh_cast_counts(cast)
+        self.assertEqual((cast["characters"]["wren"]["lines"], cast["characters"]["rob"]["lines"]), (1, 1))
+        self.assertEqual((cast["chapters"]["h"]["unknown"], cast["stats"]["unknown_lines"],
+                          cast["stats"]["lines"]), (1, 1, 3))
+
+    def test_merge_invalidates_profile_and_rebuilds_counts_from_saved_lines(self):
+        cast = _cast({"gemma": (4, "female", "Gianna.wav"), "young woman": (2, "female", "Lucy.wav")})
+        cast["characters"]["gemma"]["profile"] = {"description": "old split"}
+        cast["chapters"] = {"h": {"number": 1, "lines": {"1": "gemma", "2": "young woman"}}}
+        cast_store.merge_characters(cast, "young woman", "gemma")
+        self.assertNotIn("profile", cast["characters"]["gemma"])
+        self.assertEqual(cast["characters"]["gemma"]["lines"], 2)
+        self.assertEqual(cast["chapters"]["h"]["lines"], {"1": "gemma", "2": "gemma"})
+
+    def test_generic_labels_never_carry_a_voice_but_proven_names_do(self):
+        previous = {"characters": {
+            "woman": {"name": "Woman", "aliases": [], "voice": "Layla.wav", "voice_picked": True},
+            "rob companion": {"name": "Rob's companion", "aliases": [],
+                                "voice": "Alex.wav", "voice_picked": True},
+            "young woman": {"name": "Mara", "aliases": ["young woman"],
+                            "voice": "Gianna.wav", "voice_picked": True},
+        }}
+        fresh = {
+            "woman_2": {"name": "Woman", "aliases": [], "voice": None},
+            "rob companion_2": {"name": "Rob's companion", "aliases": [], "voice": None},
+            "woman_ch11": {"name": "Mara", "aliases": ["young woman"], "voice": None},
+        }
+        self.assertEqual(cast_store.carry_voice_choices(previous, fresh, picked_only=True), 1)
+        self.assertIsNone(fresh["woman_2"]["voice"])
+        self.assertIsNone(fresh["rob companion_2"]["voice"])
+        self.assertEqual(fresh["woman_ch11"]["voice"], "Gianna.wav")

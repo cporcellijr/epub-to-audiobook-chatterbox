@@ -106,6 +106,36 @@ def new_cast(key: str, input_file: str, title: str, author: str, engine: str, na
     }
 
 
+def casting_issues(cast: dict) -> List[dict]:
+    """The saved line-level cast issues: advisory, they never hold back voices or queueing. Empty
+    for casts made before issue tracking."""
+    return list(cast.get("issues") or [])
+
+
+def refresh_cast_counts(cast: dict) -> None:
+    """Rebuild character and unknown counts from the final saved chapter maps."""
+    chapters = cast.get("chapters", {})
+    if not chapters:
+        return  # legacy/manual casts can carry counts without saved line maps
+    counts = {key: 0 for key in cast.get("characters", {})}
+    unknown = total = 0
+    for chapter in chapters.values():
+        lines = chapter.get("lines", {})
+        chapter_unknown = 0
+        for speaker in lines.values():
+            total += 1
+            if speaker in counts:
+                counts[speaker] += 1
+            else:
+                chapter_unknown += 1
+        chapter["unknown"] = chapter_unknown
+        unknown += chapter_unknown
+    for key, character in cast.get("characters", {}).items():
+        character["lines"] = counts[key]
+    stats = cast.setdefault("stats", {})
+    stats["lines"], stats["unknown_lines"] = total, unknown
+
+
 # ---- lookups used while narrating ----
 
 def chapter_lines(cast: dict, chapter_hash: str) -> Optional[Dict[int, Optional[str]]]:
@@ -145,6 +175,7 @@ def merge_characters(cast: dict, source: str, target: str) -> None:
     if source == target or source not in characters or target not in characters:
         raise ValueError(f"cannot merge {source!r} into {target!r}")
     gone, keep = characters.pop(source), characters[target]
+    keep.pop("profile", None)  # its excerpts and first line may describe only the pre-merge identity
     known = {normalize_name(n) for n in [keep.get("name", target), *keep.get("aliases", [])]}
     for name in [gone.get("name", source), *gone.get("aliases", [])]:
         if normalize_name(name) and normalize_name(name) not in known:
@@ -167,6 +198,7 @@ def merge_characters(cast: dict, source: str, target: str) -> None:
     tone = cast.get("book_tone") or {}
     if tone.get("pov_key") == source:
         tone["pov_key"] = target
+    refresh_cast_counts(cast)
 
 
 def character_voice(cast: dict, speaker: Optional[str]) -> Optional[str]:
@@ -182,7 +214,8 @@ def character_voice(cast: dict, speaker: Optional[str]) -> Optional[str]:
 # ---- names ----
 
 def _name_words(name: str) -> List[str]:
-    return [w.strip("'-") for w in re.sub(r"[^\w\s'-]", " ", (name or "").lower()).split()]
+    name = (name or "").translate(str.maketrans({"’": "'", "‘": "'", "ʼ": "'", "＇": "'"}))
+    return [w.strip("'-") for w in re.sub(r"[^\w\s'-]", " ", name.lower()).split()]
 
 
 def titled_name(name: str) -> str:
@@ -619,20 +652,27 @@ def carry_voice_choices(previous: Optional[dict], characters: Dict[str, dict], p
            if c.get("voice") and (c.get("voice_picked") or not picked_only
                                   or (c.get("voice_design") or {}).get("status") == "done")}
 
+    # ponytail: descriptive labels never prove continuity; add persistent identity IDs if generic people must carry picks.
+    generic_words = {"a", "an", "the", "of", "one", "unnamed", "unknown", "man", "woman", "girl", "boy",
+                     "child", "person", "patient", "doctor", "nurse", "companion", "stranger", "guy", "guys",
+                     "group", "narrator", "speaker", "male", "female", "mom", "mother", "dad", "father",
+                     "sister", "brother", "aunt", "uncle", "wife", "husband"}
+
     def forms(key: str, character: dict) -> set:
         names = [character.get("name", ""), *character.get("aliases", [])]
-        return ({key} | {normalize_name(n) for n in names}) - {""}
+        return {name for value in names if (name := normalize_name(value))
+                and not (set(name.split()) & generic_words)}
 
     old_forms = {key: forms(key, c) for key, c in old.items()}
     carried = 0
     for key, character in characters.items():
         if character.get("voice"):
             continue
-        if key in old:
+        identity = forms(key, character)
+        if key in old and old_forms[key] & forms(key, character):
             match = key
         else:
-            mine = forms(key, character)
-            hits = [old_key for old_key, names in old_forms.items() if names & mine]
+            hits = [old_key for old_key, names in old_forms.items() if names & identity]
             match = hits[0] if len(hits) == 1 else None
         if match is None:
             continue

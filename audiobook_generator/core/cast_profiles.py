@@ -17,7 +17,7 @@ import logging
 import re
 from typing import Callable, Dict, List, NamedTuple, Optional
 
-from audiobook_generator.core.cast import AGES, GENDERS, normalize_name
+from audiobook_generator.core.cast import AGES, GENDERS, normalize_name, refresh_cast_counts
 from audiobook_generator.core.cast_llm import AttributionError, Chat, _extract_json, render_paragraph
 from audiobook_generator.core.dialogue import DIALOGUE, NARRATION, Segment
 from audiobook_generator.core.speech_tags import NOT_NAMES
@@ -320,6 +320,8 @@ def profile_cast(cast: dict, chapters: List[ChapterText], chat: Chat, log: loggi
     stats = cast.setdefault("stats", {})
     stats.setdefault("profiles", 0)
     stats.setdefault("profiles_unusable", 0)
+    for character in characters.values():
+        character.pop("profile", None)
     for key, line in first_lines(chapters).items():
         if key in characters:
             characters[key]["profile"] = {"first_line": line}
@@ -413,11 +415,45 @@ _TONE_WORDS = {
 }
 
 
+# ponytail: prose boundaries only; use EPUB document metadata if real books exceed this evidence.
+_DOCUMENT_OPEN = re.compile(r"\b(?:browse|read|open|turn(?:ed)? to|start(?:ed)? reading)\b[^.?!]{0,100}\b(?:notebook|journal|diary|letter|entry)\b", re.I)
+_DOCUMENT_CLOSE = re.compile(r"\b(?:close[sd]?|slam(?:med)?|finish(?:ed)?|stop(?:ped)? reading|look(?:ed)? up from)\b[^.?!]{0,100}\b(?:notebook|journal|diary|letter)\b", re.I)
+_BACKMATTER = re.compile(r"^(?:acknowledg(?:e)?ments?|about the author|also by|author(?:'|’)s? note)$", re.I)
+
+
+INSET_MAX_PARAGRAPHS = 8  # a framed document longer than this is more likely a stray "I open the letter"
+
+
+def _narration_exclusions(chapter: ChapterText) -> set:
+    """Paragraph indexes to leave out of POV evidence: backmatter, and the contents of a document
+    explicitly opened and closed within INSET_MAX_PARAGRAPHS (an unclosed or over-long frame excludes nothing)."""
+    texts = [" ".join(segment.text for segment in paragraph).strip() for paragraph in chapter.paragraphs]
+    excluded = set()
+    opened = None
+    for index, text in enumerate(texts):
+        if _BACKMATTER.fullmatch(text) and len(text) <= 80:
+            excluded.update(range(index, len(texts)))
+            break
+        if opened is not None and index - opened > INSET_MAX_PARAGRAPHS:
+            opened = None  # too far to be this frame's close
+        if opened is None:
+            if _DOCUMENT_OPEN.search(text):
+                opened = index
+        elif _DOCUMENT_CLOSE.search(text):
+            excluded.update(range(opened + 1, index))
+            opened = None
+    return excluded
+
+
 def narration_passages(chapters: List[ChapterText]) -> List[Passage]:
-    """Every paragraph without dialogue, in reading order: the narrator's own voice."""
-    return [Passage(c, p, " ".join(s.text for s in paragraph))
-            for c, chapter in enumerate(chapters) for p, paragraph in enumerate(chapter.paragraphs)
-            if paragraph and all(s.kind == NARRATION for s in paragraph)]
+    """Eligible narrator paragraphs, excluding only documents explicitly framed and closed in text."""
+    passages = []
+    for c, chapter in enumerate(chapters):
+        excluded = _narration_exclusions(chapter)
+        passages.extend(Passage(c, p, " ".join(s.text for s in paragraph))
+                        for p, paragraph in enumerate(chapter.paragraphs)
+                        if p not in excluded and paragraph and all(s.kind == NARRATION for s in paragraph))
+    return passages
 
 
 def _word(value, kind: str) -> Optional[str]:
@@ -496,7 +532,9 @@ _FIRST_PERSON = re.compile(r"\b(?:I|me|my|mine|myself)\b|\bI[’'](?:m|d|ve|ll)\
 def chapter_point_of_view(chapter: ChapterText) -> Optional[str]:
     """"first" or "third" from how often the chapter's narration says I/me/my; None when there is
     too little narration to tell."""
-    narration = " ".join(s.text for paragraph in chapter.paragraphs for s in paragraph if s.kind == NARRATION)
+    excluded = _narration_exclusions(chapter)
+    narration = " ".join(s.text for i, paragraph in enumerate(chapter.paragraphs) if i not in excluded
+                         for s in paragraph if s.kind == NARRATION)
     words = len(narration.split())
     if words < POV_MIN_NARRATION_WORDS:
         return None
@@ -504,7 +542,9 @@ def chapter_point_of_view(chapter: ChapterText) -> Optional[str]:
 
 
 def _narration_words(chapter: ChapterText) -> int:
-    return sum(len(s.text.split()) for paragraph in chapter.paragraphs for s in paragraph if s.kind == NARRATION)
+    excluded = _narration_exclusions(chapter)
+    return sum(len(s.text.split()) for i, paragraph in enumerate(chapter.paragraphs) if i not in excluded
+               for s in paragraph if s.kind == NARRATION)
 
 
 def _stories(chapters: List[ChapterText], views: List[Optional[str]]) -> List[List[int]]:
@@ -553,6 +593,8 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
                                   for c, view in zip(chapters, views) if view}
     single_run_tone = (book_tone or {}).get("pov_key") if (
         len(stories) == 1 and (book_tone or {}).get("point_of_view") == "first") else None
+    if single_run_tone not in cast.get("characters", {}):
+        single_run_tone = None  # a key nobody in the cast has can't narrate
     for story in stories:
         members = [chapters[i] for i in story]
         # Each chapter votes on its own: two first-person stories can sit side by side in a
@@ -587,6 +629,55 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
     return narrators
 
 
+def _drop_unused(cast: dict, keys, entries: dict) -> None:
+    """Remove characters nobody speaks as any more, unless the owner gave them a voice or design."""
+    used = {speaker for entry in entries.values() for speaker in entry.get("lines", {}).values() if speaker}
+    characters = cast.get("characters", {})
+    for key in set(keys) - used:
+        character = characters.get(key) or {}
+        if not character.get("voice_picked") and (character.get("voice_design") or {}).get("status") != "done":
+            characters.pop(key, None)
+
+
+def _share_anonymous_narrator(cast: dict, chapters: List[ChapterText], narrators: Dict[int, dict],
+                              entries: dict) -> set:
+    """One first-person story has one "I": the chapters of a run whose narrator the model never named
+    (an anonymous "The Narrator" the roster made per chapter) all take the run's first such key, so
+    the story keeps one voice. Returns the keys whose lines changed."""
+    characters = cast.get("characters", {})
+    anonymous = {e["narrator_reference"] for e in entries.values() if e.get("narrator_reference")}
+    anonymous |= {k for k, c in characters.items() if c.get("name") == "The Narrator" and not c.get("voice_picked")}
+    runs = _stories(chapters, [(narrators.get(c.number) or {}).get("point_of_view") for c in chapters])
+    changed, folded = set(), set()
+    for run in runs:
+        members = [(chapters[i], entries[chapters[i].number]) for i in run if chapters[i].number in entries]
+        final = {}
+        for chapter, entry in members:
+            key = (narrators.get(chapter.number) or {}).get("narrator") or entry.get("narrator_reference")
+            if key in anonymous:
+                final[chapter.number] = key
+        if not final:
+            continue
+        shared = next(final[c.number] for c, _ in members if c.number in final)
+        for chapter, entry in members:
+            old = final.get(chapter.number)
+            if old is None:
+                continue
+            if old != shared:
+                for line_id, speaker in chapter.lines.items():
+                    if speaker == old:
+                        chapter.lines[line_id] = shared
+                for line_id, speaker in entry.get("lines", {}).items():
+                    if speaker == old:
+                        entry["lines"][line_id] = shared
+                folded.add(old)
+                changed.add(shared)
+            entry["narrator"] = entry["narrator_reference"] = shared
+            narrators.setdefault(chapter.number, {"point_of_view": "first"})["narrator"] = shared
+    _drop_unused(cast, folded, entries)
+    return changed
+
+
 def apply_chapter_narrators(cast: dict, chapters: List[ChapterText], narrators: Dict[int, dict]) -> None:
     """Keep each chapter's point of view and narrator with its attributions (cast["chapters"]), and
     let them settle the book's own: first person when most of the narration is, told by whoever
@@ -603,11 +694,15 @@ def apply_chapter_narrators(cast: dict, chapters: List[ChapterText], narrators: 
             entry.pop("point_of_view", None)
             entry.pop("narrator", None)
     characters = cast.get("characters", {})
+    changed = set()
     for chapter in chapters:
         narrator = (narrators.get(chapter.number) or {}).get("narrator")
         if not narrator:
             continue
         line_ids = set(first_person_tagged(chapter.paragraphs))
+        reference = (entries.get(chapter.number) or {}).get("narrator_reference")
+        if reference:
+            line_ids.update(line_id for line_id, speaker in chapter.lines.items() if speaker == reference)
         for paragraph in chapter.paragraphs:
             for piece in paragraph:
                 if piece.kind == DIALOGUE and piece.continues and piece.line_id - 1 in line_ids:
@@ -621,15 +716,24 @@ def apply_chapter_narrators(cast: dict, chapters: List[ChapterText], narrators: 
             if previous in characters:
                 character = characters[previous]
                 character["lines"] = max(0, int(character.get("lines", 0)) - 1)
+                changed.add(previous)
             chapter.lines[line_id] = narrator
             if stored_lines is not None:
                 stored_lines[str(line_id)] = narrator
             if narrator in characters:
                 characters[narrator]["lines"] = int(characters[narrator].get("lines", 0)) + 1
+                changed.add(narrator)
     for entry in entries.values():
         entry["unknown"] = sum(speaker is None for speaker in entry.get("lines", {}).values())
     if "stats" in cast:
         cast["stats"]["unknown_lines"] = sum(entry["unknown"] for entry in entries.values())
+    changed |= _share_anonymous_narrator(cast, chapters, narrators, entries)
+    for key in changed:
+        characters.get(key, {}).pop("profile", None)
+    replaced_references = {entry.get("narrator_reference") for entry in entries.values()
+                           if entry.get("narrator") and entry.get("narrator") != entry.get("narrator_reference")}
+    _drop_unused(cast, replaced_references, entries)
+    refresh_cast_counts(cast)
     words = {c.number: _narration_words(c) for c in chapters}
     first = sum(words[n] for n, found in narrators.items() if found["point_of_view"] == "first")
     third = sum(words[n] for n, found in narrators.items() if found["point_of_view"] == "third")
