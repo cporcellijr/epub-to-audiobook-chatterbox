@@ -106,13 +106,21 @@ class TestTenses(unittest.TestCase):
         self.assertEqual(tags('"Last part," Alan finishes.'), {1: "Alan"})
         self.assertEqual(tags('"No, nope, not you," Rob sputters.'), {1: "Rob"})
 
-    def test_first_person_speech_tag_can_follow_in_the_next_paragraph(self):
-        text = f'"Last sentence."{M}I say the last sentence with a snarl, then jab the needle in.'
-        self.assertEqual(first_person_tagged(chapter_segments(text)), [1])
+    def test_an_i_sentence_in_the_next_paragraph_is_the_narrators_reply_not_a_tag(self):
+        # Seen live: "I told her I had seen the same thing." / "I said nothing." after someone else's
+        # quotation had handed that quotation to the narrator.
+        for reply in ("I told her I had seen the same thing.", "I said nothing. She handed me a pad.",
+                      "I asked her if she wanted milk.", "I say the last sentence with a snarl."):
+            self.assertEqual(first_person_tagged(chapter_segments(f'"Last sentence."{M}{reply}')), [], reply)
         self.assertEqual(first_person_tagged(chapter_segments(f'"Last sentence."{M}I grin and shrug.')), [])
         self.assertEqual(first_person_tagged(chapter_segments(f'"Last sentence."{M}She says it with a snarl.')), [])
         intro = f'"Old quote."{M}I say: "New quote."{M}"Other speaker."'
         self.assertEqual(first_person_tagged(chapter_segments(intro)), [2])
+
+    def test_another_speaker_in_between_ends_the_narrators_run(self):
+        text = '"You are a fool to try," I said, and he repeated "Proof."'
+        self.assertEqual(first_person_tagged(chapter_segments(text)), [1])
+        self.assertEqual(first_person_tagged(chapter_segments('"Go," I said. I smiled. "Now."')), [1, 2])
 
 
 class TestNotNames(unittest.TestCase):

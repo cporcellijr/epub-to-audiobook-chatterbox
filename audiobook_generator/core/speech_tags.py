@@ -174,6 +174,10 @@ _AFTER_I = re.compile(rf"^\s*[,;]?\s*(?:{_VERB}{_ADVERB}\s+I\b|I{_ADVERB}\s+{_AN
 _BEFORE_I = re.compile(rf"(?:^|[.!?]\s+|\s)I{_ADVERB}\s+{_ANY_VERB}\b[^\"“”.!?]{{0,20}}[,:]\s*$")
 
 
+# Someone else speaking in the narration between two quotations ('"...," I said, and he repeated "...').
+_SOMEONE_SPEAKS = re.compile(rf"\b(?:he|she|they){_ADVERB}\s+{_ANY_VERB}\b", re.I)
+
+
 def first_person_tagged(paragraphs: List[List[Segment]]) -> List[int]:
     """Ids of the dialogue lines a first-person tag ("I said") gives to the narrator: whoever the
     attribution names for them is the "I" of a first-person chapter. Untagged quotations that
@@ -193,19 +197,16 @@ def first_person_tagged(paragraphs: List[List[Segment]]) -> List[int]:
             if (_AFTER_I.match(after) and not _introduces(after)) or _BEFORE_I.search(before):
                 speaking = True
                 found.append(piece.line_id)
-            elif speaking and not has_own_tag(before, after) and all(keeps_speaker(text, "I") for text in between):
+            elif (speaking and not has_own_tag(before, after) and all(keeps_speaker(text, "I") for text in between)
+                  and not any(_SOMEONE_SPEAKS.search(text) for text in between)):
                 found.append(piece.line_id)
             else:
                 speaking = False
             between = []
-    # Some EPUB parsers split a quote from its immediately following tag into adjacent blocks.
-    # Keep this narrow: an action such as "I grin" or "I shrug" is not a speech tag.
-    for before, after in zip(paragraphs, paragraphs[1:]):
-        if not before or not after or before[-1].kind != DIALOGUE or after[0].kind != NARRATION:
-            continue
-        if _AFTER_I.match(after[0].text) and not _introduces(after[0].text):
-            found.append(before[-1].line_id)
-    return list(dict.fromkeys(found))
+    # A paragraph opening "I told her..." / "I said nothing." after a quotation is the narrator's reply,
+    # not that quotation's tag: measured over three labelled books, reading it as a tag was right 2
+    # times and wrong 12, so it is not done.
+    return found
 
 
 _PRONOUN_WORD = re.compile(r"\b(he|she|they|I|we|you)\b", re.I)
