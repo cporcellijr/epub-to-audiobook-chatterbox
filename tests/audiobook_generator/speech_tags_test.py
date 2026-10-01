@@ -105,6 +105,14 @@ class TestTenses(unittest.TestCase):
             self.assertEqual(first_person_tagged(chapter_segments(text)), [1])
         self.assertEqual(tags('"Last part," Alan finishes.'), {1: "Alan"})
 
+    def test_first_person_speech_tag_can_follow_in_the_next_paragraph(self):
+        text = f'"Last sentence."{M}I say the last sentence with a snarl, then jab the needle in.'
+        self.assertEqual(first_person_tagged(chapter_segments(text)), [1])
+        self.assertEqual(first_person_tagged(chapter_segments(f'"Last sentence."{M}I grin and shrug.')), [])
+        self.assertEqual(first_person_tagged(chapter_segments(f'"Last sentence."{M}She says it with a snarl.')), [])
+        intro = f'"Old quote."{M}I say: "New quote."{M}"Other speaker."'
+        self.assertEqual(first_person_tagged(chapter_segments(intro)), [2])
+
 
 class TestNotNames(unittest.TestCase):
 

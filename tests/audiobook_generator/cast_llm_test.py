@@ -242,6 +242,36 @@ class TestRoster(unittest.TestCase):
         woman = roster.add("The Woman", "female")  # a character's own name is kept even when generic
         self.assertEqual(roster.add("the woman"), woman)
 
+    def test_narrator_references_are_scoped_to_the_chapter(self):
+        roster = Roster()
+        polly = roster.add("Polly", "female", aliases=["I"])
+        roster.set_chapter_narrator(polly, ["Polly Mary"])
+        self.assertEqual([roster.add(name) for name in ("I", "narrator", "the narrator", "Polly Mary")],
+                         [polly] * 4)
+        roster.new_chapter()
+        jane = roster.add("Jane", "female")
+        roster.set_chapter_narrator(jane)
+        self.assertEqual(roster.add("I"), jane)
+        self.assertEqual(roster.add("the narrator"), jane)
+        self.assertNotEqual(jane, polly)
+
+    def test_unnamed_narrators_do_not_merge_across_chapters(self):
+        roster = Roster()
+        first = roster.add("I")
+        self.assertEqual(roster.add("the narrator"), first)
+        roster.new_chapter()
+        second = roster.add("narrator")
+        self.assertNotEqual(first, second)
+        self.assertEqual(roster.names_for_prompt(), ["The Narrator"])
+
+    def test_current_reply_can_bind_the_scoped_narrator_to_a_named_character(self):
+        roster = Roster()
+        anonymous = roster.add("I")
+        polly = roster.add("Polly", "female", aliases=["I"])
+        self.assertEqual(roster.chapter_narrator, polly)
+        self.assertEqual(roster.canonical_key(anonymous), polly)
+        self.assertFalse(roster.is_scoped_narrator(polly))
+
     def test_a_family_word_names_one_person_only_within_a_chapter(self):
         # Seen live: a collection's six stories each had a "Mom", and all of them became one character.
         roster = Roster()
@@ -267,6 +297,13 @@ class TestRoster(unittest.TestCase):
         speakers, characters, _ = parse_reply(reply, [1, 2, 3])
         self.assertEqual(speakers, {1: None, 2: None, 3: "I"})
         self.assertEqual(characters, [])
+
+    def test_narrator_labels_are_valid_scoped_references(self):
+        reply = json.dumps({"speakers": {"1": "narrator", "2": "the narrator", "3": "I"}})
+        speakers, _, _ = parse_reply(reply, [1, 2, 3])
+        self.assertEqual(speakers, {1: "narrator", 2: "the narrator", 3: "I"})
+        roster = Roster()
+        self.assertEqual({roster.add(name) for name in speakers.values()}, {"narrator"})
 
     def test_a_saved_cast_restores_the_roster(self):
         roster = Roster({"thomas baker": {"name": "Thomas Baker", "aliases": ["Tom"], "gender": "male",
@@ -444,7 +481,7 @@ class TestAttributeChapter(unittest.TestCase):
         roster = Roster()
         lines, moods = attribute_chapter(self.paragraphs, roster, chat, {}, self.log)
         # Line 2 is tagged "said Tom", so the model's "unknown" for it is not even asked for.
-        self.assertEqual(lines, {1: "ada marsh", 2: "tom", 3: "ada marsh", 4: None, 5: None, 6: "tom"})
+        self.assertEqual(lines, {1: "ada marsh", 2: "tom", 3: "ada marsh", 4: None, 5: "narrator", 6: "tom"})
         next_chat = ScriptedChat(_reply({1: "Tom"}))
         attribute_chapter(chapter_segments('"Again," he said.'), roster, next_chat, {}, self.log)
         self.assertIn("Ada Marsh, Tom", next_chat.prompts[0][1]["content"])
@@ -478,34 +515,47 @@ class TestReview(unittest.TestCase):
 
     def test_flagged_lines_are_asked_again_and_corrected_before_counting(self):
         chat = ScriptedChat(_reply(self.FIRST, self.PEOPLE),
-                            _reply({3: "Sam", 4: "Sam", 5: "Ann", 6: "Ann", 7: "Ann", 8: "Ann", 9: "Ann"}))
+                            _reply({5: "Ann", 6: "Ann", 7: "Ann", 8: "Ann", 9: "Ann"}))
         roster, stats = Roster(), {}
-        lines, _ = attribute_chapter(chapter_segments(self.CHAPTER), roster, chat, stats, self.log)
+        lines, _ = attribute_chapter(chapter_segments(self.CHAPTER), roster, chat, stats, self.log,
+                                     narrator="Sam")
         self.assertEqual(lines, {1: "sam", 2: "sam", 3: "sam", 4: "sam", 5: "ann", 6: "ann", 7: "ann",
                                  8: "ann", 9: "ann"})
         self.assertEqual((roster.characters["sam"]["lines"], roster.characters["ann"]["lines"]), (4, 5))
-        self.assertEqual((stats["review_requests"], stats["review_changed"], stats["unknown_lines"]), (1, 5, 0))
+        self.assertEqual((stats["review_requests"], stats["review_changed"], stats["unknown_lines"]), (1, 3, 0))
         prompt = chat.prompts[1][1]["content"]
-        self.assertIn('The narrator, who says "I" in the narration, is Sam', prompt)
+        self.assertIn('In this chapter, the narrator is Sam', prompt)
         self.assertIn('[#6] "So, Dad,"', prompt)
-        self.assertIn('[Sam?] "Morning,"', prompt)  # an earlier guess, shown as one
-        self.assertIn("Ids to answer: 3, 4, 5, 6, 7, 8, 9", prompt)
+        self.assertIn('[Sam] "Morning,"', prompt)  # explicit first-person tag, not a guess
+        self.assertIn("Ids to answer: 5, 6, 7, 8, 9", prompt)
 
     def test_an_unknown_review_answer_keeps_the_first_answer(self):
         chat = ScriptedChat(_reply(self.FIRST, self.PEOPLE),
                             _reply({3: "unknown", 4: "unknown", 5: "unknown", 6: "unknown", 7: "unknown",
                                     8: "unknown", 9: "unknown"}))
         stats = {}
-        lines, _ = attribute_chapter(chapter_segments(self.CHAPTER), Roster(), chat, stats, self.log)
-        self.assertEqual((lines[6], lines[9], lines[3]), ("sam", "sam", None))
+        lines, _ = attribute_chapter(chapter_segments(self.CHAPTER), Roster(), chat, stats, self.log,
+                                     narrator="Sam")
+        self.assertEqual((lines[6], lines[9], lines[3]), ("sam", "sam", "sam"))
         self.assertEqual(stats["review_changed"], 0)
 
-    def test_an_unnamed_narrator_is_described_not_named_i(self):
+    def test_an_unnamed_narrator_is_a_chapter_scoped_identity(self):
         text = f'"Morning," I said.{M}"Coffee?" I said.{M}"Now?" I said.'
-        chat = ScriptedChat(_reply({1: "I", 2: "I", 3: "unknown"}), _reply({3: "I"}))
+        chat = ScriptedChat()
         lines, _ = attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
-        self.assertIn('is never named: answer "I"', chat.prompts[1][1]["content"])
         self.assertEqual(lines[3], lines[1])
+        self.assertEqual(lines[2], lines[1])
+        self.assertEqual(chat.prompts, [])
+
+    def test_current_reply_alias_i_guides_the_next_attribution_window(self):
+        text = f'"Intro," I said.{M}' + M.join(f'"Line {i}?"' for i in range(2, 26))
+        first = _reply({i: "Polly" for i in range(2, 22)},
+                       [{"name": "Polly", "gender": "female", "aliases": ["I"]}])
+        second = _reply({i: "Polly" for i in range(22, 26)})
+        chat = ScriptedChat(first, second)
+        lines, _ = attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
+        self.assertEqual(set(lines.values()), {"polly"})
+        self.assertIn("the narrator is Polly", chat.prompts[1][1]["content"])
 
     def test_a_consistent_chapter_asks_nothing_more(self):
         chat = ScriptedChat(_reply({1: "Ada"}))

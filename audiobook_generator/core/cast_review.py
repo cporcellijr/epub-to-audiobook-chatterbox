@@ -31,9 +31,12 @@ UNKNOWN, GENDER, NARRATOR, CONTINUES, CONTRADICTED = (
 _GENDER_OF = {"he": "male", "she": "female"}
 
 
-def narrator_by_tags(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]]) -> Optional[str]:
+def narrator_by_tags(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]],
+                     narrator: Optional[str] = None) -> Optional[str]:
     """The key the chapter's "I said" lines clearly point to: at least 2 of them, more than half of
     those with a speaker (as core.cast_profiles.chapter_narrators decides the narrator)."""
+    if narrator:
+        return narrator
     votes = Counter(result.get(i) for i in speech_tags.first_person_tagged(paragraphs) if result.get(i))
     if not votes:
         return None
@@ -48,7 +51,7 @@ def _around(segments: List[Segment], i: int) -> Tuple[str, str]:
 
 
 def flag_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]], anchors: Dict[int, str],
-               characters: Dict[str, dict]) -> Dict[int, List[str]]:
+               characters: Dict[str, dict], narrator: Optional[str] = None) -> Dict[int, List[str]]:
     """{line id: reasons} for the lines to ask again. Anchored (tag-named) and continued lines are
     never asked; they stay evidence. characters: the roster's {key: {"name", "gender", ...}}."""
     flags: Dict[int, List[str]] = {}
@@ -57,7 +60,7 @@ def flag_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]]
         if line_id not in anchors and reason not in flags.setdefault(line_id, []):
             flags[line_id].append(reason)
 
-    narrator = narrator_by_tags(paragraphs, result)
+    narrator = narrator_by_tags(paragraphs, result, narrator)
     first_person = set(speech_tags.first_person_tagged(paragraphs))
     for line_id in speech_tags.contradicted(paragraphs):
         flag(line_id, CONTRADICTED)

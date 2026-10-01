@@ -198,7 +198,14 @@ def first_person_tagged(paragraphs: List[List[Segment]]) -> List[int]:
             else:
                 speaking = False
             between = []
-    return found
+    # Some EPUB parsers split a quote from its immediately following tag into adjacent blocks.
+    # Keep this narrow: an action such as "I grin" or "I shrug" is not a speech tag.
+    for before, after in zip(paragraphs, paragraphs[1:]):
+        if not before or not after or before[-1].kind != DIALOGUE or after[0].kind != NARRATION:
+            continue
+        if _AFTER_I.match(after[0].text) and not _introduces(after[0].text):
+            found.append(before[-1].line_id)
+    return list(dict.fromkeys(found))
 
 
 _PRONOUN_WORD = re.compile(r"\b(he|she|they|I|we|you)\b", re.I)
