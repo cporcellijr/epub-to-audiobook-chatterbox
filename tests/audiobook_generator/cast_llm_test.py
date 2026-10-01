@@ -732,6 +732,67 @@ class TestReviewIsAccountable(unittest.TestCase):
         self.assertIsNone(cast_review.hard_violation(paragraphs, 2, "ben", roster.characters, "ben"))
 
 
+class TestNamesFromTheModel(unittest.TestCase):
+    """Qualifiers, nicknames and bare surnames in the names a model or a tag gives."""
+
+    def test_a_parenthetical_qualifier_is_not_part_of_the_name(self):
+        reply = json.dumps(_reply({1: "Kenjiro Mori (the clone)", 2: "Wren [younger]", 3: "(unknown)",
+                                   4: "Kenjiro Mori, Ninth of the line"}, [
+            {"name": "Kenjiro Mori (the clone)", "gender": "male", "age": "adult", "aliases": ["Ken (the clone)"]}]))
+        speakers, characters, _ = parse_reply(reply, [1, 2, 3, 4])
+        self.assertEqual(speakers, {1: "Kenjiro Mori", 2: "Wren", 3: None, 4: "Kenjiro Mori"})
+        self.assertEqual((characters[0]["name"], characters[0]["aliases"]), ("Kenjiro Mori", ["Ken"]))
+        roster = Roster()
+        for character in characters:
+            roster.add(character["name"], character["gender"], character["age"], character["aliases"])
+        self.assertEqual(roster.add(speakers[1]), roster.add("Kenjiro Mori"))
+        self.assertEqual(len(roster.characters), 1)
+
+    def test_a_nickname_that_ends_the_first_name_is_the_same_person_in_either_order(self):
+        roster = Roster()
+        key = roster.add("Kenjiro Mori", "male")
+        self.assertEqual(roster.add("Jiro"), key)
+        later = Roster()
+        key = later.add("Jiro")
+        self.assertEqual(later.add("Kenjiro Mori"), key)
+        self.assertEqual(later.add("Drew"), later.add("Andrew"))
+
+    def test_an_ending_is_no_nickname_when_short_ambiguous_or_of_another_gender(self):
+        short = Roster()
+        short.add("Joann Pike")
+        self.assertNotEqual(short.add("Ann"), "joann pike")
+        self.assertEqual(len(short.characters), 2)
+        twice = Roster()
+        twice.add("Kenjiro Mori")
+        twice.add("Shinjiro Ito")
+        twice.add("Jiro")
+        self.assertEqual(len(twice.characters), 3)
+        gendered = Roster()
+        gendered.add("Kenjiro Mori", "male")
+        gendered.add("Jiro", "female")
+        self.assertEqual(len(gendered.characters), 2)
+
+    def test_a_bare_surname_joins_the_one_character_with_that_last_name(self):
+        roster = Roster()
+        key = roster.add("Detective Nora Vale", "female")
+        self.assertEqual(roster.add("Vale"), key)
+        self.assertEqual(roster.add("Vale", "male"), "vale")  # a man of that name is someone else
+        self.assertEqual(len(roster.characters), 2)
+
+    def test_a_bare_surname_stays_apart_when_shared_titled_or_a_first_name(self):
+        shared = Roster()
+        shared.add("Nora Vale")
+        shared.add("Peter Vale")
+        self.assertIsNone(shared.resolve("Vale"))
+        titled = Roster()
+        key = titled.add("Nora Vale", "female")
+        self.assertNotEqual(titled.add("Mrs. Vale"), key)
+        first = Roster()
+        first.add("Nora Vale")
+        first.add("Vale Wen")
+        self.assertEqual(first.resolve("Vale"), "vale wen")  # as a first name it is Vale Wen's, not Nora's
+
+
 class TestTaggedLines(unittest.TestCase):
     """Lines a speech tag names are not asked; the model sees them, and earlier decisions, as [Name]."""
 
@@ -852,3 +913,24 @@ class TestMoodsStayRulesOnly(unittest.TestCase):
                                      logging.getLogger("test-cast"))
         self.assertEqual(moods, {1: "normal"})
 
+
+
+class TestQuotedTermsInAChapter(unittest.TestCase):
+
+    def test_quoted_terms_are_not_asked_shown_unmarked_and_have_no_speaker(self):
+        text = (f'She pointed at the “spare two” crates.{M}'
+                f'“Who is there?” asked Ada.{M}'
+                f'“Nobody.”{M}'
+                f'So much for the “one small glass” of wine. “Pour it,” said Tom.{M}'
+                f'“Fine.”')
+        chat = ScriptedChat(_reply({3: "Ada", 6: "Tom"}))
+        stats = {}
+        lines, moods = attribute_chapter(chapter_segments(text), Roster(), chat, stats, logging.getLogger("t"))
+        prompt = chat.prompts[0][1]["content"]
+        self.assertIn("Ids to answer: 3, 6", prompt)
+        self.assertIn("the “spare two” crates", prompt)
+        self.assertNotIn("[#1]", prompt)
+        self.assertNotIn("[#4]", prompt)
+        self.assertEqual((lines[1], lines[4]), (None, None))
+        self.assertEqual((lines[5], lines[6]), ("tom", "tom"))
+        self.assertEqual((stats["quoted_terms"], stats["unknown_lines"]), (2, 0))

@@ -2,7 +2,7 @@
 import unittest
 
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
-from audiobook_generator.core.speech_tags import first_person_tagged, has_speech_tag, tagged_speakers
+from audiobook_generator.core.speech_tags import first_person_tagged, has_speech_tag, quoted_terms, tagged_speakers
 
 
 def tags(text: str) -> dict:
@@ -138,6 +138,35 @@ class TestNotNames(unittest.TestCase):
 
     def test_a_continued_quotation_is_left_to_the_previous_line(self):
         self.assertEqual(tags(f'“First part.{M}“Second part,” said Ada.'), {})
+
+
+class TestQuotedTerms(unittest.TestCase):
+    """A term in quotation marks inside a sentence is narration, not a line of dialogue."""
+
+    def terms(self, text: str) -> set:
+        return quoted_terms(chapter_segments(text))
+
+    def test_terms_quoted_mid_sentence_are_found(self):
+        for text in ('She pointed at the “spare two” crates that were left.',
+                     'He swore whoever was “It” was going to devour him.',
+                     'So much for the “one small glass” of wine.',
+                     "He frowned at his calling Tom a “pal.” They were all tired.",
+                     'He only thought of her as the “green scarf woman,” but he doubted it.',
+                     'The sergeant had promised to “toughen him up.” He left at dawn.',
+                     'Now it was called “quiet time” because the door stayed shut.'):
+            self.assertEqual(self.terms(text), {1}, text)
+
+    def test_speech_is_not_a_term(self):
+        for text in ('He whispered “Go.”', 'Ada said to Tom “Check the door.”', 'She turned. “Fine.”',
+                     '“Fine,” she said.', '“Fine.” He left.', 'Tom nodded, “Fine.”', 'Tom said: “Fine.”'):
+            self.assertEqual(self.terms(text), set(), text)
+
+    def test_a_continued_quotation_is_never_a_term(self):
+        self.assertEqual(self.terms(f'“First part{M}and then the rest,” said Ada.'), set())
+
+    def test_only_the_term_is_found_among_real_dialogue(self):
+        text = 'He liked the “one small glass” of wine. “Pour me one,” said Ada.'
+        self.assertEqual(self.terms(text), {1})
 
 
 if __name__ == "__main__":

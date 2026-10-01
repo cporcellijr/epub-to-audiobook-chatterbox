@@ -293,3 +293,30 @@ def tagged_speakers(paragraphs: List[List[Segment]]) -> Dict[int, str]:
             for line_id in continuing:
                 found[line_id] = next(iter(named.values()))
     return found
+
+
+_BEING = re.compile(r"\b(?:was|is|are|were|be|been|being)\s+$", re.I)
+
+
+def _speaks(sentence: str) -> bool:
+    """Whether a sentence holds a speech verb; one right after a form of "to be" names things
+    ("it was called") rather than speaks."""
+    return any(not _BEING.search(sentence[:m.start()])
+               for m in re.finditer(rf"\b{_ANY_VERB}\b", sentence, re.I))
+
+
+def quoted_terms(paragraphs: List[List[Segment]]) -> set:
+    """Ids of the dialogue lines that are a term quoted inside a sentence, not speech: 'the “other
+    two” bodies', 'as a “buddy.” We're getting loopy'. The quotation follows narration in its paragraph
+    that runs straight into it (ends with a letter, no comma, colon or full stop) and whose sentence
+    has no speech verb ('He whispered “Go.”' and 'Maria said to Hiro “Check on Paul.”' are speech).
+    A line that continues an unclosed quotation is never one."""
+    found = set()
+    for segments in paragraphs:
+        for i, piece in enumerate(segments):
+            if piece.kind != DIALOGUE or piece.continues or i == 0 or segments[i - 1].kind != NARRATION:
+                continue
+            before = segments[i - 1].text.rstrip()
+            if before and before[-1].isalpha() and not _speaks(re.split(r"[.!?]", before)[-1]):
+                found.add(piece.line_id)
+    return found

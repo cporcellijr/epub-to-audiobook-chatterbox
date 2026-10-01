@@ -25,7 +25,7 @@ from audiobook_generator.core import cast_review
 from audiobook_generator.core.cast import AGES, GENDERS, display_name, normalize_name, title_gender, titled_name
 from audiobook_generator.core.delivery import MOOD_NORMAL, MOODS, segment_moods
 from audiobook_generator.core.dialogue import DIALOGUE, Segment, split_paragraph
-from audiobook_generator.core.speech_tags import contradicted, first_person_tagged, tagged_speakers
+from audiobook_generator.core.speech_tags import contradicted, first_person_tagged, quoted_terms, tagged_speakers
 
 logger = logging.getLogger(__name__)
 
@@ -263,34 +263,36 @@ class Window(NamedTuple):
     end: int = 0            # paragraph index after the window's last paragraph
 
 
-def render_paragraph(segments: List[Segment], ask_ids: bool, known: Optional[Dict[int, str]] = None) -> str:
+def render_paragraph(segments: List[Segment], ask_ids: bool, known: Optional[Dict[int, str]] = None,
+                     skip: Collection[int] = ()) -> str:
     """One paragraph as the model sees it: dialogue whose speaker is already known shown as
-    [Name], dialogue whose speaker is wanted marked [#id]."""
+    [Name], dialogue whose speaker is wanted marked [#id] (not the quoted terms in skip)."""
     parts = []
     for piece in segments:
         if piece.kind == DIALOGUE and known and piece.line_id in known:
             parts.append(f"[{known[piece.line_id]}] {piece.text}")
-        elif piece.kind == DIALOGUE and ask_ids and not piece.continues:
+        elif piece.kind == DIALOGUE and ask_ids and not piece.continues and piece.line_id not in skip:
             parts.append(f"[#{piece.line_id}] {piece.text}")
         else:
             parts.append(piece.text)
     return " ".join(parts)
 
 
-def render_window(paragraphs: List[List[Segment]], window: Window, known: Optional[Dict[int, str]] = None) -> str:
+def render_window(paragraphs: List[List[Segment]], window: Window, known: Optional[Dict[int, str]] = None,
+                  skip: Collection[int] = ()) -> str:
     """The window's passage with the speakers known right now shown in place."""
     return "\n\n".join([render_paragraph(p, False, known) for p in paragraphs[window.context_start:window.start]]
-                       + [render_paragraph(p, True, known) for p in paragraphs[window.start:window.end]])
+                       + [render_paragraph(p, True, known, skip) for p in paragraphs[window.start:window.end]])
 
 
 def build_windows(paragraphs: List[List[Segment]], window_lines: int = WINDOW_LINES,
                   max_chars: int = WINDOW_MAX_CHARS, context_paragraphs: int = CONTEXT_PARAGRAPHS,
-                  known: Optional[Dict[int, str]] = None) -> List[Window]:
+                  known: Optional[Dict[int, str]] = None, skip: Collection[int] = ()) -> List[Window]:
     """Cut a chapter into windows of consecutive paragraphs holding up to window_lines dialogue
     lines to ask about (continued lines and lines in known aside) and up to max_chars of text,
     each preceded by the previous context_paragraphs paragraphs as unasked context. Paragraphs
     without asked lines ride along with the window they fall in; a stretch with none makes no
-    window."""
+    window. skip: quoted terms (speech_tags.quoted_terms), never asked or marked."""
     known = known or {}
     windows: List[Window] = []
     start = 0
@@ -299,7 +301,7 @@ def build_windows(paragraphs: List[List[Segment]], window_lines: int = WINDOW_LI
         while end < len(paragraphs):
             paragraph = paragraphs[end]
             asked = [s.line_id for s in paragraph if s.kind == DIALOGUE and not s.continues
-                     and s.line_id not in known]
+                     and s.line_id not in known and s.line_id not in skip]
             tagged = [s.line_id for s in paragraph if s.kind == DIALOGUE and s.line_id in known]
             cont = [s.line_id for s in paragraph if s.kind == DIALOGUE and s.continues]
             length = sum(len(s.text) + 1 for s in paragraph)
@@ -316,7 +318,7 @@ def build_windows(paragraphs: List[List[Segment]], window_lines: int = WINDOW_LI
             end = start + 1
         if ids:
             window = Window(ids, "", continued, anchored, max(0, start - context_paragraphs), start, end)
-            windows.append(window._replace(passage=render_window(paragraphs, window, known)))
+            windows.append(window._replace(passage=render_window(paragraphs, window, known, skip)))
         start = end
     return windows
 
@@ -350,10 +352,15 @@ def _line_id(key) -> Optional[int]:
 _JOINED = re.compile(r"\s+(?:and|&)\s+(?=[A-Z])")
 
 
+_PARENTHETICAL = re.compile(r"\s*[(\[][^()\[\]]*[)\]]")
+
+
 def _one_person(name: str) -> str:
     """The first of two people answered as one speaker ("Jonathon and Jess" -> "Jonathon"): a pair is
-    no character, and its fuller-looking name had become one twin's display name (§30)."""
-    return _JOINED.split(name, maxsplit=1)[0]
+    no character, and its fuller-looking name had become one twin's display name (§30). A qualifier in
+    brackets ("Akihiro Sato (the clone)", "Maria (younger)") or after a comma ("Akihiro Sato, Ninth of
+    the line", seen live) is the model's note, not part of the name."""
+    return _JOINED.split(_PARENTHETICAL.sub("", name).split(",", 1)[0], maxsplit=1)[0].strip()
 
 
 def _speaker_or_none(value) -> Optional[str]:
@@ -362,7 +369,7 @@ def _speaker_or_none(value) -> Optional[str]:
     if not isinstance(value, str):
         raise AttributionError(f"speaker is not a name: {value!r}")
     name = display_name(_one_person(value))
-    return None if normalize_name(name) in UNKNOWN_SPEAKER_WORDS else name
+    return None if not normalize_name(name) or normalize_name(name) in UNKNOWN_SPEAKER_WORDS else name
 
 
 def parse_reply(reply: str, expected_ids: List[int],
@@ -398,8 +405,8 @@ def parse_reply(reply: str, expected_ids: List[int],
             continue
         if _speaker_or_none(item["name"]) is None:  # "Unknown" listed as a character (seen live) is no one
             continue
-        aliases = [display_name(a) for a in item.get("aliases") or [] if isinstance(a, str) and normalize_name(a)
-                   and not _JOINED.search(a)]
+        aliases = [display_name(_one_person(a)) for a in item.get("aliases") or [] if isinstance(a, str)
+                   and normalize_name(_one_person(a)) and not _JOINED.search(a)]
         characters.append({
             "name": display_name(_one_person(item["name"])),
             "gender": item.get("gender") if item.get("gender") in GENDERS else "unknown",
@@ -454,13 +461,16 @@ _NICKNAMES = {
 
 def _same_person(word: str, other: str) -> bool:
     """The same first name in two forms: identical, one the start of the other and at least two
-    letters shorter (Ben / Benjamin, but not Ann / Anna or Paul / Paula, which are other names), or a
-    listed short form (Tom / Thomas, Bill / Will / William)."""
+    letters shorter (Ben / Benjamin, but not Ann / Anna or Paul / Paula, which are other names), the
+    end of the other and at least four letters (Hiro / Akihiro, but not Ann / Joann), or a listed
+    short form (Tom / Thomas, Bill / Will / William)."""
     if word == other:
         return True
     short, long = sorted((word, other), key=len)
     if len(short) >= 3 and long.startswith(short) and len(long) - len(short) >= 2:
         return True
+    if len(short) >= 4 and long.endswith(short):
+        return True  # a nickname that is the end of the name; the roster still wants a single candidate
     full_a, full_b = _NICKNAMES.get(word, word), _NICKNAMES.get(other, other)
     return full_a == full_b
 
@@ -471,8 +481,9 @@ class Roster:
     grows more complete ("Tom" -> "Thomas Baker"); when two entries turn out to be one person,
     merge() folds the retired key into the surviving one.
 
-    Merging is deliberately conservative: a bare surname ("Mrs. Marsh" next to "Ada Marsh") is
-    never merged by code, since a family shares it, and neither are two people of different genders,
+    Merging is deliberately conservative: a titled surname ("Mrs. Marsh" next to "Ada Marsh") is
+    never merged by code, since a family shares it (a plain "Marsh" joins the one character with that
+    last name, if nobody else has it), and neither are two people of different genders,
     known or said by a title ("Mr. Smith" and "Mrs. Smith" stay two, the second keyed "mrs smith"); a
     wrong merge gives a main character the wrong voice, while a split just shows two rows the owner
     can give the same voice. The prompt asks the model for aliases, which do merge.
@@ -577,6 +588,20 @@ class Roster:
         first = words[0]
         return sorted(found, key=lambda k: (normalize_name(self.characters[k]["name"]).split() or [k])[0] != first)
 
+    def _by_surname(self, norm: str) -> List[str]:
+        """The characters whose last name is this one word; none when anyone has it as a first name
+        or whole name ("Lo" may be a first name), so a bare surname is only ever a fallback."""
+        found = []
+        for key, character in self.characters.items():
+            key_words = normalize_name(character["name"]).split() or key.split()
+            if _local_reference(character["name"]) or _relationship_owner(character["name"]):
+                continue
+            if key_words[0] == norm:
+                return []
+            if len(key_words) > 1 and key_words[-1] == norm:
+                found.append(key)
+        return found
+
     def resolve(self, name: str, gender: str = "unknown") -> Optional[str]:
         """The key of the existing character this name refers to, or None when it is new: the same
         normalized name, a recorded alias, or (for a first name / fuller name pair) exactly one
@@ -610,6 +635,12 @@ class Roster:
         candidates = [] if _relationship_owner(name) else [
             k for k in self._candidates(norm)
             if "unknown" in (gender, self._gender(k)) or gender == self._gender(k)]
+        if not candidates and len(norm.split()) == 1 and titled == norm and not _relationship_owner(name):
+            # "Lo" for "Detective Natalie Lo": a bare surname, never a titled one ("Mrs. Marsh" is
+            # someone else than "Ada Marsh"), when exactly one character has it
+            by_surname = self._by_surname(norm)
+            candidates = [k for k in by_surname if len(by_surname) == 1
+                          and ("unknown" in (gender, self._gender(k)) or gender == self._gender(k))]
         if len(candidates) == 1:
             return candidates[0]
         first = norm.split()[0]
@@ -910,15 +941,18 @@ def merge_self_introductions(paragraphs: List[List[Segment]], result: Dict[int, 
 
 def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]], anchors: Dict[int, str],
                  roster: Roster, chat: Chat, stats: dict, log: logging.Logger = logger, label: str = "",
-                 narrator: Optional[str] = None, narrator_aliases: Collection[str] = ()) -> None:
+                 narrator: Optional[str] = None, narrator_aliases: Collection[str] = (),
+                 skip: Collection[int] = ()) -> None:
     """Ask once more, with wider context, about the lines core.cast_review flags. A reply that names
     someone replaces the first pass's answer unless the line's own text rules that character out
     (pronoun tag of the other gender, "I said" given to a non-narrator: stats["review_rejected"]);
-    "unknown" keeps it; an unusable reply changes nothing (logged, counted in stats["review_unusable"]). result is updated in place."""
+    "unknown" keeps it; an unusable reply changes nothing (logged, counted in stats["review_unusable"]).
+    Lines in skip (quoted terms) are never asked. result is updated in place."""
     if narrator:
         roster.set_chapter_narrator(narrator, narrator_aliases)
     flags = cast_review.flag_lines(paragraphs, result, anchors, roster.characters,
                                    narrator=roster.chapter_narrator)
+    flags = {i: reasons for i, reasons in flags.items() if i not in skip}
     if not flags:
         return
     narrator_key = roster.chapter_narrator or cast_review.narrator_by_tags(paragraphs, result)
@@ -987,13 +1021,14 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
 
     stats is updated in place: windows asked, invalid_json (windows whose first reply was
     unusable), invalid_after_retry (windows whose retry was unusable too), lines, tagged_lines,
-    unknown_lines, seconds.
+    unknown_lines, quoted_terms, seconds. A quoted term in the narration ("the "other two" bodies",
+    core.speech_tags.quoted_terms) is no speech: never asked, no speaker, not an unknown line.
     """
     roster.new_chapter()  # family and narrator references belong only to this chapter
     roster.set_chapter_narrator(narrator, narrator_aliases)
     result: Dict[int, Optional[str]] = {}
     llm_moods: Dict[int, str] = {}
-    for field in ("windows", "invalid_json", "invalid_after_retry", "lines", "tagged_lines", "unknown_lines"):
+    for field in ("windows", "invalid_json", "invalid_after_retry", "lines", "tagged_lines", "unknown_lines", "quoted_terms"):
         stats.setdefault(field, 0)
     stats.setdefault("seconds", 0.0)
     anchors = tagged_speakers(paragraphs)
@@ -1002,8 +1037,11 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
     for line_id in first_person_tagged(paragraphs):
         if line_id not in contradictions:
             anchors.setdefault(line_id, narrator_name)
+    terms = quoted_terms(paragraphs)
+    for line_id in terms:
+        anchors.pop(line_id, None)
     rule_moods = segment_moods(paragraphs)
-    windows = build_windows(paragraphs, known=anchors)
+    windows = build_windows(paragraphs, known=anchors, skip=terms)
     started = time.monotonic()
 
     def known_now() -> Dict[int, str]:
@@ -1013,12 +1051,12 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
         return known
 
     for number, window in enumerate(windows, 1):
-        window = window._replace(passage=render_window(paragraphs, window, known_now()))
+        window = window._replace(passage=render_window(paragraphs, window, known_now(), terms))
         speakers, characters, window_moods = None, [], {}
         for attempt in (1, 2):
             reply = chat(_messages(window, roster))
             try:
-                speakers, characters, window_moods = parse_reply(reply, window.ids, ignore_ids=anchors)
+                speakers, characters, window_moods = parse_reply(reply, window.ids, ignore_ids={*anchors, *terms})
                 break
             except AttributionError as e:
                 if attempt == 1:
@@ -1057,7 +1095,7 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
     merge_self_introductions(paragraphs, result, roster, stats, log, label, chat)
     if REVIEW_FLAGGED_LINES:
         review_lines(paragraphs, result, anchors, roster, chat, stats, log, label,
-                     narrator, narrator_aliases)
+                     narrator, narrator_aliases, terms)
         for line in all_lines:  # a continued line follows its (possibly corrected) first part
             if line.continues and line.line_id - 1 in result:
                 result[line.line_id] = result[line.line_id - 1]
@@ -1074,6 +1112,7 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
             moods[line.line_id] = rule_mood if rule_mood != MOOD_NORMAL else llm_moods.get(line.line_id, MOOD_NORMAL)
     stats["lines"] = stats.get("lines", 0) + len(all_lines)
     stats["tagged_lines"] = stats.get("tagged_lines", 0) + len(anchors)
-    stats["unknown_lines"] = stats.get("unknown_lines", 0) + sum(1 for v in result.values() if v is None)
+    stats["quoted_terms"] = stats.get("quoted_terms", 0) + len(terms)
+    stats["unknown_lines"] = stats.get("unknown_lines", 0) + sum(1 for i, v in result.items() if v is None and i not in terms)
     stats["seconds"] = round(stats.get("seconds", 0.0) + time.monotonic() - started, 2)
     return result, moods
