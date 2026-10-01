@@ -3,6 +3,7 @@ import base64
 import io
 import threading
 import time
+import weakref
 
 import numpy as np
 import pytest
@@ -193,6 +194,37 @@ def test_oom_split_and_retry(voices):
     out = post(c, items).json()["items"]
     assert all(o["error"] is None and o["wav_b64"] for o in out)
     assert [len(call["ids"]) for call in synth.calls] == [8, 4, 2, 2, 4, 2, 2]
+
+
+def test_oom_releases_failed_batch_before_cleanup_and_retry(voices, monkeypatch):
+    refs = []
+    retries = []
+
+    class Resource:
+        pass
+
+    class Synth(FakeSynth):
+        def generate(self, chunk, cfg, seed, max_new_tokens):
+            if len(chunk) > 2:
+                resource = Resource()
+                refs.append(weakref.ref(resource))
+                raise OutOfMemory("cuda oom")
+            retries.append([r["id"] for r in chunk])
+            return super().generate(chunk, cfg, seed, max_new_tokens)
+
+    def clean_cache():
+        assert all(ref() is None for ref in refs)
+
+    monkeypatch.setattr(server, "empty_cuda_cache", clean_cache)
+    synth = Synth()
+    client = TestClient(create_app(synth, voices_dir=str(voices)))
+    items = [item("i3", "xxx"), item("i1", "x"), item("i4", "xxxx"), item("i2", "xx")]
+
+    out = post(client, items).json()["items"]
+
+    assert [o["id"] for o in out] == ["i3", "i1", "i4", "i2"]
+    assert all(o["error"] is None and o["wav_b64"] for o in out)
+    assert retries == [["i1", "i2"], ["i3", "i4"]]
 
 
 def test_oom_single_item_fails_others_succeed(voices):

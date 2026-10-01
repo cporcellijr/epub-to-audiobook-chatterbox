@@ -198,26 +198,32 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
             if len(audios) != len(chunk):
                 raise RuntimeError(f"model returned {len(audios)} takes for {len(chunk)} items")
         except Exception as exc:
-            if is_oom(exc):
-                empty_cuda_cache()
-                if len(chunk) > 1:
-                    half = len(chunk) // 2
-                    log.warning("out of memory at batch %d; retrying as %d + %d", len(chunk), half, len(chunk) - half)
-                    run_chunk(chunk[:half], cfg, seed, results)
-                    run_chunk(chunk[half:], cfg, seed, results)
-                    return
-                log.error("out of memory on a single item (%s)", chunk[0]["id"])
-            else:
+            if not is_oom(exc):
                 log.exception("chunk of %d failed", len(chunk))
-            for r in chunk:
-                results[r["id"]] = (None, f"{type(exc).__name__}: {exc}")
+                for r in chunk:
+                    results[r["id"]] = (None, f"{type(exc).__name__}: {exc}")
+                return
+            error = f"{type(exc).__name__}: {exc}"
+        else:
+            elapsed = time.perf_counter() - started
+            seconds = sum(len(a) for a in audios) / SAMPLE_RATE
+            log.info("chunk of %d: %.1fs audio in %.1fs = %.2fx real time", len(chunk), seconds, elapsed,
+                     seconds / elapsed if elapsed > 0 else 0.0)
+            for r, audio in zip(chunk, audios):
+                results[r["id"]] = (audio, None if len(audio) else "no audio generated")
             return
-        elapsed = time.perf_counter() - started
-        seconds = sum(len(a) for a in audios) / SAMPLE_RATE
-        log.info("chunk of %d: %.1fs audio in %.1fs = %.2fx real time", len(chunk), seconds, elapsed,
-                 seconds / elapsed if elapsed > 0 else 0.0)
-        for r, audio in zip(chunk, audios):
-            results[r["id"]] = (audio, None if len(audio) else "no audio generated")
+
+        # Leave the exception handler first: its traceback can hold GPU tensors from generate().
+        empty_cuda_cache()
+        if len(chunk) > 1:
+            half = len(chunk) // 2
+            log.warning("out of memory at batch %d; retrying as %d + %d", len(chunk), half, len(chunk) - half)
+            run_chunk(chunk[:half], cfg, seed, results)
+            run_chunk(chunk[half:], cfg, seed, results)
+            return
+        log.error("out of memory on a single item (%s)", chunk[0]["id"])
+        for r in chunk:
+            results[r["id"]] = (None, error)
 
     def run_batch(body: BatchRequest) -> dict:
         started = time.perf_counter()
