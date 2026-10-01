@@ -37,7 +37,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import gradio as gr
 import yaml
@@ -47,7 +47,7 @@ from pydub import AudioSegment
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import breeze_client, delivery, voice_measure, voice_transcripts
+from audiobook_generator.core import breeze_client, delivery, voice_design, voice_measure, voice_transcripts
 from audiobook_generator.core.cast_llm import llm_configured
 from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.core.chatterbox_control import chatterbox_url
@@ -336,9 +336,19 @@ def preview_delivery_range(voice: str, phrase: str, exaggeration: float, cfg_wei
     return path
 
 
+def _save_preview(audio: AudioSegment) -> str:
+    """Write a sample to a temp mp3 for the player; the previous one is deleted."""
+    global _current_preview_path
+    handle, path = tempfile.mkstemp(prefix="voice_preview_", suffix=".mp3")
+    with os.fdopen(handle, "wb") as f:
+        audio.export(f, format="mp3")
+    _delete_if_exists(_current_preview_path)
+    _current_preview_path = path
+    return path
+
+
 def _breeze_sample(voice: str) -> str:
     """One-off Breeze sample of PREVIEW_PHRASE in a voice file, as one item of a batch."""
-    global _current_preview_path
     if not breeze_client.configured():
         raise gr.Error("Breeze is not configured (BREEZE_BASE_URL).")
     ref_text = voice_transcripts.transcript(voice)
@@ -352,12 +362,7 @@ def _breeze_sample(voice: str) -> str:
         raise gr.Error(f"Could not reach Breeze: {e}")
     if isinstance(take, str):
         raise gr.Error(f"Breeze could not make the sample: {take}")
-    handle, path = tempfile.mkstemp(prefix="voice_preview_", suffix=".mp3")
-    with os.fdopen(handle, "wb") as f:
-        take.export(f, format="mp3")
-    _delete_if_exists(_current_preview_path)
-    _current_preview_path = path
-    return path
+    return _save_preview(take)
 
 
 def _kokoro_sample(voice: str, speed: float) -> str:
@@ -566,18 +571,44 @@ def _chatterbox_voice_files() -> Dict[str, str]:
             if name.lower().endswith(web_ui.VOICE_FILE_EXTENSIONS) and os.path.isfile(os.path.join(voices_dir, name))}
 
 
+def _breeze_measure_speech(voice: str) -> bytes:
+    """Breeze speaking voice_measure.MEASURE_TEXT in this voice, as WAV bytes (one item of a batch)."""
+    ref_text = voice_transcripts.transcript(voice)
+    if not ref_text:
+        raise ValueError(f"Breeze needs the words spoken in {voice}, and the speech check's Whisper model "
+                         "could not transcribe it (SPEECH_CHECK_MODEL)")
+    take = breeze_client.synthesize_batch([{"id": "measure", "text": voice_measure.MEASURE_TEXT, "voice": voice,
+                                            "ref_text": ref_text, "instruction": None, "cfg_scale": None}])[0]
+    if isinstance(take, str):
+        raise RuntimeError(f"Breeze made no audio: {take}")
+    buffer = io.BytesIO()
+    take.export(buffer, format="wav")
+    return buffer.getvalue()
+
+
+def _speech_engine() -> str:
+    """The engine that speaks the measuring sentence: Breeze once it is set up (Chatterbox is retired
+    for it and kept off the GPU), else Chatterbox."""
+    return "Breeze" if breeze_client.configured() else "Chatterbox"
+
+
 def measure_voice(voice: str) -> dict:
-    """Have Chatterbox speak voice_measure.MEASURE_TEXT with this voice (the saved delivery
-    settings, as a book would), measure the speech and save it; returns the measurement."""
+    """Have Breeze (or, when it isn't configured, Chatterbox with the saved delivery settings, as a
+    book would) speak voice_measure.MEASURE_TEXT with this voice, measure the speech and save it;
+    returns the measurement."""
     path = _chatterbox_voice_files().get(voice)
     if not path:
         raise ValueError(f"'{voice}' is not in the voices folder")
-    settings = read_saved_settings()
-    payload = {"text": voice_measure.MEASURE_TEXT, "voice_mode": "predefined", "predefined_voice_id": voice,
-               "output_format": "wav", "split_text": True, "chunk_size": 500, "speed_factor": 1.0,
-               "exaggeration": settings["exaggeration"], "cfg_weight": settings["cfg_weight"],
-               "temperature": settings["temperature"]}
-    measurement = voice_measure.measure_audio(_post_json("/tts", payload, timeout=MEASURE_TIMEOUT_SECONDS))
+    if breeze_client.configured():
+        audio = _breeze_measure_speech(voice)
+    else:
+        settings = read_saved_settings()
+        payload = {"text": voice_measure.MEASURE_TEXT, "voice_mode": "predefined", "predefined_voice_id": voice,
+                   "output_format": "wav", "split_text": True, "chunk_size": 500, "speed_factor": 1.0,
+                   "exaggeration": settings["exaggeration"], "cfg_weight": settings["cfg_weight"],
+                   "temperature": settings["temperature"]}
+        audio = _post_json("/tts", payload, timeout=MEASURE_TIMEOUT_SECONDS)
+    measurement = voice_measure.measure_audio(audio)
     voice_measure.save_features(voice, measurement, voice_measure.file_signature(path))
     logger.info(f"Voice measured: {voice} {measurement}")
     return measurement
@@ -592,13 +623,13 @@ def voice_sound_words(voice: Optional[str]) -> str:
 
 
 def _measure_after_add(voice: str) -> str:
-    """Measure a voice just added; a failure (Chatterbox busy, unloaded or unreachable) never
+    """Measure a voice just added; a failure (the engine busy, unloaded or unreachable) never
     fails the add, it only leaves the voice for Measure voices."""
     try:
         measure_voice(voice)
     except Exception as e:
         logger.warning(f"Voice {voice} not measured after adding it: {e}")
-        return "Not measured yet (Chatterbox couldn't be asked just now): press **Measure voices** later."
+        return f"Not measured yet ({_speech_engine()} couldn't be asked just now): press **Measure voices** later."
     return f"Measured: sounds {voice_sound_words(voice)}."
 
 
@@ -614,9 +645,8 @@ def voice_sound_text(voice: Optional[str]) -> str:
 
 
 def measure_voices() -> str:
-    """Voice lab: measure every Chatterbox voice not measured yet, or changed since (about 3 s
-    each). Stops at the first sign that Chatterbox can't be reached rather than timing out on
-    every voice."""
+    """Voice lab: measure every voice not measured yet, or changed since (about 3 s each). Stops at
+    the first sign that the engine can't be reached rather than timing out on every voice."""
     files = _chatterbox_voice_files()
     if not files:
         raise gr.Error("The Chatterbox voices folder is not mounted (TTS_VOICES_DIR).")
@@ -631,7 +661,7 @@ def measure_voices() -> str:
         except urllib.error.HTTPError as e:
             failed.append(f"{os.path.splitext(voice)[0]} ({_http_error_detail(e)})")
         except (urllib.error.URLError, OSError) as e:
-            return (f"Measured {done} of {len(todo)}, then Chatterbox couldn't be reached ({e}). "
+            return (f"Measured {done} of {len(todo)}, then {_speech_engine()} couldn't be reached ({e}). "
                     "Press **Measure voices** again when it's running.")
         except Exception as e:  # this voice's audio couldn't be measured; the others still can
             failed.append(f"{os.path.splitext(voice)[0]} ({e})")
@@ -1048,6 +1078,8 @@ def cast_rows(cast: dict, engine: str) -> Tuple[list, list]:
         role = profile.get("role", "")
         shown = ("(narrator's voice)" if key == narrating
                  else labels.get(voice, voice) if voice else "(dialogue voice)")
+        if voice and key != narrating and (character.get("voice_design") or {}).get("status") == voice_design.PENDING:
+            shown += " (a new voice is designed when the book starts)"
         rows.append([character.get("name", key), "" if role == "unknown" else role, int(character.get("lines", 0)),
                      character.get("gender", "unknown"), character.get("age", "unknown"), shown,
                      profile.get("voice", ""), ", ".join(character.get("aliases", []))])
@@ -1123,18 +1155,39 @@ def engine_voice_traits(engine: str, voices: Optional[List[Tuple[str, str]]] = N
 def _fill_missing_voices(cast: dict, path: str, engine: str, narrator_voice: Optional[str]) -> dict:
     """Give every character without a voice the automatic suggestion and save, so what the table
     shows is exactly what a queued book would use. A first-person book's narrating character gives
-    up any suggested voice first: their lines are the narrator's."""
-    if cast_store.release_narrating_voice(cast):
+    up any suggested voice first: their lines are the narrator's. With Breeze, a main character the
+    suggestion fits badly is marked for a designed voice (core.voice_design): the book designs it
+    when it starts, and uses the suggestion if that fails."""
+    changed = cast_store.release_narrating_voice(cast)
+    if engine == "breeze":
+        changed = _forget_deleted_designs(cast) or changed
+    if changed:
         cast_store.save_cast(path, cast)
     narrating = cast_store.narrating_character(cast)
     if any(not c.get("voice") for key, c in cast["characters"].items() if key != narrating):
         voices = engine_voices_with_gender(engine)
-        suggestions = cast_store.suggest_voices(cast, voices, narrator_voice, engine_voice_traits(engine, voices))
+        traits = engine_voice_traits(engine, voices)
+        suggestions = cast_store.suggest_voices(cast, voices, narrator_voice, traits)
         for key, voice in suggestions.items():
             cast["characters"][key]["voice"] = voice
+        if engine == "breeze":
+            voice_design.mark_pending(cast, list(suggestions), dict(voices), traits)
         if suggestions:
             cast_store.save_cast(path, cast)
     return cast
+
+
+def _forget_deleted_designs(cast: dict) -> bool:
+    """A character whose designed voice file was deleted from the library gets a suggestion again."""
+    known = engine_voice_ids("breeze")
+    if known is None:
+        return False
+    gone = [c for c in cast["characters"].values()
+            if (c.get("voice_design") or {}).get("status") == voice_design.DONE and c.get("voice") not in known]
+    for character in gone:
+        character["voice"], character["voice_picked"] = None, False
+        character.pop("voice_design")
+    return bool(gone)
 
 
 def _fill_narrator_suggestion(cast: dict, path: str, engine: str,
@@ -1435,6 +1488,7 @@ def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gende
         character = cast["characters"][character_key]
         character["gender"] = gender if gender in cast_store.GENDERS else "unknown"
         character["voice"], character["voice_picked"] = None, False  # follows the narrator again
+        character.pop("voice_design", None)
         character["delivery"] = delivery_choice if delivery_choice in cast_store.DELIVERIES else "auto"
         cast_store.save_cast(path, cast)
         rows, keys = cast_rows(cast, engine)
@@ -1448,12 +1502,116 @@ def apply_cast_edit(cast_key: Optional[str], character_key: Optional[str], gende
         raise gr.Error(f"'{voice}' isn't one of the {engine} voices (was it deleted or renamed?).")
     character = cast["characters"][character_key]
     character["gender"] = gender if gender in cast_store.GENDERS else "unknown"
+    if (character.get("voice_design") or {}).get("file") != voice:
+        character.pop("voice_design", None)  # a design waiting for this character is no longer wanted
     character["voice"] = voice
     character["voice_picked"] = True  # Suggest voices again keeps it
     character["delivery"] = delivery_choice if delivery_choice in cast_store.DELIVERIES else "auto"
     cast_store.save_cast(path, cast)
     rows, keys = cast_rows(cast, engine)
     return gr.update(value=rows, visible=True), keys, f"Saved **{character.get('name', character_key)}**: {gender}, {voice}."
+
+
+# ---- Designed voices (Breeze) ----
+
+def _design_blocker(jobs: List[dict], books: bool) -> str:
+    """Why a voice can't be designed now, or "": a running cast analysis has the GPU for the language
+    model; with books=True a running book is Breeze's too (a design takes minutes of its time)."""
+    for job in jobs:
+        if job.get("status") != RUNNING:
+            continue
+        if job_kind(job) == CAST:
+            return "A cast analysis is running and the language model has the GPU: design voices once it has finished."
+        if books and job_kind(job) == BOOK:
+            return "A book is generating and Breeze is busy with it: design voices once it has finished."
+    return ""
+
+
+def _require_breeze_design(jobs: List[dict], books: bool) -> None:
+    if not breeze_client.configured():
+        raise gr.Error("Voices are designed by Breeze (BREEZE_BASE_URL is not set).")
+    blocker = _design_blocker(jobs, books)
+    if blocker:
+        raise gr.Error(blocker)
+
+
+def design_description_for(cast_key: Optional[str], character_key: Optional[str]) -> dict:
+    """The cast editor's description box for the selected character: the one a design was (or is to
+    be) made from, else what their profile suggests (core.voice_design.describe)."""
+    cast = cast_store.load_cast(cast_file_for(cast_key)) if cast_key else None
+    character = ((cast or {}).get("characters") or {}).get(character_key or "")
+    if not character:
+        return gr.update(value="")
+    return gr.update(value=(character.get("voice_design") or {}).get("description") or voice_design.describe(character))
+
+
+def design_character_voice(cast_key: Optional[str], character_key: Optional[str], description: str, engine: str,
+                           jobs: List[dict]) -> tuple:
+    """Cast editor, Breeze: design a voice from the description for the selected character, give it to
+    them as the owner's own pick (automatic suggestions never replace it) and play it. Returns the
+    refreshed table, keys, a status line, the voice dropdown and the sample's player value."""
+    if engine != "breeze":
+        raise gr.Error("Voices are designed by Breeze: switch the Engine to Breeze first.")
+    _require_breeze_design(jobs, books=False)
+    if not cast_key or not character_key:
+        raise gr.Error("Click a character in the cast table first.")
+    cast = cast_store.load_cast(cast_file_for(cast_key))
+    if cast is None or character_key not in cast["characters"]:
+        raise gr.Error("That character is no longer in the cast (was it re-analysed?).")
+    if not (description or "").strip():
+        raise gr.Error("Describe the voice first (who they are and how they sound).")
+    character = cast["characters"][character_key]
+    try:
+        file_name, measurement = voice_design.design_voice(
+            character.get("name", character_key), description, character.get("gender", "unknown"),
+            character.get("age", "unknown"))
+    except voice_design.DesignError as error:
+        raise gr.Error(f"Could not design a voice: {error}")
+    cast = cast_store.load_cast(cast_file_for(cast_key)) or cast  # edited while Breeze worked
+    character = cast["characters"].get(character_key) or character
+    character["voice"], character["voice_picked"] = file_name, True
+    character["voice_design"] = {"status": voice_design.DONE, "description": " ".join(description.split()),
+                                 "file": file_name}
+    cast_store.save_cast(cast_file_for(cast_key), cast)
+    clip = AudioSegment.from_file(os.path.join(os.environ["TTS_VOICES_DIR"], file_name))
+    rows, keys = cast_rows(cast, engine)
+    message = (f"Designed **{os.path.splitext(file_name)[0]}** for **{character.get('name', character_key)}** "
+               f"({measurement['f0_median']:.0f} Hz) and saved it as their voice.")
+    return (gr.update(value=rows, visible=True), keys, message,
+            gr.update(choices=engine_voice_choices(engine), value=file_name), _save_preview(clip))
+
+
+def design_starter_voices(jobs: Callable[[], List[dict]],
+                          designer: Callable[..., tuple] = voice_design.design_voice) -> Iterator[str]:
+    """Voice lab: design every voice of voice_design.STARTER_VOICES whose file doesn't exist yet, one
+    after another (about 40 s each), yielding progress text. Stops if a book or a cast analysis starts
+    meanwhile: they need the GPU. `jobs` is called before every voice for the queue's current jobs."""
+    _require_breeze_design(jobs(), books=True)
+    folder = os.environ.get("TTS_VOICES_DIR")
+    if not folder or not os.path.isdir(folder):
+        raise gr.Error("The Chatterbox voices folder is not mounted (TTS_VOICES_DIR).")
+    todo = [v for v in voice_design.STARTER_VOICES
+            if not os.path.exists(os.path.join(folder, voice_design.file_name_for(v[0])))]
+    if not todo:
+        yield f"All {len(voice_design.STARTER_VOICES)} starter voices are already in the library."
+        return
+    made, failed = 0, []
+    for number, (name, gender, age, description) in enumerate(todo, 1):
+        blocker = _design_blocker(jobs(), books=True)
+        if blocker:
+            yield f"Designed {made} of {len(todo)}, then stopped. {blocker}"
+            return
+        yield f"Designing {number} of {len(todo)}: **{name}** (about 40 s each)..."
+        try:
+            designer(name, description, gender, age)
+            made += 1
+        except Exception as error:
+            logger.warning("Starter voice %s was not designed: %s", name, error)
+            failed.append(f"{name} ({error})")
+    message = f"Designed {made} starter voice{'' if made == 1 else 's'}."
+    if failed:
+        message += f" Couldn't design {'; '.join(failed)}."
+    yield message
 
 
 def analysis_settings(library_book, input_file, chapter_table, engine: str, voice: str, title_mode: str,
@@ -2014,6 +2172,18 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                         if engine in FILE_VOICE_ENGINES else gr.update())
         return message, lab_update, voice_update, gr.update(choices=own_voice_choices(), value=None)
 
+    def design_for_character(cast_key, character_key, description, engine) -> tuple:
+        return design_character_voice(cast_key, character_key, description, engine, queue.jobs())
+
+    def design_starters() -> Iterator[str]:
+        yield from design_starter_voices(queue.jobs)
+
+    def voice_lists_after_design() -> tuple:
+        """New voice files in the Make tab's, the Voice lab's and the delete dropdowns, selections kept."""
+        choices = openai_voice_choices()
+        return (gr.update(choices=choices), gr.update(choices=choices), gr.update(choices=own_voice_choices()),
+                gr.update(choices=dialogue_voice_choices(choices)))
+
     def select_job(ids: list, evt: gr.SelectData) -> tuple:
         row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
         job = next((j for j in queue.jobs() if 0 <= row < len(ids) and j["id"] == ids[row]), None)
@@ -2178,6 +2348,13 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                                            "two spellings): merge them.")
                         cast_merge_button = gr.Button("Merge", size="sm", scale=0, min_width=100)
                     cast_merge_confirmed = gr.Checkbox(False, visible=False)
+                    with gr.Row(equal_height=True, visible=initial_engine == "breeze") as cast_design_row:
+                        cast_design_text = gr.Textbox(
+                            label="Design a voice for them", lines=2, scale=4,
+                            info="Breeze invents a voice from this description (about 40 s) and gives it to the "
+                                 "character; the book also designs one by itself for a main character no "
+                                 "library voice suits.")
+                        cast_design_button = gr.Button("Design a new voice", size="sm", scale=0, min_width=170)
                 cast_key_state = gr.State(None)
                 cast_keys_state = gr.State([])
                 cast_selected = gr.State(None)
@@ -2254,6 +2431,16 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                     "liveliness. **Measure voices** speaks one sentence with every voice not measured yet (about "
                     "3 s each); a voice you add is measured straight away.")
 
+            if breeze_client.configured():
+                with gr.Accordion("Design starter voices (advanced)", open=False):
+                    gr.Markdown("Breeze designs a spread of voices (both genders, child to elderly, low to high, "
+                                "clear, husky, raspy and breathy, a few accents) straight into your library, "
+                                "skipping any it already made. It takes about 40 s per voice, so 15 minutes or "
+                                "more, and needs the GPU to itself: it won't start while a book is generating "
+                                "or a cast is being analysed.")
+                    design_starters_button = gr.Button("Design starter voices", scale=0, min_width=200)
+                    design_starters_status = gr.Markdown()
+
             gr.Markdown("### Delete a voice")
             with gr.Row(equal_height=True):
                 delete_voice_dropdown = gr.Dropdown(own_voice_choices(), value=None, label="Your voices",
@@ -2310,7 +2497,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                outputs=[cast_table, cast_keys_state, cast_status, *narrator_outputs])
         cast_table.select(select_cast_row, inputs=[cast_key_state, cast_keys_state, engine],
                           outputs=[cast_selected, cast_editing, cast_gender, cast_voice, cast_profile, cast_delivery]) \
-            .then(merge_choices, inputs=[cast_key_state, cast_selected], outputs=cast_merge_into)
+            .then(merge_choices, inputs=[cast_key_state, cast_selected], outputs=cast_merge_into) \
+            .then(design_description_for, inputs=[cast_key_state, cast_selected], outputs=cast_design_text)
+        engine.change(lambda chosen: gr.update(visible=chosen == "breeze"), inputs=engine, outputs=cast_design_row)
+        cast_design_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
+            .then(design_for_character, inputs=[cast_key_state, cast_selected, cast_design_text, engine],
+                  outputs=[cast_table, cast_keys_state, cast_status, cast_voice, sample_audio])
         cast_merge_button.click(
             None, inputs=None, outputs=cast_merge_confirmed,
             js="() => confirm('Merge this character into the one picked? Their lines, names and aliases move "
@@ -2359,6 +2551,10 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             .then(voice_sound_text, inputs=lab_voice, outputs=lab_sound)
         measure_button.click(measure_voices, inputs=None, outputs=measure_status) \
             .then(voice_sound_text, inputs=lab_voice, outputs=lab_sound)
+        if breeze_client.configured():
+            design_starters_button.click(design_starters, inputs=None, outputs=design_starters_status) \
+                .then(voice_lists_after_design, inputs=None,
+                      outputs=[voice, lab_voice, delete_voice_dropdown, dialogue_voice])
         # The player stays hidden until the first sample, then shows before the audio arrives.
         sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
             .then(sample_voice, inputs=[engine, voice, speed], outputs=sample_audio)

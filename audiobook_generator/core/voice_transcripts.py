@@ -2,7 +2,8 @@
 
 Transcribed once with the app's Whisper (core.speech_check) over the whole clip and saved in
 VOICE_TRANSCRIPTS_FILE (app data, next to voice_features.json) with the voice file's size and
-modification time, so a replaced clip is transcribed again.
+modification time, so a replaced clip is transcribed again. A designed voice speaks a fixed sample, so its
+words are recorded with `remember` instead.
 """
 import json
 import logging
@@ -72,3 +73,13 @@ def transcript(voice: str, voices_dir: Optional[str] = None, path: Optional[str]
     except OSError as error:
         logger.warning("Could not save the voice transcripts: %s", error)
     return text
+
+
+def remember(voice: str, text: str, voices_dir: Optional[str] = None, path: Optional[str] = None) -> None:
+    """Record the words of a clip whose text is known (a designed voice speaks a fixed sample), so no
+    Whisper pass is needed. Raises OSError when the clip is missing."""
+    voices_dir = voices_dir or os.environ.get("TTS_VOICES_DIR") or ""
+    path = path or VOICE_TRANSCRIPTS_FILE
+    saved = _load(path)
+    saved[voice] = {"text": text, "signature": file_signature(os.path.join(voices_dir, voice))}
+    _write(saved, path)

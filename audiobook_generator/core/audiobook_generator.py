@@ -246,6 +246,19 @@ class AudiobookGenerator:
         idx, title, text = args
         return idx, self.process_chapter(idx, title, text)
 
+    def _design_cast_voices(self) -> None:
+        """A Breeze cast book designs the voices its cast marked pending (core.voice_design) before the
+        provider reads the cast: Breeze is loaded for the book by now, and a design that fails only
+        leaves the character the voice that was suggested, so it never stops the book."""
+        if (self.config.preview or getattr(self.config, "model_name", None) != "breeze"
+                or getattr(self.config, "voice_mode", None) != "cast" or not getattr(self.config, "cast_file", None)):
+            return
+        try:
+            from audiobook_generator.core.voice_design import design_pending_voices
+            design_pending_voices(self.config.cast_file)
+        except Exception as error:
+            logger.warning("Designing the cast's voices failed (the suggested voices are used): %s", error)
+
     def run(self) -> bool:
         """Generate the book; True when every selected chapter (and the M4B, if asked) succeeded."""
         succeeded = False
@@ -256,6 +269,7 @@ class AudiobookGenerator:
                 # Chapters become AAC (ADTS) so the M4B can be built with a stream copy
                 # instead of a second lossy re-encode (F-06); loose-file output is unaffected.
                 self.config.output_format = "aac"
+            self._design_cast_voices()
             tts_provider = get_tts_provider(self.config)
 
             # Preview writes nothing unless chapter text was asked for, so previewing into a

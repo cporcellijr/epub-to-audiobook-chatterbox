@@ -590,11 +590,16 @@ def suggest_voices(cast: dict, voices: List[Tuple[str, str]], narrator_voice: Op
 
 def clear_suggested_voices(cast: dict) -> int:
     """Take away every voice the owner didn't pick (character["voice_picked"], set when a voice is
-    saved in the cast editor), so suggest_voices can choose them again; returns how many."""
+    saved in the cast editor) and every pending or failed voice design, so suggest_voices can choose
+    them again; returns how many. A voice designed for the character stays (core.voice_design)."""
     cleared = 0
     for character in cast.get("characters", {}).values():
+        design = character.get("voice_design") or {}
+        if design.get("status") == "done":
+            continue  # a designed voice took ~40 s to make: it stays, like a pick
         if character.get("voice") and not character.get("voice_picked"):
             character["voice"] = None
+            character.pop("voice_design", None)
             cleared += 1
     return cleared
 
@@ -606,12 +611,13 @@ def carry_voice_choices(previous: Optional[dict], characters: Dict[str, dict], p
     A character matches by key, else by exactly one earlier character sharing a name or alias with
     it; an ambiguous match is left for the owner to review. Characters that already have a voice are
     left alone. picked_only carries only the voices the owner saved in the cast editor
-    ("voice_picked"), leaving the rest to fresh suggestions. Returns how many characters got a
-    carried voice."""
+    ("voice_picked") and the ones designed for a character, leaving the rest to fresh suggestions.
+    Returns how many characters got a carried voice."""
     if not previous:
         return 0
     old = {key: c for key, c in previous.get("characters", {}).items()
-           if c.get("voice") and (c.get("voice_picked") or not picked_only)}
+           if c.get("voice") and (c.get("voice_picked") or not picked_only
+                                  or (c.get("voice_design") or {}).get("status") == "done")}
 
     def forms(key: str, character: dict) -> set:
         names = [character.get("name", ""), *character.get("aliases", [])]
@@ -633,6 +639,8 @@ def carry_voice_choices(previous: Optional[dict], characters: Dict[str, dict], p
         character["voice"] = old[match]["voice"]
         if old[match].get("voice_picked"):
             character["voice_picked"] = True
+        if (old[match].get("voice_design") or {}).get("status") == "done":
+            character["voice_design"] = dict(old[match]["voice_design"])  # a designed voice is kept like a pick
         if old[match].get("gender") in GENDERS and old[match]["gender"] != "unknown":
             character["gender"] = old[match]["gender"]
         carried += 1

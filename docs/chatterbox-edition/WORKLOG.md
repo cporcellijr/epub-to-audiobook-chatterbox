@@ -2230,3 +2230,46 @@ Same lines, voices and book settings on both engines; listening page in the sess
   Those, designed voices for unmatched characters, and a usable clip for Teen are phases 3-4.
 - **Long clips:** "andor request.wav" and "good morning.wav" run 25 s, so every request using them
   carries a long reference. Trimming isn't measured.
+
+## 36. Designed voices, and the first real Breeze chapter (2026-10-01)
+
+### 36.1 The owner's test chapter on Breeze
+
+The owner picked the Greene Shorts chapter that gave Chatterbox the most trouble (garbled words,
+random artifacts): 677 units, 49 min of audio, cast mode, through the queue.
+- **Handover:** the cast analysis unloaded Breeze for the LLM. When Start was pressed, the queue
+  loaded it again (136.7 s from a cold disk) and the book started.
+- **Takes:** 664 passed first time, 8 on the second round, 5 on the third. One was kept with a flag
+  (6:23, "Mm-hmm … Jeeesuss", a stretched interjection).
+- **Whole chapter by Whisper:** 94.8% of 8,978 words. The four other 4-word gaps are Whisper's
+  mishearings or the text's paragraph marks. No garbled runs, no near-silent takes.
+- **Speed:** 19.5 min for 49 min of audio, 2.5x real time, against 4-5x on Goblin Chapter 1.
+  Suspected cause, not yet measured: a batch pads every request to its longest voice reference, and
+  this cast uses "andor request.wav" (26 s). Next step: trim references to about 10 s.
+
+### 36.2 Designed voices (phase 3; written by a Sonnet subagent, reviewed here)
+
+- **Who gets one:** in a Breeze cast book, a main character (profiled, with at least
+  `PROFILE_MIN_LINES` lines) whose suggested voice fits poorly. That means the voice is of the
+  other gender, is shared with a bigger or owner-picked character, or misses the pitch band
+  (`match_cost >= OUT_OF_BAND_COST`). The narrating character and owner picks are never designed
+  over, and there are at most 6 per cast.
+- **What happens:** the character is marked `voice_design: pending` with `describe(character)`
+  (gender, age, voice targets and the profile's voice words). The matcher's voice stays as a
+  fallback.
+- **When:** at book start, in the book's process, while Breeze is already loaded
+  (`AudiobookGenerator._design_cast_voices`). Each design is a fixed ~10 s sample whose words are
+  its transcript, checked for length, near-silence, Whisper match and a rough pitch for the gender
+  (male <= 180 Hz, female >= 150 Hz, child >= 250 Hz), with up to 3 seeds.
+- **Saved as:** "<Name> (designed).wav", with its transcript, gender and measurement recorded. It
+  goes into both the job's cast and the saved cast, so later books reuse it. A failure keeps the
+  fallback voice and is not retried.
+- **Advanced:** "Design a new voice" in the cast editor (editable description), and
+  "Design starter voices" in the Voice lab (24 varied descriptions).
+- **Voice measuring** now speaks `MEASURE_TEXT` through Breeze when it is configured.
+- **Live:** Emera (Goblin Stepsister Obsession) was designed from her profile, "A young girl with a
+  high, clear voice. Youthful, playful, sharp, with a lively, expressive delivery." It passed on the
+  first attempt in 42 s at 337 Hz. Breeze then cloned it for a new line, and Whisper matched it 1.00.
+- **Tests:** 828 pass (§35's 772, plus 56).
+- **Not verified live:** a book start with a pending design, the starter-voices run (about 15 min),
+  and the pitch limits on male and low female voices.
