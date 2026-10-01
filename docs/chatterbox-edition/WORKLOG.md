@@ -2873,3 +2873,84 @@ over a story the most-addressed person points the right way (Vic 36, Polly 9 vs 
 thin margins; this needs its own design and measurement before anything ships.
 
 - Tests: 933 app tests pass in the container. Not deployed.
+
+## 46. Narrator choice: nobody the narration names, and an unnamed "I" stays unnamed (2026-10-01)
+
+Phases A+B (§45.1) were deployed first; the container's code matched `302f075`. Evidence for this
+section, outside git: `data/diagnostics/narrator_choice_2026-10-01` (tools and replayed casts).
+
+### 46.1 What went wrong in §45.4
+
+The failed runs' logs show the book-wide guess (one model answer from narration excerpts) overruling
+chapter votes, not only filling gaps:
+
+- An unnamed "I said" vote can never be confirmed by the chapter-only question ("The Narrator" is
+  never offered as an answer), so in a single first-person run it was always replaced by the guess:
+  Alita Bell for chapters 15, 16 and 17 of one window-16 run.
+- A named vote (Vic, chapter 16 of the other) was overruled when the chapter-only answer differed.
+
+A chapter told by anyone but the book's own "I" is read in that teller's own voice, so her voice read
+part of his story.
+
+### 46.2 The rule: nobody the narration names is its "I" (`could_say_i`)
+
+First-person narration calls its teller "I". Over 153 first-person chapters of eight books (the test
+sets and five of the owner's saved casts) real narrators were named in 0-3 narration paragraphs of
+their chapter, 125 chapters in none. The 18 wrong narrators found in saved casts were named in 9-54:
+Alita Bell, and "Ruby" in Goblin Stepsister Obsession, a stepsister the narration talks about (checked
+in the text: the narration describes her to "me"). Named in more than 4, a person is not that
+chapter's narrator, whether the "I said" vote, a neighbour's, the pooled vote, the book-wide guess or
+the chapter-only answer proposes them. Message labels ("Name: hey"; a texting chapter wrote its
+narrator's name 12 times that way) and framed documents don't count. Checked and rejected first:
+speech tags alone ("Allie said") named her once in chapter 15 and never in 16.
+
+### 46.3 Option 1: an unnamed "I" stays unnamed
+
+A story whose "I said" lines only ever went to "The Narrator" keeps one unnamed narrator: the
+book-wide guess no longer names it, and its untagged chapters join it. A story the model names
+anywhere still folds its unnamed chapters into that name (§42). The cost: the narrator's lines the
+model gave to their name (when addressed, say) keep that name's voice. The Apex Prey 2 safeguard (§40:
+a named vote for the dermatologist overruled by the book narrator after the chapter-only question)
+stands, unless the narration names the book narrator.
+
+Unnamed tellers also split at story breaks, on the signs `_split_story_breaks` uses for named ones
+(at least 3 other named people, none shared). Without it a replayed run gave The Dreamers the same
+unnamed narrator as Rattlesnakes.
+
+### 46.4 Measured
+
+Exact replay: the pipeline runs on each saved run's requests, answered with the model's saved
+replies (HEAD reproduces all ten runs exactly; older runs used older code and can't be replayed).
+The scorer judges an unnamed narrator as whoever most of its reference lines belong to: one voice,
+one person.
+
+| Run (wrong of the reference lines) | HEAD | New |
+|---|---|---|
+| You Like It Darker, window 16, rule on | 292 (Alita Bell narrates 15-16, Vic 17) | 104 (Vic, Vic, unnamed 17) |
+| You Like It Darker, window 16, rule off | 294 (Alita Bell narrates 15-16) | 100 (unnamed 15-16, its own unnamed 17) |
+| You Like It Darker phaseAB, phaseA | 100, 100 | 100, 100 |
+| Apex Prey 3 phaseAB, phaseA | 8, 8 (Polly throughout) | 8, 8 |
+| Six Wakes fix2, fix3, phaseA, phaseAB | 2 each | 2 each |
+
+The owner's eight saved first-person casts, rerun offline with a stand-in model that confirms every
+chapter vote (the worst case): the old code makes Ruby narrator of 14 Goblin chapters, the new code
+keeps Rakos; nothing else changes (Apex Prey 2's dermatologist chapter, the Greene collections' five
+tellers, Troy, Oliver).
+
+One live run of the You Like It Darker chapters with the new code: 100 wrong, as before; narrators
+Vic, Vic and The Dreamers' own unnamed narrator (profiled male). The model named Vic in that run, so
+it shows an ordinary run is unchanged; the replays above show the fix.
+
+### 46.5 Option 2 measured, not shipped
+
+Per story (first-person runs split at story breaks), the person others address most by name among
+those the narration doesn't name, needing 3 addresses and twice the next person: 9 stories right, 4
+abstained, none wrong; by chapter 35 right, 66 abstained, 1 wrong. Abstentions: one person split into
+two cast keys (Goblin "Onii-chan" 79 / Rakos 53, Mom's Guidance Troy 55 / "Troy" 47), The Dreamers
+(William Davis is never addressed) and two merged Greene stories. The wrong chapter: in a cast where
+the model had already given The Dreamers' "I said" lines to Vic, the story break could not be seen
+and Vic was named. Looser thresholds (2 addresses, 1.5x) start naming wrong people (Robin for a Greene
+story). It would name an unnamed story's narrator (Rattlesnakes: Vic) and could replace the
+book-wide guess as the safeguard's reference; not done until the owner decides.
+
+- Tests: 936 app tests pass in the container. Not deployed.
