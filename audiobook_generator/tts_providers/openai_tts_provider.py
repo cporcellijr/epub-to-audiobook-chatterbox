@@ -25,6 +25,7 @@ from audiobook_generator.core.audio_tags import AudioTags
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import delivery
 from audiobook_generator.core import speech_check
+from audiobook_generator.core.m4b import LOSSY_BITRATE
 from audiobook_generator.core.dialogue import DIALOGUE, NARRATION, PARAGRAPH_MARK, Segment, chapter_segments
 from audiobook_generator.core.speech_tags import has_speech_tag
 from audiobook_generator.config.general_config import GeneralConfig
@@ -48,6 +49,7 @@ MAX_UNIT_CHARS = 400  # a trailing short sentence joins the previous unit only i
 # packing threshold, so one request never risks that cap either way.
 MAX_REQUEST_CHARS = 450
 _PYDUB_EXPORT = {"aac": ("adts", "aac"), "opus": ("opus", "libopus")}
+_LOSSY_FORMATS = ("mp3", "aac", "opus")
 _BAD_CLIP_SILENCE_MS = 3000
 _BAD_CLIP_SILENCE_DBFS = -50
 _BAD_CLIP_RETRIES = 2
@@ -668,6 +670,7 @@ class OpenAITTSProvider(BaseTTSProvider):
         # base_url=None falls back to OPENAI_BASE_URL exactly as before; a per-config URL (e.g.
         # Kokoro's) must win over that env var, since both can be set at once.
         self.client = OpenAI(max_retries=4, base_url=config.openai_base_url)  # OPENAI_API_KEY env var still required
+        self._tone = None  # tone_match.ToneMatcher, made on the first chapter that matches
         self.cast: Optional[dict] = None
         if config.voice_mode == VOICE_MODE_CAST:
             self.cast = cast_store.load_cast(config.cast_file) if config.cast_file else None
@@ -983,6 +986,7 @@ class OpenAITTSProvider(BaseTTSProvider):
         baseline = (self._delivery_baseline() if self._is_chatterbox_engine()
                     and (self.config.adaptive_delivery or self._has_custom_baseline()) else None)
         pieces: List[bytes] = []
+        spoken: List[Tuple[int, str]] = []  # (index in pieces, voice) of every unit's audio
         audio_format = None
         previous_paragraph = None
         timeline_frames = 0
@@ -1030,6 +1034,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                 pieces.append(b"\0" * gap_frames * audio_format[1] * audio_format[2])
                 timeline_frames += gap_frames
             start_frame = timeline_frames
+            spoken.append((len(pieces), voice))
             pieces.append(audio.raw_data)
             timeline_frames += len(audio.raw_data) // (audio_format[1] * audio_format[2])
             if self._is_chatterbox_engine():
@@ -1052,6 +1057,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                             clip_entries[-1]["settings"])
             previous_paragraph = paragraph
 
+        self._finish_units(pieces, spoken, audio_format)
         self._combine_and_export(pieces, audio_format, speed, output_file, audio_tags)
         if clip_entries:
             map_path = f"{output_file}.clips.json"
@@ -1209,6 +1215,55 @@ class OpenAITTSProvider(BaseTTSProvider):
             logger.warning("Speech check skipped for %s: %s", chunk_id, error)
             return None
 
+    def _finish_units(self, pieces: List[bytes], spoken: List[Tuple[int, str]],
+                      audio_format: Tuple[int, int, int]) -> None:
+        """Last touches on each unit's audio before the chapter is joined (pauses are left alone).
+
+        Tone matching (Chatterbox, on unless the book turned it off): every voice is turned down
+        wherever it comes out brighter than its own reference clip, measured over all of that
+        voice's speech so far in this book (core/tone_match.py).
+
+        Peak guard (lossy chapters): any unit still peaking above delivery.PEAK_GUARD_DBFS is turned
+        down to it. Chatterbox hands back takes peaking near -0.45 dBFS and AAC decoding overshoots
+        that: two finished 64 kb/s books decoded to +1.2 and +1.5 dBFS (2026-09-30), which a player
+        decoding to 16 bits clips. Adaptive delivery already guarded its own units; now every unit is.
+        """
+        rate, channels, width = audio_format
+        match = self._is_chatterbox_engine() and self.config.tone_match is not False
+        guard = self.config.output_format in _LOSSY_FORMATS
+        if channels != 1 or width != 2 or not (match or guard):
+            return
+        import numpy as np
+        from audiobook_generator.core import tone_match
+
+        takes = {index: np.frombuffer(pieces[index], dtype="<i2").astype(np.float32) / 32768
+                 for index, _ in spoken}
+        changed = set()
+        if match:
+            if self._tone is None:
+                self._tone = tone_match.ToneMatcher(os.environ.get("TTS_VOICES_DIR"))
+            for index, voice in spoken:
+                self._tone.add(voice, takes[index])
+            for voice in dict.fromkeys(voice for _, voice in spoken):
+                cuts = self._tone.cuts(voice, rate)
+                logger.info("Tone match %s: %s", voice,
+                            "left as generated" if cuts is None else tone_match.describe(cuts, rate))
+                if cuts is None or not np.any(cuts):
+                    continue
+                for index, unit_voice in spoken:
+                    if unit_voice == voice:
+                        takes[index] = tone_match.apply(takes[index], rate, cuts)
+                        changed.add(index)
+        if guard:
+            limit = 10 ** (delivery.PEAK_GUARD_DBFS / 20)
+            for index, samples in takes.items():
+                peak = float(np.abs(samples).max()) if len(samples) else 0.0
+                if peak > limit:
+                    takes[index] = samples * (limit / peak)
+                    changed.add(index)
+        for index in changed:
+            pieces[index] = np.clip(np.round(takes[index] * 32768), -32768, 32767).astype("<i2").tobytes()
+
     def _combine_and_export(self, pieces: List[bytes], audio_format: Tuple[int, int, int], speed: float,
                              output_file: str, audio_tags: AudioTags) -> None:
         """Join raw PCM pieces, apply one client-side atempo pass if speed != 1.0 (F-27), then
@@ -1218,7 +1273,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                                 channels=audio_format[1], sample_width=audio_format[2])
         export_format, codec = _PYDUB_EXPORT.get(self.config.output_format, (self.config.output_format, None))
         combined.export(output_file, format=export_format, codec=codec,
-                        bitrate="64k" if self.config.output_format in ("mp3", "aac", "opus") else None)
+                        bitrate=LOSSY_BITRATE if self.config.output_format in _LOSSY_FORMATS else None)
         _tag_loose_file(output_file, self.config.output_format, audio_tags)
 
     def get_break_string(self):

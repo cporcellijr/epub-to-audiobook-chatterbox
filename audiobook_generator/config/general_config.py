@@ -59,6 +59,9 @@ class GeneralConfig:
         self.delivery_exaggeration = getattr(args, 'delivery_exaggeration', None)
         self.delivery_cfg_weight = getattr(args, 'delivery_cfg_weight', None)
         self.delivery_temperature = getattr(args, 'delivery_temperature', None)
+        # Tone matching (Chatterbox only): each voice is turned down wherever it comes out brighter
+        # than its own reference clip (core/tone_match.py). None = on; only False turns it off.
+        self.tone_match = getattr(args, 'tone_match', None)
 
         # TTS provider: Azure & Edge TTS specific arguments
         self.break_duration = getattr(args, 'break_duration', None)

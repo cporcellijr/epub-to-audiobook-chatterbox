@@ -12,6 +12,11 @@ from audiobook_generator.utils.safe_names import sanitize_display_name
 
 logger = logging.getLogger(__name__)
 
+# Lossy chapters and M4B re-encodes. Was 64k: on 24 kHz mono speech ffmpeg's AAC encoder already
+# keeps the full band there, but 96k lowers the coding noise in the 4-12 kHz range by ~8 dB and AAC's
+# peak overshoot with it (measured 2026-09-30). 128k only reaches ~107 kb/s on this material.
+LOSSY_BITRATE = "96k"
+
 # ffmpeg's MP4 muxer only accepts these as an attached picture with "-c:v copy" (F-04);
 # any other cover format (GIF, WebP, TIFF, SVG, ...) must be re-encoded.
 _COPY_COVER_EXTS = frozenset({"jpg", "jpeg", "png"})
@@ -78,7 +83,7 @@ def _escape_concat_path(path: str) -> str:
 
 
 def build_m4b(chapters: List[Tuple[str, str]], output_path: str, title: str, author: str,
-              cover_path: Optional[str] = None, bitrate: str = "64k") -> List[float]:
+              cover_path: Optional[str] = None, bitrate: str = LOSSY_BITRATE) -> List[float]:
     """Encode (chapter title, audio file) pairs, in order, into output_path, and return each
     chapter's duration in seconds as laid out in the book (its chapter marker's length).
 

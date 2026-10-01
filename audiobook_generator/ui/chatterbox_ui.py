@@ -618,12 +618,12 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
                  voice_mode: str = VOICE_MODE_SINGLE, dialogue_voice: Optional[str] = None,
                  cast_file: Optional[str] = None, adaptive_delivery: bool = False,
                  delivery_exaggeration: Optional[float] = None, delivery_cfg_weight: Optional[float] = None,
-                 delivery_temperature: Optional[float] = None) -> GeneralConfig:
+                 delivery_temperature: Optional[float] = None, tone_match: bool = True) -> GeneralConfig:
     """GeneralConfig for the OpenAI provider pointed at Chatterbox or Kokoro (pauses in seconds).
 
-    paced_unit_mode, engine, the voice-mode arguments and the delivery arguments all default so
-    books queued before any of them existed still build (as Chatterbox, sentence units, one voice,
-    adaptive delivery off). Kokoro always narrates in sentence units regardless of paced_unit_mode:
+    paced_unit_mode, engine, the voice-mode arguments, the delivery arguments and tone_match all
+    default so books queued before any of them existed still build (as Chatterbox, sentence units,
+    one voice, adaptive delivery off, tone matching on). Kokoro always narrates in sentence units regardless of paced_unit_mode:
     paragraph mode's gap detector was tuned on Chatterbox audio and saves nothing on a server this
     fast (see the Narration units info text); delivery is ignored entirely for Kokoro.
 
@@ -672,6 +672,7 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
         config.paced_unit_mode = "sentence"
         config.adaptive_delivery = False
         config.delivery_exaggeration = config.delivery_cfg_weight = config.delivery_temperature = None
+        config.tone_match = False
     else:
         config.model_name = "chatterbox"
         config.openai_base_url = None
@@ -680,6 +681,7 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
         config.delivery_exaggeration = delivery_exaggeration
         config.delivery_cfg_weight = delivery_cfg_weight
         config.delivery_temperature = delivery_temperature
+        config.tone_match = bool(tone_match)
     return config
 
 
@@ -771,7 +773,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
                    voice_mode: str = VOICE_MODE_SINGLE, dialogue_voice: Optional[str] = None,
                    cast_key: Optional[str] = None, adaptive_delivery: bool = False,
                    delivery_exaggeration: Optional[float] = None, delivery_cfg_weight: Optional[float] = None,
-                   delivery_temperature: Optional[float] = None,
+                   delivery_temperature: Optional[float] = None, tone_match: bool = True,
                    active_jobs: Optional[List[dict]] = None) -> dict:
     """Validate the form and turn it into build_config keyword arguments for a queued book.
 
@@ -861,6 +863,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         "delivery_exaggeration": None if engine == "kokoro" else delivery_exaggeration,
         "delivery_cfg_weight": None if engine == "kokoro" else delivery_cfg_weight,
         "delivery_temperature": None if engine == "kokoro" else delivery_temperature,
+        "tone_match": bool(tone_match) and engine != "kokoro",
     }
 
 
@@ -1445,7 +1448,7 @@ def book_options_for_later(library_book, chapter_table, stats: list, output_dir:
                            sentence_pause: float, paragraph_pause: float, output_m4b: bool, skip_existing: bool,
                            output_text: bool, engine: str, paced_unit_mode: str, dialogue_voice: Optional[str],
                            adaptive_delivery: bool, exaggeration: float, cfg_weight: float, temperature: float,
-                           active_jobs: Optional[List[dict]] = None) -> dict:
+                           tone_match: bool = True, active_jobs: Optional[List[dict]] = None) -> dict:
     """With Auto-pick on, the Make tab's book options go with the cast analysis so the book joins
     the queue once its cast is ready (queue_book_after_cast). What can already be checked is
     checked now, while the owner is at the page."""
@@ -1462,7 +1465,8 @@ def book_options_for_later(library_book, chapter_table, stats: list, output_dir:
         "output_m4b": bool(output_m4b), "skip_existing": bool(skip_existing), "output_text": bool(output_text),
         "paced_unit_mode": paced_unit_mode or "sentence", "dialogue_voice": dialogue_voice,
         "adaptive_delivery": bool(adaptive_delivery), "exaggeration": exaggeration, "cfg_weight": cfg_weight,
-        "temperature": temperature, "estimate_seconds": generation_estimate(chapter_table, stats, engine or "chatterbox"),
+        "temperature": temperature, "tone_match": bool(tone_match),
+        "estimate_seconds": generation_estimate(chapter_table, stats, engine or "chatterbox"),
     }
 
 
@@ -1490,7 +1494,7 @@ def queue_book_after_cast(queue: JobQueue, job: dict) -> Optional[str]:
             s["remove_reference_numbers"], s.get("search_and_replace_file"), s.get("log_level") or "INFO",
             later["paced_unit_mode"], engine, VOICE_MODE_CAST, later["dialogue_voice"], s["cast_key"],
             later["adaptive_delivery"], source["exaggeration"], source["cfg_weight"], source["temperature"],
-            active_jobs=queue.jobs())
+            later.get("tone_match", True), active_jobs=queue.jobs())
     except gr.Error as e:
         message = getattr(e, "message", None) or str(e)
         logger.warning(f"Queue: '{job['title']}' is ready but its book was not queued: {message}")
@@ -1886,7 +1890,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                        paragraph_pause, output_m4b, skip_existing, output_text, title_mode, newline_mode,
                        remove_endnotes, remove_reference_numbers, search_and_replace_file, log_level,
                        paced_unit_mode, engine, voice_mode, dialogue_voice, cast_key, adaptive_delivery,
-                       exaggeration, cfg_weight, temperature, auto_pick_voices) -> tuple:
+                       exaggeration, cfg_weight, temperature, tone_match, auto_pick_voices) -> tuple:
         """Analyse this cast before generating queued books; a running book finishes first. With
         Auto-pick on, the book follows its analysis into the queue (queue_book_after_cast)."""
         job_settings = analysis_settings(library_book, input_file, chapter_table, engine, voice, title_mode,
@@ -1901,7 +1905,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             job_settings["then_queue"] = book_options_for_later(
                 library_book, chapter_table, stats, output_dir, voice, speed, sentence_pause, paragraph_pause,
                 output_m4b, skip_existing, output_text, engine, paced_unit_mode, dialogue_voice,
-                adaptive_delivery, exaggeration, cfg_weight, temperature, active_jobs=queue.jobs())
+                adaptive_delivery, exaggeration, cfg_weight, temperature, tone_match, active_jobs=queue.jobs())
         book = job_settings["input_file"]
         title = f"Cast: {library_index.book_title(book, library_index.load_index()) or os.path.basename(book)}"
         # Books already started keep going (this analysis runs after the current one, and its book
@@ -2063,6 +2067,11 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                          "at the gaps Chatterbox leaves between sentences. Kokoro always narrates by "
                          "sentence: its gap detector was tuned on Chatterbox audio, and it saves nothing "
                          "on a server this fast.")
+                tone_match = gr.Checkbox(
+                    True, label="Match each voice to its clip",
+                    info="Chatterbox makes some voices brighter than the recording they are copied from: a "
+                         "sharp, fizzy top end. This turns each voice down only where it comes out brighter "
+                         "than its own clip, never up. Chatterbox only.")
                 search_and_replace_file = gr.File(label="Search & replace file (optional, e.g. fix pronunciations)",
                                                   file_types=[".txt"], file_count="single")
             with gr.Column(visible=initial_mode == VOICE_MODE_CAST) as cast_panel:
@@ -2185,12 +2194,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                 delete_voice_button = gr.Button("Delete voice", variant="stop")
             delete_voice_status = gr.Markdown()
 
-        # adaptive_delivery, exaggeration, cfg_weight, temperature (the Voice lab sliders) are last:
-        # enqueue captures the Voice lab's current values as this book's delivery baseline.
+        # adaptive_delivery, exaggeration, cfg_weight, temperature (the Voice lab sliders) come near the
+        # end: enqueue captures the Voice lab's current values as this book's delivery baseline.
         settings = [output_dir, voice, speed, sentence_pause, paragraph_pause, output_m4b, skip_existing,
                     output_text, title_mode, newline_mode, remove_endnotes, remove_reference_numbers,
                     search_and_replace_file, log_level, paced_unit_mode, engine, voice_mode, dialogue_voice,
-                    cast_key_state, adaptive_delivery, exaggeration, cfg_weight, temperature]
+                    cast_key_state, adaptive_delivery, exaggeration, cfg_weight, temperature, tone_match]
         # The chapter list follows the book and the options that change how it's split (parsing is <0.5 s);
         # this re-runs the auto-selection. Ticks, speed, pauses, engine and "Tick all" only touch the table.
         timing = [speed, sentence_pause, paragraph_pause, engine]

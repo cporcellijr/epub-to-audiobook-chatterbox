@@ -2058,3 +2058,87 @@ against the parser before and after §32:
 **Deployment.** The running image was built at 20:14, a minute after §32's commit, so §31 and §32 are
 live, although both sections say nothing was rebuilt. This section's fix is not deployed. Private
 evidence is in `data/diagnostics/review31_2026-09-30/`.
+
+## 34. Tone matching: each voice turned down to its own clip (2026-10-01)
+
+The owner asked about raising the bitrate for better sound. On questioning, the complaint turned out
+to be specific: the treble sounds turned up and there is a faint hiss. Neither came from the encoder.
+
+### 34.1 What it was
+
+- **The bitrate wasn't it.** On 24 kHz mono speech, ffmpeg's AAC encoder keeps the full band at 64k: a
+  clean speech test kept 98% of the 10–12 kHz energy at 64k, 96k and 128k. A higher rate only lowers the
+  coding noise (4–12 kHz noise-to-signal 14.1 → 22.2 → 28.0 dB). 128k only reaches ~107 kb/s on this
+  material.
+- **First comparison against the wrong clip.** The first excerpt was compared with Adrian's clip (the
+  book's narrator), and showed 11 dB too much at 10–12 kHz. The owner heard that the excerpt was Emera,
+  voiced by Teen. Teen's clip matched that excerpt's top band, so that comparison proved nothing.
+- **The fair test:** the same two lines per voice, lossless, with the book's settings and a fixed seed,
+  each compared with its own clip (dB, generated minus clip):
+
+  | voice | 4–6k | 6–8k | 8–10k | 10–11k |
+  |---|---|---|---|---|
+  | Teen | +6.8 | +11.9 | +7.3 | +12.7 |
+  | Everett | -3.3 | -2.1 | +11.4 | +6.5 |
+  | Adrian | 0.0 | 0.0 | +3.8 | +14.2 |
+  | Maya | +2.3 | +4.0 | -3.1 | +0.3 |
+  | Gianna | -1.5 | -3.3 | -1.3 | -6.1 |
+
+  Every take's background was quieter than its clip's (2.9–13 dB). The "hiss" is fizz on the voice,
+  not noise in the pauses.
+- **Ruled out:** the Perth watermark (it adds -55 to -67 dB of signal above 2 kHz and no change in
+  level), the server's post-processing (DC filter off, peak normalisation only) and the AAC encode.
+- **One clip is the problem itself:** `love poem.wav` (Charra, 520 lines in the book being made) is
+  extremely bright, with 6–8 kHz at -1 dB against the speech core where clips usually sit 15–30 dB lower.
+  It is also the hissiest custom clip. Matching keeps a voice like its clip, so this one needs a better
+  clip.
+
+### 34.2 Choices
+
+- **Per-voice matching over one fixed filter.** A fixed cut (fizz above 10.5 kHz, -3.5 dB around
+  3.5 kHz) helped Teen but would dull Gianna, who already comes out darker than her clip. The owner
+  compared now / fixed / matched for Teen, Adrian, Everett and Maya and said matching "made a huge
+  difference".
+- **No pause gate.** By ear, "fixed filter" and "fixed filter plus quieter pauses" were the same.
+  Measured, the gate took 1.5 dB off the pauses, and a stronger gate would clip word endings.
+- **Measured from the book itself, not a calibration pass.** A calibration pass would cost GPU time for
+  every voice in every book. The book's own audio costs nothing extra and reflects its delivery
+  settings. The measurement accumulates per voice over the whole run, and a voice is left as generated
+  until 8 s of it has been heard. A voice with only a line or two in the book is never touched.
+- **How:** frames within 30 dB of a take's peak, third-octave bands from 1.6 to 11.8 kHz, each against
+  the 300–1600 Hz core. Cuts only, at most 12 dB, smoothed across neighbouring bands. The filter is
+  zero-phase FFT, padded so nothing wraps around a take's ends. The clip is read through ffmpeg:
+  pydub's resampler would fold a 44.1 kHz clip's top octave into the bands being compared.
+- **96k for lossy chapters and M4B re-encodes**, one constant (`m4b.LOSSY_BITRATE`) instead of two
+  hard-coded "64k".
+- **Peak guard on every unit of a lossy chapter** (-1 dBFS, `delivery.PEAK_GUARD_DBFS`), not only
+  adaptive ones. Decoded finished books went past full scale: The Sofa reached +1.53 dBFS (1,181
+  events in 7.1 h) and Apex Prey 2 reached +1.21 dBFS (18 events in 3.5 h). A 16-bit decode clips those.
+
+### 34.3 Evidence
+
+- **Live chapter** (working tree in a scratch container against the running Chatterbox): Adrian
+  narrating, Teen speaking the quotes, the book's settings, 22.6 s and 29.6 s of speech. dB against
+  each voice's clip:
+  - Adrian at 10.9 kHz: +13.1 before, +4.3 after (the 12 dB cap plus smoothing). 1.8–3.6 kHz within
+    1 dB, untouched.
+  - Teen at 5.7–7.2 kHz: +3.2/+6.1 before, +0.3/+1.2 after. Every band within 3.4 dB.
+  - Old pipeline (64k, unmatched, unguarded): 63.5 kb/s, decoded peak -0.80 dBFS. New: 86.1 kb/s,
+    -1.13 dBFS. Neither had samples over full scale in this one-minute test.
+- **Tests:** 713 pass (§8's command): 697 at the previous commit by the same command (§33 recorded 703),
+  plus 8 tone-match unit tests, 7 provider tests (matched
+  and unmatched voices, the switch, Kokoro, carry-over between chapters, peak guard on lossy and not on
+  lossless output) and 1 queue test (old jobs default to on).
+
+### 34.4 Not verified
+
+- **Not yet run on a whole book.** Each chapter logs `Tone match <voice>: up to N dB from F kHz`.
+- **A book resumed across this change mixes matched and unmatched chapters.** Goblin Stepsister
+  Obsession has chapters 1–42 from before it. Each chapter's `.clips.json` records every clip's voice
+  and timing, so finished chapters could be matched afterwards. That is not built.
+- **The clip and the book say different words**, so a voice's first chapter measures it on less
+  speech than later chapters do. The cut can shift by about a dB as the book goes on.
+- **Listening samples and measurements:** `data/diagnostics/treble_hiss_samples/`.
+
+**Deployment.** Deployed 2026-10-01 03:17 with the queue empty; the five changed files in `/app_src`
+match the working tree, and the app starts with tone matching on and 96k. Not yet committed.

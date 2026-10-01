@@ -95,6 +95,13 @@ The repo holds the whole stack:
   -1 dBFS), so an excited take can never clip (WORKLOG #17). Voice lab has a **▶ Play soft / normal / excited** button to audition the three deliveries
   around the current sliders before queuing a book. See `docs/chatterbox-edition/WORKLOG.md` #14 for
   the presets, the rule cues and a measured LLM-mood accuracy trade-off.
+- **Tone matching** (Chatterbox only, on by default; Advanced → *Match each voice to its clip* turns it
+  off): Chatterbox renders some voices brighter than the clip it copies them from, which sounds like
+  sharp treble with a faint hiss on top. Each voice's speech is measured as the book is generated and
+  turned down only where it comes out brighter than its own clip, band by band above 1.6 kHz (at most
+  12 dB, never a boost). A voice is left as generated until 8 s of it has been heard. Lossy chapters are
+  encoded at 96 kb/s, and every unit is held to a -1 dBFS peak so the AAC decode can't clip
+  (WORKLOG #34).
 - **Single M4B** per book with chapter markers, cover art, title/author tags. Chapters are generated in a
   hidden `.chapters` folder and merged only when all succeed, so a library scanner never sees a
   half-finished book; a failed book can be resumed with "Skip chapters already made".

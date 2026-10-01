@@ -427,6 +427,15 @@ class TestQueueSettings(unittest.TestCase):
         del settings["paced_unit_mode"]  # a job queued before the option existed
         self.assertEqual(chatterbox_ui.build_config(**settings).paced_unit_mode, "sentence")
 
+    def test_tone_matching_is_queued_on_and_old_jobs_default_to_on(self):
+        settings = self._settings("/library/book.epub", None)
+        self.assertTrue(settings["tone_match"])
+        self.assertTrue(chatterbox_ui.build_config(**settings).tone_match)
+        settings["tone_match"] = False  # turned off under Advanced
+        self.assertFalse(chatterbox_ui.build_config(**settings).tone_match)
+        del settings["tone_match"]  # a job queued before the option existed
+        self.assertTrue(chatterbox_ui.build_config(**settings).tone_match)
+
     def test_dataframe_table_is_read(self):
         import pandas as pd
         table = pd.DataFrame(TABLE, columns=chatterbox_ui.CHAPTER_COLUMNS)
