@@ -1,7 +1,7 @@
 # Chatterbox edition: work log and findings
 
-Covers 2026-09-25 to 2026-09-30. Written for the owner and for any agent reviewing or continuing
-this project. Personal library details (book titles, authors) are deliberately left out.
+Covers 2026-09-25 to 2026-10-01. Written for the owner and for any agent reviewing or continuing
+this project. Later investigations name the affected books where needed to trace the evidence.
 
 Since 2026-09-27 this repo holds the whole stack: the audiobook app at the root and the Chatterbox
 server in `chatterbox/` (upstream commit 915ae28 as a git subtree, then one commit of local patches),
@@ -2394,3 +2394,194 @@ to Chatterbox, which has been stopped since §35 ("Could not reach Chatterbox").
 - **Not verified yet:** a whole book under the 16 GB cap (model reloads after switching may take
   30-50 s instead of 17 s), and gradual reclaim ever triggering on this always-busy VM.
 - **Tests:** 869 pass, including 4 new ones here.
+
+## 39. Breeze implementation review and plain-English voice creation (2026-10-01)
+
+This records the review and fixes completed before the cast audit below. Findings were handled in
+separate design, implementation, test and commit phases, using CodeGraph to trace the shared paths
+and cheaper-model assistance where appropriate.
+
+| Commit | Finding and implemented change |
+|---|---|
+| `9b643e2` | Cast reanalysis could discard Breeze voice choices. Preserve the existing choices through reanalysis. |
+| `ffd380d` | Failed batch allocations could remain alive during the out-of-memory retry. Release them before splitting and retrying. |
+| `7738d64` | Standalone Breeze requests could overlap the queue's GPU work. Coordinate their ownership through the shared GPU path. |
+| `eb6b132` | Default Compose service discovery could leave Breeze unavailable without an explicit URL. Discover the default Breeze service. |
+| `81fef98` | A pending automatic voice design could overwrite an owner's newer cast edits. Preserve those edits when saving the design result. |
+| `c3d4496` | Breeze voice previews ignored the selected speed. Apply the selected speed to the preview. |
+
+At that review checkpoint, **860 app unit tests and 20 Breeze server tests passed**. These are
+historical suite counts, not a claim that the entire suite was rerun after every later change.
+
+**Live verification:** evidence is in `data/live_verification/2026-10-01` under the stack directory.
+The four-item mixed batch returned its items in order, with Whisper matches of 0.974-1.00. Preview
+audio at speeds 1.0, 2.0 and 0.5 lasted 7.680, 3.837 and 15.336 seconds respectively; all three
+matched the requested words at 1.00. A designed voice and its saved records were also checked.
+These checks establish those paths, rather than whole-book speaker accuracy or every retry case.
+
+The owner expected a plain-English custom voice maker in the Voice lab. **`2465bab`** added the
+Name / Describe / Create flow, saved the generated voice and metadata, refreshed the selectors and
+provided a preview. **270 related tests passed.** The live `/design_custom` check produced an
+8.72-second preview in 56.14 seconds, Whisper match 1.00, and updated the dropdowns. The temporary
+test voice was removed. `custom_maker_report.json` records the result. The separate problem with
+playing that voice through the stopped Chatterbox service was subsequently fixed by Clough in
+`035cc1a`, documented in §38.
+
+## 40. Apex Prey 2: narrator switched at the chapter boundary (2026-10-01)
+
+### 40.1 Diagnosis and owner intent
+
+The owner heard the narrator change about 20 minutes into the finished book. BookOrbit bookmark
+**66**, book **6186**, at **1,205 seconds** marks the change; the first chapter ends at 1,204.532
+seconds. The model had assigned six first-person narrator quotes to the minor dermatologist.
+Chapter narrator voting then chose the dermatologist's Elena voice for the first chapter and
+Polly's selected Gianna voice for the remaining chapters.
+
+The owner confirmed that Polly is the narrator and the dermatologist has only one or two lines.
+Either suitable female voice chosen during evaluation was acceptable, provided the narrator stayed
+consistent. **The owner explicitly requested prevention for future books, with no redo of this book.**
+
+### 40.2 Implemented prevention and verification
+
+**`bae3df5`** requires independent, narration-only model confirmation before a chapter switches away
+from the single first-person book narrator. An unconfirmed vote uses the book narrator. Genuine
+chapter POV changes can still be confirmed. Applying the resolved narrator also repairs explicit
+first-person speech tags and their quote continuations, updates speaker maps and counts, and is
+idempotent.
+
+**192 related tests passed at this checkpoint.** A real independent narration-only model request
+identified I / Polly. A private check using the running app's deployed correction path examined all
+10 chapters and 800 narration/tagged passages: narrator routing was Gianna throughout, while the
+dermatologist's actual dialogue remained separate. No audio was generated and the existing cast
+was unchanged. Evidence: `data/diagnostics/apex_narrator_2026-10-01`, especially `diagnosis.json`,
+`independent_narration.json` and `future_routing_report.json`.
+
+The original finished output was 156,423,229 bytes, approximately 4.02 hours and 10 chapters. It was
+not replaced. This routing check does not retroactively change the audio already being listened to.
+
+## 41. Apex Prey 3 cast audit, failed private rerun, and Astra handoff (2026-10-01)
+
+**Current outcome: speaker attribution remains unreliable. The owner stopped further algorithm
+work and requested an independent Astra audit before authorizing more fixes.** Passing regression
+tests and keeping the chapter narrator consistent did not make this cast correct. This section
+supersedes the earlier pending-validation status in the diagnostic `review.md` and any implication
+in §38 that the attribution commits fully resolved the book's cast problems.
+
+### 41.1 Original cast and text audit
+
+The test book is *Apex Prey: The Reaping* (Apex Prey Trilogy, Book 3), cast key
+**`8c7f3e6ca0040c1a`**. Its nine selected EPUB documents, numbered **7-15**, correspond to story
+chapters **1-9**, with **269 dialogue lines**. The original analysis kept Polly / Emily as narrator
+in all nine chapters. Voice-feature comparisons matched the saved gender and pitch targets;
+Emily had the lowest measured matching cost for Polly's target. This was a metadata comparison,
+not a fresh listening test, and did not establish that the assigned speakers were correct.
+
+The first manual audit identified 14 wrong assignments:
+
+| EPUB document / story chapter | Dialogue lines | Original assignment | Text-based correction |
+|---|---|---|---|
+| 9 / 3 | 2, 4 | Polly | Unnamed girl with needle phobia |
+| 9 / 3 | 7 | Jimmy | Unnamed male group patient |
+| 12 / 6 | 18 | Jimmy | Gus, Jimmy's companion, who addresses Jimmy and later gives his own name |
+| 14 / 8 | 6, 10, 11, 15, 20, 25, 26 | Andrew | Polly |
+| 14 / 8 | 18, 19 | Andrew | Alan |
+| 14 / 8 | 23 | Alan | Polly, explicitly tagged "I read aloud" |
+
+Andrew's throat had already been severed; the scene explicitly says he cannot shout. Jimmy and
+"Jimmy's companion" had also collapsed into one roster entry. Nine unknown lines in EPUB document
+11 were Polly's, whose narrator fallback already used Emily correctly. The displayed unknown count
+was stale: 16 reported versus 9 remaining after earlier correction.
+
+**Reference correction discovered later:** EPUB document 9, dialogue line 24 is Stuart answering
+Polly's preceding question. The original reference incorrectly said Polly. `expected_speakers.json`
+and the rerun comparison were corrected; the historical original report still records the first
+14 findings. The manual reference needs independent review and must not be treated as infallible.
+
+### 41.2 Four completed fix phases
+
+| Commit | Implemented change and intended effect |
+|---|---|
+| `b11699b` | Keep possessive relationship names separate from their owners, including both registration orders, curly/ASCII apostrophes, supplied aliases and saved-roster restoration. Prevent Jimmy from becoming Jimmy's companion. |
+| `c04a520` | Recognize missing first-person speech verbs such as respond, read, finish and sneer; carry the narrator through same-paragraph quote continuations until another speaker or introduction intervenes. |
+| `cb8f7e6` | Resolve narrator attributions before building voice profiles, and recompute chapter/book unknown counts from the corrected assignments. Avoid profiling the wrong speaker's lines. |
+| `fcea8c4` | Strengthen attribution and review prompts around who is present and able to speak, addressed/mentioned names, and consistently identified unnamed speakers. |
+
+**200 relevant local tests passed** across cast analysis, LLM attribution, speech tags, profiles,
+review and storage. The profile-order test runs the analysis on a generated EPUB with controlled
+model replies; it verifies ordering and counts, not live-model accuracy. Applying only deterministic
+corrections to a private copy fixed three of the original 14 errors and three additional unknown
+Polly lines, with no unexpected assignment changes. The other 11 needed real-model validation.
+
+Docker failed during this work; the owner assigned recovery to Clough. The cast investigation
+continued offline without taking over recovery. Clough's `035cc1a` GPU/Voice lab fixes are separate
+from these four cast changes. After recovery, runtime hashes confirmed the cast modules matched
+the committed local versions before the private rerun.
+
+### 41.3 Actual private rerun: still failed
+
+A fresh analysis through `analyse_book` used **qwen2.5:14b**, without carrying the saved cast into
+the new analysis or writing results to the book. It made **42 model requests in 190.28 seconds**:
+20 base attribution windows, six review requests (26 lines reviewed, 25 changed), plus narrator/tone
+and 13 profile requests. Measured voice suggestions were then added to the private result. This
+tested analysis and suggestion components; it did not enqueue a book, run pending voice designs,
+or regenerate audio through the UI. The harness checked that the queue was idle and unloaded the
+LLM at the end.
+
+Polly / Emily remained the narrator for all nine chapters; the final unknown count was zero.
+Andrew was no longer assigned dialogue, which is an improvement. Nevertheless:
+
+- The needle-phobic girl's lines were still assigned to Polly.
+- Polly's dialogue was split into an "unnamed female" entry, aliased as "the narrator", with Layla
+  suggested. Fourteen of that entry's 15 lines were Polly's in the reference; one was Alan's.
+- Gemma was split into Gemma / Lucy and "young woman" / Gianna, giving the same character two voices.
+- "One of the guys" represented both an unnamed group patient and Gus in different scenes.
+- Opening Jimmy/Jose assignments changed. These need an independent reading of the surrounding
+  narration; they are comparison leads rather than unquestionable ground truth.
+
+The current comparison records **241/269 reference matches and 28 speaker/identity discrepancies**:
+five of the original 14 findings fixed, nine remaining, plus 19 new discrepancies. These numbers
+include identity splits and depend on a corrected but fallible manual reference. **They are not
+a validated accuracy score.** Zero unknowns likewise does not imply correct attribution.
+
+The original saved cast `data/casts/8c7f3e6ca0040c1a.json` was unchanged, reconfirmed while writing
+this entry with SHA-256 `01dfe6ecdc990aa0933dfe3aaae7f0870410db0785afc78dd2964bc6bd61971c`.
+The original queue snapshot `upload_xqmwp1pu.json` was removed by the separate queue/recovery
+cleanup described in §38; this audit did not edit or delete it. Do not rely on the older diagnostic
+report's statement that that snapshot still exists. Apex Prey 2 was not redone.
+
+### 41.4 Unshipped prompt experiments
+
+Two private request replays produced mixed results and were **not implemented or committed**:
+
+- `test_grounding.py` / `grounding_experiment.json` tried narrator aliases and evidence after the
+  speaker list. Its broad string replacement also changed occurrences of Polly inside quoted book
+  text, invalidating it as a production-equivalent experiment. Some identity improvements came
+  with malformed names and persistent wrong assignments.
+- `test_evidence_first.py` / `evidence_first_experiment.json` asked for evidence before speakers.
+  Some girl/Gemma assignments improved, but other speakers became wrong or unknown and the
+  "unnamed female" split remained. This did not establish a reliable fix.
+
+No further algorithm code changes followed the failed rerun. No larger-book test was performed.
+
+### 41.5 Evidence and next authorized action
+
+All diagnostic paths above are relative to **`C:\Server\stacks\epub-to-audiobook`**, outside the
+`src` Git repository. The Apex Prey 3 evidence directory is:
+`C:\Server\stacks\epub-to-audiobook\data\diagnostics\apex3_2026-10-01`.
+
+- Original audit: `review.md`, `verification.json`, `roster.json`, `audit_input_summary.json`,
+  `voice_fit.json`, and `chapter_7.txt` through `chapter_15.txt`. The chapter annotations are
+  original predictions, not ground truth; `review.md` has historical live-validation status.
+- Deterministic-only preview: `offline_corrected_preview.json`; it is not a fully repaired cast.
+- Revised reference: `expected_speakers.json`, including the Stuart correction above.
+- Actual rerun: `reanalysis_1.json`, `reanalysis_1_with_voices.json`,
+  `reanalysis_1_comparison.json`, `reanalysis_1_requests.json`, `reanalysis_1.log`, and
+  `rerun_analysis.py`. Requests/replies allow attribution and review decisions to be inspected.
+- Unshipped experiments: the two scripts and result files named in §41.4.
+
+**Next action is an independent, read-only Astra audit.** Its prompt must require reading this
+worklog first, then tracing the full cast-to-voice flow with CodeGraph and checking predictions
+against the book text. Return ranked, evidenced findings and a minimal phased implementation/test
+plan, including which existing changes to retain, revise or revert. Do not edit code, deploy,
+change casts or queues, regenerate audio, or launch more model experiments during that audit.
+The owner will provide the fixes to implement afterward. Algorithm work remains stopped.
