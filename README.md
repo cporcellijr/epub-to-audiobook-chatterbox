@@ -80,7 +80,9 @@ The repo holds the whole stack:
   speak one sentence and measures its pitch, huskiness and liveliness (a voice you add is measured
   straight away). The main characters are matched as a group so a scarce fitting voice is not spent
   on someone with good alternatives. They stay distinct from each other and the narrator; lines whose
-  speaker the LLM couldn't tell get the dialogue voice. The analysis also reads the book's tone
+  speaker the LLM couldn't tell get the dialogue voice, and so does a line whose own tag contradicts
+  the speaker it was given ("he cries out" given to a woman): the cast summary lists those lines, and
+  nothing waits on them. The analysis also reads the book's tone
   (point of view, mood, pace, intensity): when the cast is shown, the narrator voice and the book's
   delivery sliders are set from it, and with adaptive delivery each character's lines are read a
   little more even or more expressive than the book, as their profile suggests. Each chapter's point

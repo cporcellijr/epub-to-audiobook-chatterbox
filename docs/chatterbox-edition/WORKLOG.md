@@ -2645,13 +2645,71 @@ identity question ("same as one of the guys?"), which the replay can only answer
 ### 42.4 Tests and what is not verified
 
 - 915 app tests pass in the container (full discovery, including the UI modules).
-- Not verified: a fresh real-model analysis with the new prompts and the identity question; the
-  replay cannot show what the model now answers when the narrator is named in the prompt. The
-  release gate from the audit still applies: a private Apex Prey 3 rerun via `evaluate_cast.py`,
-  inspected line by line, before any larger book.
+- The owner then authorized the live rerun, the history rewrite and the deploy (§42.5).
 - The reference contains the book's text, so it is not in the repository: Codex's original
   commit (which added it under `tests/fixtures`) was rewritten before any push. The reference is at
   `data/diagnostics/apex3_2026-10-01/expected_speakers_source_linked.json`; `cast_audit_eval.py`
   reads it from there by default (or `--reference` / `CAST_AUDIT_REFERENCE`), and its unit tests
   use an invented reference. The pre-rewrite history is kept on the local branch
   `backup/before-fixture-move`, which must never be pushed.
+
+### 42.5 Live private reruns with qwen2.5:14b
+
+Four private reruns of the 9 selected chapters ran through `evaluate_cast.py` in a throwaway
+container (`reanalysis_2` to `_5` beside the earlier evidence, each with `run.py`, `cast.json`, the
+exact `requests.jsonl`, `analysis.log` and the scorer's `eval.json`). Each refused to start with a
+queued job, unloaded Breeze first and the LLM afterwards, and wrote nothing outside its folder.
+
+| Run | Code | Wrong speakers (real) | Narrator |
+|---|---|---|---|
+| failed rerun (§41.3) | `32631d1` | 28 discrepancies | Polly + "unnamed female" (Layla voice) |
+| 2 | `b537a78` | 7, Alan's line unassigned | Polly, 9 chapters |
+| 3 | 2 + "I said" lines not pinned when the narrator is unnamed | 12 | 5 Polly lines to Andrew |
+| 4 | 2 + "sputters" | narrator split | Polly ch 1-2, "The Narrator" ch 3-9 |
+| 5 | `73b9afb` (deployed) | 7, Alan's line unassigned | Polly, 9 chapters |
+
+"Real" ignores label-only differences ("the girl" for the needle-phobic girl, "the realtor" for the
+male realtor, "one of the guys" for the patient), which are the right people.
+
+- **Run 3** tried showing the model unnamed-narrator "I said" lines instead of pinning them as `[I]`
+  (in run 2 the bare `[I]` seemed to cut the link between "I" and Polly in the first chapter). It
+  fixed that chapter but sent five of Polly's lines and two of Alan's to Andrew, who cannot speak;
+  reverted. With this model, prompt-level changes move errors around rather than remove them.
+- **Run 4 found a real bug**, not model noise: the book-tone question was offered the roster's
+  "The Narrator" placeholder and picked it over Polly; chapters 3-9, whose "I" the model never named,
+  then kept that placeholder as their narrator, so the narrator voice would have changed at chapter
+  3 (the Apex Prey 2 symptom). `73b9afb` never offers or accepts the placeholder there, and an
+  unnamed "I" chapter takes the nearest named narrator of its first-person run.
+- **Run 5 (deployed code)**: one narrator, Polly, in every chapter; Gemma one character; the
+  needle-phobic girl separate from Polly; the patient and Jimmy's companion separate, and the
+  companion joined to Gus by the new identity question; "Stuart sputters" now settles that line;
+  Alan's "he cries out" line unassigned and listed. Still wrong: D7 lines 1, 6, 16 (the opening
+  Jimmy/Jose scene and the doctor's "Well, Polly, ..."), D9 line 6 and D11 line 22 (Polly's lines to
+  Stuart and the realtor), D12 line 15 (Jimmy's line under Gus), D15 line 7 (Gemma's "Absolutely!"
+  to Polly). The text settles every one of them; these are the model's errors.
+- **Release gate**: not fully met. The audit asked for no remaining errors in the known scenes, and
+  D7 line 1 is still wrong. The owner chose to deploy because every identity failure the audit found
+  is fixed with the real model and narrator continuity held in every run but the one whose bug is
+  now fixed. Before a larger book: the remaining errors need a better prompt or model, judged with
+  this scorer over repeated runs, not single runs.
+
+### 42.6 History rewrite
+
+Codex's commit that added the reference under `tests/fixtures` was rewritten before any push:
+`621a9b3` replaces it with the scorer and invented-reference tests, and the later commits were
+replayed unchanged (new hashes in §42.1). The tree differs from the pre-rewrite history only by the
+fixture and the scorer's tests. The old history is on the local branch `backup/before-fixture-move`
+(like `backup/before-scrub`, never to be pushed).
+
+- Tests after `73b9afb`: 242 host cast tests pass; the full container run is in §42.7.
+
+### 42.7 Deploy
+
+- 916 app tests pass in the container on `73b9afb` (1 skipped: the private reference check, whose
+  file lives outside the repository). 242 host cast tests pass.
+- With no job queued or running, `docker compose up -d --build epub-to-audiobook` recreated the app.
+  The container's `/app_src` copies of the seven changed modules match the commit, the page answers
+  200 and the log shows no errors. The owner's saved Apex Prey 3 cast (made before these changes)
+  loads and summarises unchanged; no cast, queue or audio was changed. Breeze was left unloaded by
+  the reruns and loads again when a book starts.
+- README: a line whose tag contradicts its speaker reads in the dialogue voice and is listed.
