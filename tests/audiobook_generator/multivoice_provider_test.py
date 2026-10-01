@@ -197,6 +197,24 @@ class TestProviderVoices(unittest.TestCase):
         self.assertEqual([voice for voice, _ in narrator_reads],
                          ["Ada.wav", "Narrator.wav", "Narrator.wav", "Narrator.wav", "Narrator.wav"])
 
+    def test_unknown_lines_default_to_the_chapters_narrator(self):
+        text = f'I waited. "Come in."{M}"Thanks."{M}"Who is there?"'
+        cast = cast_store.new_cast("k", "/x.epub", "T", "A", "chatterbox", "Narrator.wav", [1])
+        cast["book_tone"] = {"point_of_view": "first", "pov_key": "sam"}
+        cast["characters"] = {"sam": {"name": "Sam"}, "ann": {"name": "Ann", "voice": "Ann.wav"},
+                              "guest": {"name": "Guest", "voice": None}}
+        cast["chapters"][cast_store.text_hash(text)] = {
+            "number": 1, "narrator": "ann", "lines": {"1": "ann", "2": "guest", "3": None}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cast.json")
+            cast_store.save_cast(path, cast)
+            for fallback in (None, "Dialogue.wav"):
+                with self.subTest(fallback=fallback):
+                    provider = self._provider(voice_mode="cast", cast_file=path, dialogue_voice=fallback)
+                    self.assertEqual(self._requests(provider, text), [
+                        ("Ann.wav", "I waited."), ("Ann.wav", '"Come in."'),
+                        (fallback or "Ann.wav", '"Thanks."'), (fallback or "Ann.wav", '"Who is there?"')])
+
     def test_adaptive_delivery_uses_each_speakers_setting_when_their_voice_is_shared(self):
         text = ('"Ada says this in a complete sentence that is long enough."' + M +
                 '"Bo answers in a complete sentence that is long enough."')

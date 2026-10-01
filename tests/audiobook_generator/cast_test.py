@@ -71,6 +71,23 @@ class TestPersistence(unittest.TestCase):
 
 class TestMerge(unittest.TestCase):
 
+    def test_merging_preserves_the_chosen_voices_picked_status(self):
+        for source_picked in (False, True):
+            for target_voice, target_picked in ((None, False), (None, True), ("Own.wav", False), ("Own.wav", True)):
+                with self.subTest(source_picked=source_picked, target_voice=target_voice, target_picked=target_picked):
+                    cast = _cast({"source": (1, "female", "Source.wav"), "target": (2, "female", target_voice)})
+                    cast["characters"]["source"]["voice_picked"] = source_picked
+                    cast["characters"]["target"]["voice_picked"] = target_picked
+                    cast_store.merge_characters(cast, "source", "target")
+                    kept = cast["characters"]["target"]
+                    picked = target_picked if target_voice else source_picked
+                    voice = target_voice or "Source.wav"
+                    self.assertEqual((kept["voice"], kept["voice_picked"]), (voice, picked))
+                    fresh = {"target": {"name": "Target", "voice": None}}
+                    self.assertEqual(cast_store.carry_voice_choices(cast, fresh, picked_only=True), int(picked))
+                    self.assertEqual(cast_store.clear_suggested_voices(cast), int(not picked))
+                    self.assertEqual(kept["voice"], voice if picked else None)
+
     def test_merging_moves_lines_names_and_the_narrator_role(self):
         cast = cast_store.new_cast("k", "/x.epub", "T", "A", "chatterbox", "N.wav", [1, 2])
         cast["characters"] = {

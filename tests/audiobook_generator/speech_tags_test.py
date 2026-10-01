@@ -53,6 +53,17 @@ class TestDirection(unittest.TestCase):
     def test_two_speakers_introduced_in_one_paragraph(self):
         self.assertEqual(tags('Tom said: "Ready?" Ada answered at once: "Always."'), {1: "Tom", 2: "Ada"})
 
+    def test_title_abbreviations_do_not_end_a_colon_introduction(self):
+        for title in ("Mr.", "Mrs.", "Ms.", "Dr.", "St."):
+            with self.subTest(title=title):
+                name = f"{title} Marsh"
+                text = f'Then I heard Cory\'s voice: "When?" {name} answered without a pause: "Monday."'
+                self.assertEqual(tags(text), {2: name})
+                self.assertEqual(tags(f'Tom said: "When?" {name} answered: "Monday."'),
+                                 {1: "Tom", 2: name})
+                self.assertEqual(tags(f'"When?" {name} asked. Tom answered: "Monday."'),
+                                 {1: name, 2: "Tom"})
+
     def test_interrupted_speech_keeps_its_speaker(self):
         self.assertEqual(tags('"We should," Alice said, "leave."'), {1: "Alice", 2: "Alice"})
 

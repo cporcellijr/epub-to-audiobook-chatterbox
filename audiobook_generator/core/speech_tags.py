@@ -132,6 +132,8 @@ def clean_name(raw: str) -> Optional[str]:
 def _introduces(narration: str) -> bool:
     """Narration after a quotation that introduces the next one instead of tagging this one: its
     first sentence runs on to a colon ('Ann answered without a pause: "Monday."')."""
+    # A title's period is not a sentence boundary ("Mrs. Marsh answered: ...").
+    narration = re.sub(rf"\b{_TITLE}(?=\s+{_WORD})", lambda m: m.group().rstrip("."), narration)
     first = re.split(r"(?<=[.!?])\s+", narration.strip(), maxsplit=1)[0]
     return first.endswith(":")
 

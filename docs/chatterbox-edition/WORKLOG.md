@@ -1946,3 +1946,34 @@ answers, denied names, someone from an earlier chapter, an alias for a name not 
 `cast.merge_characters` (lines across chapters, narrator and point-of-view roles, voice kept) and the
 editor's Merge. Private evidence and the four whole-book casts (the old one, runs 1–3) are in
 `data/diagnostics/tag_direction_2026-09-30/` and `data/cast_backups/`.
+
+## 31. Five cast review fixes, tested between phases (2026-09-30)
+
+The owner asked to fix each review finding in a separate phase, testing before proceeding. CodeGraph
+was used to trace the shared functions and their callers. Each new regression reproduced the bug on
+the old code before the fix was applied.
+
+| Phase | Fix | Passing checks before the next phase |
+|---|---|---|
+| 1 | Self-introductions only match direct sentence openings, optionally "And" / "please". "Don't ever call me Beth", indirect reports and nested quoted introductions no longer merge another character or move their lines. The existing Dr. Hale / Lena introduction still merges. | 138 cast, attribution, speech-tag and review tests |
+| 2 | Title periods are ignored when finding the first sentence of a colon introduction. "Mrs. Marsh answered: …" tags the following quotation, without claiming the question before it. Real sentence endings still separate tags. | 139 tests in the same set |
+| 3 | An incompatible exact-name match falls through to compatible existing candidates instead of immediately returning "new". Repeated male/female "Alex" mentions reuse two entries; titled matches also check gender. Saved rosters retain this behavior. | 140 tests in the same set |
+| 4 | The default dialogue fallback is selected after the chapter narrator. Unknown lines and characters without a voice use that chapter's narrator; an explicitly selected fallback still wins. | 158 tests, including the actual voice provider with mocked speech responses |
+| 5 | A voice transferred by the editor's Merge carries its `voice_picked` flag. Picked voices survive Suggest again and voice carry-over during re-analysis; suggestions stay suggestions. A target with its own voice retains its voice and flag. | 159 tests in the combined set |
+
+Final review added a regression for a reported quotation at the very start of a dialogue line
+("'Call me Beth,' John said."). Only the outer quotation marks are removed before checking for
+nested speech, so that case also stays unmerged. The 141 core checks passed again after this adjustment.
+
+**Final validation:** 698 tests pass with the full application discovery command from §8, using the
+existing `epub_to_audiobook:local` image and the working source mounted read-only. Networking was
+disabled. The first full run had seven UI errors because the read-only mount prevented the UI from
+creating log files; rerunning with a temporary in-container `/src/logs` folder passed all 698.
+`git diff --check` also passes. Five regression test methods were added to existing test files;
+no dependency or additional model request was added.
+
+**Scope and limit:** only source, tests and this log were changed. These fixes have not been deployed,
+and no saved cast or audio was regenerated. Introduction matching is intentionally conservative:
+mixed quoted speech and introductions outside the recognized direct sentence forms stay unmerged.
+The remaining attribution and re-analysis limitations in §30 still apply; these tests do not establish
+a new live-book accuracy score.

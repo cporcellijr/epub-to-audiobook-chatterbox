@@ -681,14 +681,15 @@ class OpenAITTSProvider(BaseTTSProvider):
         else the dialogue voice (else the narrator's, so a mode without a dialogue voice degrades
         to single voice rather than failing)."""
         narrator = self.config.voice_name
-        dialogue_voice = self.config.dialogue_voice or narrator
         if self.cast is None:
+            dialogue_voice = self.config.dialogue_voice or narrator
             return lambda piece: dialogue_voice if piece.kind == DIALOGUE else narrator
         # Attributions are keyed by the chapter text's hash (the same hash the chapter manifest
         # uses), so they survive renumbering and a different chapter selection.
         chapter_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
         # A collection's first-person story is narrated by its own teller's voice.
         narrator = cast_store.chapter_narrator_voice(self.cast, chapter_hash) or narrator
+        dialogue_voice = self.config.dialogue_voice or narrator
         lines = cast_store.chapter_lines(self.cast, chapter_hash)
         if lines is None:
             logger.warning("OpenAI: this chapter is not in the cast (text changed or chapter not analysed); "

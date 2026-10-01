@@ -156,6 +156,7 @@ def merge_characters(cast: dict, source: str, target: str) -> None:
             keep[field] = gone.get(field, "unknown")
     if not keep.get("voice") and gone.get("voice"):
         keep["voice"] = gone["voice"]
+        keep["voice_picked"] = bool(gone.get("voice_picked"))
     for chapter in cast.get("chapters", {}).values():
         lines = chapter.get("lines", {})
         for line_id, key in lines.items():

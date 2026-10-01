@@ -182,6 +182,21 @@ class TestRoster(unittest.TestCase):
         roster.add("Ada", "male", "child")
         self.assertEqual((roster.characters[key]["gender"], roster.characters[key]["age"]), ("female", "adult"))
 
+    def test_repeated_conflicting_genders_reuse_the_compatible_character(self):
+        for name in ("Alex", "Alex Baker", "Dr. Alex"):
+            with self.subTest(name=name):
+                roster = Roster()
+                first = roster.add(name, "male")
+                second = roster.add(name, "female")
+                self.assertNotEqual(first, second)
+                for _ in range(3):
+                    self.assertEqual(roster.add(name, "female"), second)
+                    self.assertEqual(roster.add(name, "male"), first)
+                self.assertEqual(len(roster.characters), 2)
+                saved = Roster(roster.characters)
+                self.assertEqual(saved.add(name, "female"), second)
+                self.assertEqual(saved.add(name, "male"), first)
+
     def test_explicit_aliases_from_the_model_are_recorded(self):
         roster = Roster()
         key = roster.add("Margaret Hale", "female", aliases=["Mother", "Mrs. Hale"])
@@ -333,6 +348,20 @@ class TestOnePersonPerName(unittest.TestCase):
         lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(), {}, self.log)
         self.assertNotEqual(lines[1], lines[2])
         self.assertEqual(roster.resolve("Annie"), lines[1])
+
+    def test_denied_or_reported_introductions_do_not_merge_people(self):
+        for speech in ("Don't ever call me Beth.", "Don't you dare call me Beth.",
+                       "Yesterday John told me, 'Call me Beth.'",
+                       "John said, ‘Hello. My name is Beth.’", "'Call me Beth,' John said.",
+                       "He said my name is Beth."):
+            with self.subTest(speech=speech):
+                text = f'Beth said, "Hello."{M}Ann said, "{speech}"'
+                roster, stats, chat = Roster(), {}, ScriptedChat()
+                lines, _ = attribute_chapter(chapter_segments(text), roster, chat, stats, self.log)
+                self.assertEqual(lines, {1: "beth", 2: "ann"})
+                self.assertEqual(set(roster.characters), {"beth", "ann"})
+                self.assertNotIn("merged_introductions", stats)
+                self.assertEqual(chat.prompts, [])
 
 
 class TestAttributeChapter(unittest.TestCase):

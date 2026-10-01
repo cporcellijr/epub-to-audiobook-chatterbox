@@ -24,7 +24,7 @@ from typing import Callable, Collection, Dict, List, NamedTuple, Optional, Tuple
 from audiobook_generator.core import cast_review
 from audiobook_generator.core.cast import AGES, GENDERS, display_name, normalize_name, title_gender, titled_name
 from audiobook_generator.core.delivery import MOOD_NORMAL, MOODS, segment_moods
-from audiobook_generator.core.dialogue import DIALOGUE, Segment
+from audiobook_generator.core.dialogue import DIALOGUE, Segment, split_paragraph
 from audiobook_generator.core.speech_tags import tagged_speakers
 
 logger = logging.getLogger(__name__)
@@ -490,12 +490,15 @@ class Roster:
             gender = title_gender(name)
         titled = titled_name(name)
         if titled != norm and titled in self.aliases:  # "Mrs. Smith" keyed apart from a "Mr. Smith"
-            return self.aliases[titled]
+            key = self.aliases[titled]
+            if "unknown" in (gender, self._gender(key)) or gender == self._gender(key):
+                return key
         if norm in self.chapter_aliases:  # this chapter's "Mom" before anyone else's
             return self.chapter_aliases[norm]
         if norm in self.aliases:
             key = self.aliases[norm]
-            return key if "unknown" in (gender, self._gender(key)) or gender == self._gender(key) else None
+            if "unknown" in (gender, self._gender(key)) or gender == self._gender(key):
+                return key
         candidates = [k for k in self._candidates(norm)
                       if "unknown" in (gender, self._gender(k)) or gender == self._gender(k)]
         if len(candidates) == 1:
@@ -592,7 +595,8 @@ def _messages(window: Window, roster: Roster) -> List[dict]:
 
 
 # A speaker naming themselves: "please call me Lena", "my name is Tom".
-_SELF_NAMED = re.compile(r"\b(?:[Cc]all me|[Mm]y name is|[Mm]y name's|[Tt]he name's)\s+"
+_SELF_NAMED = re.compile(r"(?:^|[.!?]\s+)(?:[Aa]nd\s+)?(?:[Pp]lease\s+)?"
+                         r"(?:[Cc]all me|[Mm]y name is|[Mm]y name['’]s|[Tt]he name['’]s)\s+"
                          r"((?:(?:Mrs?|Ms|Miss|Dr)\.?\s+)?[A-Z][\w'’-]+)")
 
 
@@ -644,11 +648,21 @@ def merge_self_introductions(paragraphs: List[List[Segment]], result: Dict[int, 
         speaker = result.get(line.line_id)
         if not speaker or speaker not in roster.characters:
             continue
-        for match in _SELF_NAMED.finditer(line.text):
+        text = line.text.strip()
+        if text and text[0] in "\"“„«'‘":
+            closers = "'’" if text[0] in "'‘" else "\"”»“"
+            text = text[1:]
+            if text and text[-1] in closers:
+                text = text[:-1]
+        text = text.strip()
+        # ponytail: mixed quoted introductions stay unmerged; ask the model if these matter later.
+        if any(kind == DIALOGUE for style in ("single", "double")
+               for kind, _ in split_paragraph(text, style)[0]):
+            continue
+        for match in _SELF_NAMED.finditer(text):
             name = match.group(1)
-            if family_word(name) or not usable_alias(name) or re.search(
-                    r"(?:n't|\bnot|\bnever)\s*$", line.text[max(0, match.start() - 12):match.start()], re.I):
-                continue  # "Don't call me Tom" names no one
+            if family_word(name) or not usable_alias(name):
+                continue
             other = roster.resolve(name, roster.characters[speaker].get("gender", "unknown"))
             if other is None:
                 roster._alias(speaker, name)
