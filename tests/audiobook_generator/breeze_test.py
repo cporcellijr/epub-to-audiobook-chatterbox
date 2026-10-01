@@ -215,7 +215,7 @@ class _InlineThread:
 class TestEngineHandover(unittest.TestCase):
 
     def setUp(self):
-        patcher = patch.dict(os.environ, {**BASE, "OPENAI_BASE_URL": "http://cb:8004/v1"})
+        patcher = patch.dict(os.environ, {**BASE, "OPENAI_BASE_URL": "http://cb:8004/v1", "LLM_BASE_URL": ""})
         patcher.start()
         self.addCleanup(patcher.stop)
         engine_gpu._thread = None
@@ -336,6 +336,38 @@ class TestEngineHandover(unittest.TestCase):
         with patch.dict(os.environ, {"BREEZE_BASE_URL": ""}), patch.object(breeze_client, "loaded") as loaded:
             self.assertFalse(engine_gpu.unload_breeze_if_loaded())
         loaded.assert_not_called()
+
+    def test_breeze_loads_only_after_ollama_is_asked_to_free_the_gpu(self):
+        # Ollama keeps the cast LLM loaded for minutes after the analysis; Breeze beside it overfills the card
+        calls = []
+        ps = _response({"models": [{"name": "qwen2.5:14b"}]})
+        with patch.dict(os.environ, {"LLM_BASE_URL": "http://ollama:11434/v1/"}), \
+                patch.object(engine_gpu.requests, "get",
+                             side_effect=lambda url, timeout: calls.append(("get", url)) or ps), \
+                patch.object(engine_gpu.requests, "post",
+                             side_effect=lambda url, json, timeout: calls.append(("post", url, json)) or _response({})), \
+                patch.object(chatterbox_control, "model_loaded", return_value=False), \
+                patch.object(breeze_client, "load", side_effect=lambda: calls.append(("load",)) or True):
+            engine_gpu.prepare_breeze()
+        self.assertEqual(calls, [("get", "http://ollama:11434/api/ps"),
+                                 ("post", "http://ollama:11434/api/generate", {"model": "qwen2.5:14b", "keep_alive": 0}),
+                                 ("load",)])
+
+    def test_an_llm_that_cannot_be_unloaded_never_blocks_breeze(self):
+        with patch.dict(os.environ, {"LLM_BASE_URL": "http://llm:8080/v1"}):
+            with patch.object(engine_gpu.requests, "get", return_value=_response(status=404)), \
+                    patch.object(engine_gpu.requests, "post") as post:
+                self.assertTrue(engine_gpu.unload_llm())  # not Ollama: nothing to ask
+            post.assert_not_called()
+            with patch.object(engine_gpu.requests, "get", side_effect=requests.ConnectionError("down")), \
+                    patch.object(chatterbox_control, "model_loaded", return_value=False), \
+                    patch.object(breeze_client, "load", return_value=True) as load:
+                self.assertFalse(engine_gpu.unload_llm())
+                engine_gpu.prepare_breeze()
+            load.assert_called_once()
+        with patch.object(engine_gpu.requests, "get") as get:  # no LLM configured (setUp)
+            self.assertTrue(engine_gpu.unload_llm())
+        get.assert_not_called()
 
 
 class TestCastAnalysisFreesBreeze(unittest.TestCase):

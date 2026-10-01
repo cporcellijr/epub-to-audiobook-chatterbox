@@ -14,7 +14,7 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import engine_gpu, speech_check, voice_design, voice_measure, voice_transcripts
+from audiobook_generator.core import breeze_client, engine_gpu, speech_check, voice_design, voice_measure, voice_transcripts
 from audiobook_generator.core.audiobook_generator import AudiobookGenerator
 from audiobook_generator.ui import chatterbox_ui
 
@@ -613,6 +613,31 @@ class TestDesignHandlers(Workspace):
         for *_, preview in outputs:
             if os.path.isfile(preview):
                 os.remove(preview)
+
+    def test_voice_lab_play_speaks_the_phrase_with_breeze_when_it_is_the_engine(self):
+        handler = self._handler("play_lab")
+        take = AudioSegment.silent(400, frame_rate=24000)
+        with patch.object(engine_gpu, "prepare_breeze") as prepare, \
+                patch.object(voice_transcripts, "transcript", return_value="clip words"), \
+                patch.object(breeze_client, "synthesize_batch", return_value=[take]) as batch, \
+                patch.object(chatterbox_ui, "preview_voice") as chatterbox:
+            path = handler("breeze", "Elena.wav", "Hello there.", 0.5, 0.5, 0.8, 1.0)
+        self.addCleanup(os.remove, path)
+        prepare.assert_called_once()
+        chatterbox.assert_not_called()  # Chatterbox may be stopped
+        item = batch.call_args.args[0][0]
+        self.assertEqual((item["voice"], item["text"]), ("Elena.wav", "Hello there."))
+        with patch.object(chatterbox_ui, "preview_voice", return_value="/tmp/x.mp3") as chatterbox:
+            self.assertEqual(handler("chatterbox", "Elena.wav", "Hi.", 0.6, 0.4, 0.7, 1.1), "/tmp/x.mp3")
+        chatterbox.assert_called_once_with("Elena.wav", "Hi.", 0.6, 0.4, 0.7, 1.1)
+
+    def test_the_voice_lab_hides_chatterbox_delivery_controls_under_breeze(self):
+        intro, *controls = chatterbox_ui.lab_controls_for("breeze")
+        self.assertEqual(intro["value"], chatterbox_ui.LAB_INTRO_BREEZE)
+        self.assertEqual([control["visible"] for control in controls], [False] * 4)
+        intro, *controls = chatterbox_ui.lab_controls_for("chatterbox")
+        self.assertEqual(intro["value"], chatterbox_ui.LAB_INTRO_CHATTERBOX)
+        self.assertEqual([control["visible"] for control in controls], [True] * 4)
 
     def test_custom_voice_maker_validates_inputs_before_breeze_handover(self):
         handler = self._handler("design_custom")

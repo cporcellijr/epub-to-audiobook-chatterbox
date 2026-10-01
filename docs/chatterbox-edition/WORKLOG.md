@@ -2324,3 +2324,73 @@ The owner compared the 14 takes:
 So `breeze_instruction` now directs soft speech only: whispered, hissed, murmured, breathed, under
 the breath, and the soft default. Muttered and mumbled lines, and every excited and emphatic line,
 are spoken plain. The tests changed to match; 846 pass.
+
+## 38. The Docker crash, the LLM left on the GPU, and the Voice lab under Breeze (2026-10-01)
+
+### 38.1 What crashed
+
+At 10:30 the whole Docker VM died, one minute into a Breeze book that had started two minutes after its
+cast analysis. Every container went with it, and `docker` answered HTTP 500. The VM's own log just stops.
+Docker's host monitor log has the reason at 10:30:23: "Insufficient system resources exist to complete
+the requested service". Windows had run out of memory. Two things fed it:
+- **The cast LLM was still on the GPU.** Ollama keeps a model loaded for its keep-alive (`OLLAMA_KEEP_ALIVE=5m`)
+  after the last request. qwen2.5:14b (~9 GB) was still loaded when the book loaded Breeze (~8 GB) on the
+  12 GB card, with Whisper checking takes beside them. Under WSL an overfull GPU spills into Windows'
+  RAM instead of failing. `engine_gpu`'s own docstring says one model at a time, but `_to_breeze` only
+  unloaded Chatterbox.
+- **The VM keeps Windows' RAM as file cache.** On the 31.7 GB host, `memory=24GB` let `vmmemWSL` reach
+  20.7 GB while Linux used 6.7 GB. The other 17 GB was cache (model files), and Windows had 0.8 GB
+  free. WSL's automatic reclaim waits for the VM to go idle, and it never does: BookBridge
+  (`abs_kosync_enhanced`) keeps a steady ~20% CPU. Breeze loads of 105-121 s before the crash (30 s
+  normally) show Windows was already paging.
+
+Two earlier runs that day had the same LLM overlap and survived, so the overlap was the trigger, not
+the whole cause. The Voice lab change the owner suspected (2465bab) was not involved: nothing used it
+in the crashed session.
+
+### 38.2 Fixes
+
+- **`engine_gpu.unload_llm()`**, called by `_to_breeze` before Breeze loads (book handovers and
+  standalone Voice lab requests alike). It lists Ollama's loaded models (`/api/ps`) and drops each one
+  (`/api/generate` with `keep_alive: 0`). It is best effort:
+  - Another LLM server answers 404 and is left alone.
+  - An unreachable one is logged and Breeze loads anyway, since it holds no GPU memory to wait for.
+  - Rejected: unloading at the end of the cast analysis instead. It would miss a Voice lab request
+    within the keep-alive window, and the handover is where the "one model at a time" rule lives.
+- **WSL** (`C:\Users\cporc\.wslconfig`, backup `.wslconfig.bak-2026-10-01`): `memory=16GB` (was 24GB),
+  plus `[experimental] autoMemoryReclaim=gradual`.
+  - The cap does the work: Linux evicts its own cache instead of taking it from Windows.
+  - Gradual reclaim only helps when the VM goes idle. Microsoft's reference lists `dropCache` as the
+    default already, and it wasn't triggering either.
+  - Measured peaks for the cap: Linux's used memory reached 6.9 GB while Breeze loaded from a cold
+    cache, and 7.05 GB while qwen2.5:14b loaded. Both models go into the page cache, which the cap
+    can always evict.
+
+### 38.3 The Voice lab under Breeze
+
+The custom voice creator itself worked live (69 s while a book was generating). What failed was the
+next step: the lab selects the new voice, and ▶ Play, soft/normal/excited and Save for books all post
+to Chatterbox, which has been stopped since §35 ("Could not reach Chatterbox").
+- **▶ Play** now goes through `play_lab`: with Breeze as the engine, it speaks the Phrase box with Breeze
+  (`_breeze_sample` takes the phrase now) at the Make tab's speed.
+- **Under Breeze, the delivery sliders, soft/normal/excited, Save and Reset are hidden**, because Breeze
+  has no such settings. The intro says so. Under Chatterbox, nothing changed.
+- **The creator's estimate** said "about 40 s". It now says "about a minute, longer while a book is
+  generating": a cold Breeze load alone takes 30-50 s, and a request waits behind the book's batch.
+
+### 38.4 Live evidence
+
+- **Handover:** with Breeze unloaded and qwen2.5:14b warmed (GPU at 10.4 GB), `prepare_breeze()`
+  unloaded the LLM at 15:23:31, and Breeze began loading at 15:23:32. `ollama ps` was then empty.
+- **Voice lab:** the live config shows the sliders' row and the three Chatterbox buttons hidden.
+  Through the UI's own endpoints, creating a voice took 57 s, then ▶ Play on the new voice gave 5.3 s
+  of audio from Breeze in 18 s. The test voice and its records were deleted.
+- **WSL:** `drop_caches` brought `vmmemWSL` from 20.7 to 9.6 GB, and Windows from 0.8 to 12.6 GB free.
+  After the restart with the new settings, the VM has 16 GB, all 20 containers came back, and Windows
+  had 17.6 GB free.
+- **The book:** "Apex Prey: The Reaping" was stopped and deleted at the owner's request (wrong
+  characters, which Codex's attribution commits address). That removed the queue job and the 5
+  partial chapters in the library.
+- **Not verified yet:** a whole book under the 16 GB cap (model reloads after switching may take
+  30-50 s instead of 17 s), and gradual reclaim ever triggering on this always-busy VM.
+- **Tests:** 869 pass, including 4 new ones here.

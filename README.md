@@ -43,11 +43,14 @@ The repo holds the whole stack:
   (5–7× real time), every take checked by Whisper and the failures retried in the next batch. It
   needs the exact words of each voice clip, which the app transcribes once with Whisper and caches
   (`voice_transcripts.json`). The server loads its model only when a Breeze book starts and the app
-  unloads it for a cast analysis, since Breeze (~8 GB) and the LLM can't share the GPU. Adaptive
+  unloads it for a cast analysis, since Breeze (~8 GB) and the LLM can't share the GPU. Before Breeze
+  loads, the app asks Ollama to drop the cast LLM too, rather than wait out its keep-alive. Adaptive
   delivery isn't wired to Breeze yet. Breeze's weights are for research and non-commercial use only
   (WORKLOG #35).
-- **Voice lab**: play a phrase with any voice, tune Chatterbox's exaggeration / CFG weight / temperature
-  and save them as the settings books use, add new voices (long pauses in the sample are removed,
+- **Voice lab**: with Breeze, create a voice from a plain-English description (no recording needed)
+  and play a phrase with any voice; Chatterbox's delivery sliders are hidden, since Breeze has none.
+  With Chatterbox, play a phrase, tune exaggeration / CFG weight / temperature
+  and save them as the settings books use. With either, add new voices (long pauses in the sample are removed,
   because Chatterbox copies a reference clip's pauses), and delete a voice you added (Chatterbox's
   built-in voices can't be deleted; a browser confirmation is required, and a voice a queued or
   running book still uses is refused).

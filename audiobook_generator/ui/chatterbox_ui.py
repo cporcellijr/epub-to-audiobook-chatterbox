@@ -347,16 +347,19 @@ def _save_preview(audio: AudioSegment) -> str:
     return path
 
 
-def _breeze_sample(voice: str, speed: float) -> str:
-    """One-off Breeze sample of PREVIEW_PHRASE in a voice file, as one item of a batch."""
+def _breeze_sample(voice: str, speed: float, phrase: str = PREVIEW_PHRASE) -> str:
+    """One-off Breeze sample of the phrase in a voice file, as one item of a batch."""
     if not breeze_client.configured():
         raise gr.Error("Breeze is not configured (BREEZE_BASE_URL).")
+    if not voice:
+        raise gr.Error("Pick a voice first.")
     ref_text = voice_transcripts.transcript(voice)
     if not ref_text:
         raise gr.Error(f"Breeze needs the words spoken in {voice}, and the speech check's Whisper model "
                        "could not transcribe it (SPEECH_CHECK_MODEL).")
+    text = (phrase or "").strip() or PREVIEW_PHRASE
     try:
-        take = breeze_client.synthesize_batch([{"id": "sample", "text": PREVIEW_PHRASE, "voice": voice,
+        take = breeze_client.synthesize_batch([{"id": "sample", "text": text, "voice": voice,
                                                 "ref_text": ref_text, "instruction": None, "cfg_scale": None}])[0]
     except Exception as e:
         raise gr.Error(f"Could not reach Breeze: {e}")
@@ -2073,6 +2076,25 @@ def engine_changed(engine: str) -> tuple:
             gr.update(visible=is_chatterbox))
 
 
+LAB_INTRO_CHATTERBOX = ("Try voices and tune delivery. **Save** applies the sliders to every book "
+                        "(including one in progress). While a book is generating, a preview or "
+                        "**Save** waits for the current chunk to finish (up to about a minute): "
+                        "Chatterbox handles one request at a time.")
+LAB_INTRO_BREEZE = ("Try voices: **▶ Play** speaks the phrase in the selected voice with Breeze, at the Make "
+                    "tab's speed. Breeze has no delivery sliders: a book's moods are spoken as voice "
+                    "directions. While a book is generating, Play waits for Breeze's current batch "
+                    "(up to about a minute).")
+
+
+def lab_controls_for(engine: str) -> tuple:
+    """The Voice lab under the Make tab's engine: its intro, then the Chatterbox-only delivery
+    controls (sliders row, soft/normal/excited, Save, Reset), hidden under Breeze, which has none."""
+    chatterbox = engine != "breeze"
+    shown = gr.update(visible=chatterbox)
+    return (gr.update(value=LAB_INTRO_CHATTERBOX if chatterbox else LAB_INTRO_BREEZE),
+            shown, shown, shown, shown)
+
+
 def _sync_if_chatterbox(value: str, engine: str) -> dict:
     """Pass a voice value through to the paired dropdown only while the Make tab's engine is
     Chatterbox: a Kokoro id must never land in the (Chatterbox-only) Voice lab, and a Chatterbox
@@ -2189,6 +2211,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         if engine == "breeze":
             return breeze_work(sample_voice, engine, voice, speed)
         return sample_voice(engine, voice, speed)
+
+    def play_lab(engine, voice, phrase, exaggeration, cfg_weight, temperature, speed):
+        """Voice lab ▶ Play: Breeze speaks the phrase when it is the engine (Chatterbox may be stopped)."""
+        if engine == "breeze":
+            return breeze_work(_breeze_sample, voice, speed, phrase)
+        return preview_voice(voice, phrase, exaggeration, cfg_weight, temperature, speed)
 
     def cast_sample(cast_key, character_key, engine, voice, delivery_choice, speed, exaggeration,
                     cfg_weight, temperature, narrator_voice):
@@ -2438,7 +2466,8 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
             if breeze_client.configured():
                 with gr.Group():
                     gr.Markdown("### Create a custom voice\nDescribe how someone sounds in plain English. "
-                                "Breeze creates a sample and saves the voice for your books (about 40 s).")
+                                "Breeze creates a sample and saves the voice for your books (about a minute, "
+                                "longer while a book is generating).")
                     custom_voice_name = gr.Textbox(label="Name for your new voice")
                     custom_voice_description = gr.Textbox(
                         label="Describe the voice", lines=3,
@@ -2447,14 +2476,12 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                     custom_voice_button = gr.Button("Create voice", variant="primary")
                     custom_voice_status = gr.Markdown()
                     custom_voice_audio = gr.Audio(label="New voice preview", autoplay=True, interactive=False)
-            gr.Markdown("Try voices and tune delivery. **Save** applies the sliders to every book "
-                        "(including one in progress). While a book is generating, a preview or "
-                        "**Save** waits for the current chunk to finish (up to about a minute): "
-                        "Chatterbox handles one request at a time.")
+            lab_chatterbox = initial_engine != "breeze"
+            lab_intro = gr.Markdown(LAB_INTRO_CHATTERBOX if lab_chatterbox else LAB_INTRO_BREEZE)
             with gr.Row(equal_height=True):
                 lab_voice = gr.Dropdown(choices, value=default_voice, label="Voice", allow_custom_value=True)
                 phrase = gr.Textbox(PREVIEW_PHRASE, lines=2, label="Phrase")
-            with gr.Row(equal_height=True):
+            with gr.Row(equal_height=True, visible=lab_chatterbox) as lab_sliders_row:
                 exaggeration = gr.Slider(0.25, 2.0, value=saved["exaggeration"], step=0.01, label="Exaggeration",
                                          info="Emotion and emphasis")
                 cfg_weight = gr.Slider(0.1, 1.0, value=saved["cfg_weight"], step=0.05, label="CFG weight",
@@ -2463,9 +2490,9 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                         info="Higher = more varied")
             with gr.Row():
                 play_button = gr.Button("▶ Play", variant="primary")
-                play_delivery_button = gr.Button("▶ Play soft / normal / excited")
-                save_button = gr.Button("Save for books")
-                reset_button = gr.Button("Reset to saved")
+                play_delivery_button = gr.Button("▶ Play soft / normal / excited", visible=lab_chatterbox)
+                save_button = gr.Button("Save for books", visible=lab_chatterbox)
+                reset_button = gr.Button("Reset to saved", visible=lab_chatterbox)
             preview_audio = gr.Audio(label="Preview", autoplay=True, interactive=False)
             lab_status = gr.Markdown()
 
@@ -2627,8 +2654,10 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         # The player stays hidden until the first sample, then shows before the audio arrives.
         sample_button.click(lambda: gr.update(visible=True), inputs=None, outputs=sample_audio) \
             .then(make_sample, inputs=[engine, voice, speed], outputs=sample_audio)
-        play_button.click(preview_voice, inputs=[lab_voice, phrase, exaggeration, cfg_weight, temperature, speed],
+        play_button.click(play_lab, inputs=[engine, lab_voice, phrase, exaggeration, cfg_weight, temperature, speed],
                           outputs=preview_audio)
+        engine.change(lab_controls_for, inputs=engine,
+                      outputs=[lab_intro, lab_sliders_row, play_delivery_button, save_button, reset_button])
         play_delivery_button.click(preview_delivery_range,
                                    inputs=[lab_voice, phrase, exaggeration, cfg_weight, temperature, speed],
                                    outputs=preview_audio)
