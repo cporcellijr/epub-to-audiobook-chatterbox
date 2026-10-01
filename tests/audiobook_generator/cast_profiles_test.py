@@ -307,7 +307,7 @@ class TestChapterNarrators(unittest.TestCase):
                                                    json.dumps(dict(TestBookTone.TONE, pov_character="Oliver"))))
         self.assertEqual((cast["book_tone"]["pov_key"], cast["book_tone"]["pov_character"]), ("oliver", "Oliver"))
         self.assertEqual(cast["chapters"]["h1"], {"number": 1, "lines": {}, "point_of_view": "first",
-                                                  "narrator": "oliver"})
+                                                "narrator": "oliver", "unknown": 0})
 
     def test_an_anthology_keeps_each_storys_point_of_view_and_narrator(self):
         cast = self._cast(1, 2, 3)

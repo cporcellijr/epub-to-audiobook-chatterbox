@@ -20,13 +20,13 @@ CHAPTERS = [
 ]
 
 
-def _write_epub(path: str) -> None:
+def _write_epub(path: str, chapters=CHAPTERS) -> None:
     book = epub.EpubBook()
     book.set_identifier("invented-1")
     book.set_title("An Invented Book")
     book.add_author("Nobody Real")
     items = []
-    for n, (title, paragraphs) in enumerate(CHAPTERS, 1):
+    for n, (title, paragraphs) in enumerate(chapters, 1):
         body = "".join(f"<p>{p}</p>" for p in paragraphs)
         item = epub.EpubHtml(title=title, file_name=f"c{n}.xhtml", lang="en")
         item.content = f"<html><body><h1>{title}</h1>{body}</body></html>"
@@ -152,10 +152,11 @@ class TestAnalyseBook(unittest.TestCase):
                        {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}}]
         profile = {"role": "protagonist", "gender": "female", "age": "adult", "description": "Runs the farm.",
                    "relationships": "Tom's sister", "voice": "firm young woman"}
-        chat = ScriptedChat(*attribution, profile, dict(profile, gender="male", description="Her brother."))
+        tone = {"point_of_view": "third", "tone": "quiet", "narrator_gender": "female"}
+        chat = ScriptedChat(*attribution, tone, profile, dict(profile, gender="male", description="Her brother."))
         cast = analyse_book(self.settings, chat=chat)
         self.assertEqual(cast["status"], "done")
-        self.assertEqual(len(chat.prompts), 5)  # two windows, two profiles, the book-tone request
+        self.assertEqual(len(chat.prompts), 5)  # two windows, book tone, two profiles
         self.assertEqual(cast["characters"]["ada marsh"]["profile"]["voice"], "firm young woman")
         self.assertEqual(cast["characters"]["tom"]["gender"], "male")
         self.assertEqual(cast["characters"]["marsh"]["profile"], {"first_line": {"chapter": 2, "text": '"The goats are in the beans,"'}})
@@ -168,6 +169,32 @@ class TestAnalyseBook(unittest.TestCase):
                 return super().__call__(messages)
         cast = analyse_book(self.settings, chat=FailingProfiles(*attribution))
         self.assertEqual((cast["status"], cast["profile_error"], cast["profiles_done"]), ("done", "LLM down", 0))
+
+    @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 2)
+    def test_profiles_and_unknown_counts_use_the_resolved_narrators_lines(self):
+        _write_epub(self.book, [("One", ["I walked to the harbour, my hands shaking in the cold. " * 20,
+                                        '"Sally, wait," said Tom.', '"I am coming," I respond.',
+                                        '"We will take the ferry," I say.', '"Meet me there," I read aloud.'])])
+        self.settings["chapter_selection"] = [1]
+        tone = {"point_of_view": "first", "pov_character": "Sally", "tone": "quiet",
+                "narrator_gender": "female"}
+        profile = {"description": "Sally tells the story.", "gender": "female", "age": "adult"}
+        chat = ScriptedChat(
+            {"speakers": {"2": "Tom", "3": "Tom", "4": "unknown"},
+             "characters": [{"name": "Sally", "gender": "female"}]},
+            {"speakers": {"4": "unknown"}}, tone, tone, profile)
+
+        cast = analyse_book(self.settings, chat=chat)
+
+        self.assertEqual(cast["status"], "done")
+        chapter = next(iter(cast["chapters"].values()))
+        self.assertEqual(chapter["lines"], {"1": "tom", "2": "sally", "3": "sally", "4": "sally"})
+        self.assertEqual((chapter["unknown"], cast["stats"]["unknown_lines"]), (0, 0))
+        self.assertEqual((cast["characters"]["sally"]["lines"], cast["characters"]["tom"]["lines"]), (3, 1))
+        self.assertEqual(cast["characters"]["sally"]["profile"]["first_line"]["text"], '"I am coming,"')
+        self.assertEqual(cast["profiles_total"], 1)
+        self.assertNotIn("description", cast["characters"]["tom"]["profile"])
+        self.assertEqual(cast_store.load_cast(self.settings["cast_file"])["stats"]["unknown_lines"], 0)
 
     @patch("audiobook_generator.core.cast_llm.ASK_LLM_FOR_MOODS", True)
     def test_moods_are_saved_per_chapter(self):

@@ -81,8 +81,8 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
             log.info(f"Cast: {done}/{len(selection)} chapters analysed, {len(roster.characters)} characters, "
                      f"{stats['unknown_lines']} of {stats['lines']} lines unknown so far, "
                      f"{stats.get('review_lines', 0)} asked again ({stats.get('review_changed', 0)} changed)")
-        profile_cast(cast, analysed, chat, log, save=lambda: cast_store.save_cast(path, cast))
         describe_book(cast, analysed, chat, log)
+        profile_cast(cast, analysed, chat, log, save=lambda: cast_store.save_cast(path, cast))
         cast["status"] = cast_store.STATUS_DONE
     except Exception as e:
         cast["status"], cast["error"] = cast_store.STATUS_FAILED, str(e)

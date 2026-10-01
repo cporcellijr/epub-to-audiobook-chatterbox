@@ -626,6 +626,10 @@ def apply_chapter_narrators(cast: dict, chapters: List[ChapterText], narrators: 
                 stored_lines[str(line_id)] = narrator
             if narrator in characters:
                 characters[narrator]["lines"] = int(characters[narrator].get("lines", 0)) + 1
+    for entry in entries.values():
+        entry["unknown"] = sum(speaker is None for speaker in entry.get("lines", {}).values())
+    if "stats" in cast:
+        cast["stats"]["unknown_lines"] = sum(entry["unknown"] for entry in entries.values())
     words = {c.number: _narration_words(c) for c in chapters}
     first = sum(words[n] for n, found in narrators.items() if found["point_of_view"] == "first")
     third = sum(words[n] for n, found in narrators.items() if found["point_of_view"] == "third")
