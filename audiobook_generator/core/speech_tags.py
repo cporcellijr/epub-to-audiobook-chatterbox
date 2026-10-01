@@ -29,6 +29,7 @@ from audiobook_generator.core.dialogue import DIALOGUE, NARRATION, Segment
 # Past and present tense: novels are told in either ("she said", "she says").
 SPEECH_VERBS = (
     "said", "says", "asked", "asks", "replied", "replies", "answered", "answers", "called", "calls",
+    "responded", "responds", "read", "reads", "finished", "finishes", "sneered", "sneers",
     "cried", "cries", "shouted", "shouts", "yelled", "yells", "whispered", "whispers", "murmured",
     "murmurs", "muttered", "mutters", "added", "adds", "snapped", "snaps", "repeated", "repeats",
     "continued", "continues", "exclaimed", "exclaims", "demanded", "demands", "insisted", "insists",
@@ -175,16 +176,28 @@ _BEFORE_I = re.compile(rf"(?:^|[.!?]\s+|\s)I{_ADVERB}\s+{_ANY_VERB}\b[^\"“”.
 
 def first_person_tagged(paragraphs: List[List[Segment]]) -> List[int]:
     """Ids of the dialogue lines a first-person tag ("I said") gives to the narrator: whoever the
-    attribution names for them is the "I" of a first-person chapter."""
+    attribution names for them is the "I" of a first-person chapter. Untagged quotations that
+    continue that speech in the same paragraph follow the tag, just like named speakers."""
     found = []
     for segments in paragraphs:
+        speaking, between = False, []
         for i, piece in enumerate(segments):
+            if piece.kind == NARRATION:
+                between.append(piece.text)
+                continue
             if piece.kind != DIALOGUE or piece.continues:
+                speaking, between = False, []
                 continue
             before = segments[i - 1].text if i > 0 and segments[i - 1].kind == NARRATION else ""
             after = segments[i + 1].text if i + 1 < len(segments) and segments[i + 1].kind == NARRATION else ""
             if (_AFTER_I.match(after) and not _introduces(after)) or _BEFORE_I.search(before):
+                speaking = True
                 found.append(piece.line_id)
+            elif speaking and not has_own_tag(before, after) and all(keeps_speaker(text, "I") for text in between):
+                found.append(piece.line_id)
+            else:
+                speaking = False
+            between = []
     return found
 
 

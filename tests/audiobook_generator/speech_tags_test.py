@@ -94,6 +94,17 @@ class TestTenses(unittest.TestCase):
         self.assertEqual(first_person_tagged(chapter_segments('"Why?" I ask.')), [1])
         self.assertEqual(first_person_tagged(chapter_segments('"Who?" I answered without thinking: "You."')), [2])
 
+    def test_first_person_speech_continues_without_borrowing_another_speakers_line(self):
+        for tag in ("I respond.", "I responded.", "I read aloud.", "I sneer.", "I growl."):
+            with self.subTest(tag=tag):
+                text = f'"First." {tag} "Second." "His turn," he says. "Her turn," Ada says.'
+                self.assertEqual(first_person_tagged(chapter_segments(text)), [1, 2])
+        for text in ('"First," I say. Ada looks up. "Second."',
+                     '"First," I say. She looks up: "Second."',
+                     f'"First," I say.{M}"Second."'):
+            self.assertEqual(first_person_tagged(chapter_segments(text)), [1])
+        self.assertEqual(tags('"Last part," Alan finishes.'), {1: "Alan"})
+
 
 class TestNotNames(unittest.TestCase):
 
