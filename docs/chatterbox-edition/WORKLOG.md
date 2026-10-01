@@ -2954,3 +2954,49 @@ story). It would name an unnamed story's narrator (Rattlesnakes: Vic) and could 
 book-wide guess as the safeguard's reference; not done until the owner decides.
 
 - Tests: 936 app tests pass in the container. Not deployed.
+
+## 47. Option 2: the person the others call by name tells the story (2026-10-01)
+
+§46 (`5d57315`) was deployed first; the container's code matched the commit.
+
+### 47.1 What it does (`addressed_tellers`)
+
+A run of first-person chapters is split into stories where a chapter's text names at least 3 people
+and none the story so far named. Within a story, the person others address by name most often
+("..., Vic?") among those the narration never names (`could_say_i`) is its "I", if addressed at least
+3 times and twice as often as anyone else. That person:
+
+- names a story whose "I said" lines only ever went to "The Narrator" (§46.3 left it unnamed);
+- stands in for the book-wide guess as the reference that overrules an unconfirmed chapter vote (the
+  Apex Prey 2 safeguard, §40) and as the last resort for an untagged chapter. The guess is used only
+  where a story has no teller.
+
+The story split counts only the people a chapter's text names. Counting who the model said speaks,
+as `_same_story` does, joined The Dreamers to Rattlesnakes in every replay: lines of The Dreamers had
+gone to Vic. The address check now compiles one pattern per person (`_address_pattern`).
+
+### 47.2 Measured
+
+- **Per chapter on nine casts** (the test sets and five of the owner's books): 35 chapters named
+  right, 67 left alone, none wrong. Left alone: two books where one person is split into two cast
+  entries and both are addressed (79/53 and 55/47), The Dreamers (its teller is never addressed by
+  name), and two collection stories the split could not tell apart. The measurement in §46.5 had one
+  wrong chapter (The Dreamers named Vic); the text-only split removed it. 1.4 s for a 55-chapter book.
+- **Exact replays, ten runs:** scores unchanged (You Like It Darker 100, 100, 104, 100; Apex Prey 3
+  8, 8; Six Wakes 2 x4). In the window-16 run whose story stayed unnamed under §46, Rattlesnakes is now
+  told by Vic, not "The Narrator". Logged: "chapters 15-16 told by vic trenton, addressed by name 27
+  times (next 1)"; Apex Prey 3: Polly 6 (next 0).
+- **The owner's saved casts:** no narrator changes against §46, with or without a model; their votes
+  already agree with the teller.
+
+- **One live run** of the You Like It Darker chapters: 100 wrong, as before; logged "chapters 15-16 told
+  by vic trenton, addressed by name 27 times (next 1)"; narrators Vic, Vic and The Dreamers' own
+  unnamed narrator, all profiled male.
+
+### 47.3 Fixed before commit
+
+A run whose only "I said" votes were unnamed, where one story got a teller and a later story had no
+vote and no teller, raised `min()` of an empty list while lending an unnamed narrator; that chapter now
+takes the usual path. Covered by a test.
+
+- Tests: 940 app tests pass in the container. Not deployed.
