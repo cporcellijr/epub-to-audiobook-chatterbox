@@ -3048,5 +3048,10 @@ already-slow GPU would learn the slow speed; 1.5x is measured on this GPU and se
 Whether a reload restores the speed: the only evidence is that a fresh load 45 min later (with cast
 analyses in between) ran normally. The next `slowed down` line in `docker logs breeze` answers it.
 
-- Tests: 26 Breeze server tests pass (6 new). App untouched. Breeze not yet redeployed: a book was
-  running.
+- Tests: 26 Breeze server tests pass (6 new). App untouched.
+- Deployed 2026-10-02 08:10 EDT with the queue paused between books (Breeze container only;
+  `/opt/breeze-infer/server.py` matches the commit). Live: one Adrian sentence, 2.6 s, after a 41.7 s
+  load; then unloaded. Under WSL, `torch.cuda.mem_get_info` from a second process showed 11.1 of 12.3
+  GB free with the model loaded, so the logged "free" may understate use; the reserved/allocated
+  figures are the server's own. The Windows counter `\GPU Process Memory(*)\Shared Usage` shows the
+  spill into system memory (1.6 GB during a normal book on 2026-10-02).
