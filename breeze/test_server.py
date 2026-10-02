@@ -265,3 +265,77 @@ def test_generation_lock_serialises_requests(voices):
         t.join()
     assert results == [200] * 4
     assert synth.max_active == 1 and synth.loads == 1 and len(synth.calls) == 4
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_guard_ignores_odd_slow_batches_and_small_chunks():
+    guard = server.SlowdownGuard(1.5, full_batch=24, window=4, clock=FakeClock())
+    for speed in (3.1, 1.2, 3.0, 1.1, 2.9, 3.3):  # healthy books have up to two slow batches in a row
+        guard.record(32, speed)
+    for _ in range(10):
+        guard.record(8, 0.3)  # a chunk of a few sentences runs well under real time anyway
+    assert not guard.reload_due
+
+
+def test_guard_asks_for_a_reload_when_full_batches_slow_down():
+    guard = server.SlowdownGuard(1.5, full_batch=24, window=4, clock=FakeClock())
+    for speed in (1.2, 1.6, 1.1, 1.4):  # median 1.3x
+        guard.record(30, speed)
+    assert guard.reload_due
+
+
+def test_guard_waits_out_the_cooldown_when_a_reload_did_not_help():
+    clock = FakeClock()
+    guard = server.SlowdownGuard(1.5, full_batch=24, window=4, cooldown=1800, clock=clock)
+    guard.reloaded()
+    for _ in range(4):
+        guard.record(32, 1.0)
+    assert not guard.reload_due
+    clock.now = 1800
+    for _ in range(4):
+        guard.record(32, 1.0)
+    assert guard.reload_due
+
+
+def test_guard_off_at_zero():
+    guard = server.SlowdownGuard(0, full_batch=1, window=1)
+    guard.record(32, 0.01)
+    assert not guard.reload_due
+
+
+def test_slowdown_reloads_the_model_before_the_next_batch(voices):
+    clock = FakeClock()
+    guard = server.SlowdownGuard(float("inf"), full_batch=2, window=2, clock=clock)  # every chunk is "slow"
+    synth = FakeSynth()
+    c = TestClient(create_app(synth, voices_dir=str(voices), max_batch=2, guard=guard))
+    items = [item(f"i{n}") for n in range(4)]
+    post(c, items)
+    assert guard.reload_due and (synth.loads, synth.unloads) == (1, 0)
+    out = post(c, items).json()["items"]
+    assert all(o["error"] is None and o["wav_b64"] for o in out)
+    assert (synth.loads, synth.unloads) == (2, 1)
+    post(c, items)  # still slow inside the cooldown: no second reload
+    post(c, items)
+    assert (synth.loads, synth.unloads) == (2, 1)
+    clock.now = server.SLOW_RELOAD_COOLDOWN_SECONDS
+    post(c, items)
+    post(c, items)
+    assert (synth.loads, synth.unloads) == (3, 2)
+
+
+def test_unload_drops_a_pending_reload(voices):
+    guard = server.SlowdownGuard(float("inf"), full_batch=1, window=1)
+    synth = FakeSynth()
+    c = TestClient(create_app(synth, voices_dir=str(voices), guard=guard))
+    post(c, [item("a")])
+    assert guard.reload_due
+    c.post("/api/unload")
+    post(c, [item("a")])
+    assert (synth.loads, synth.unloads) == (2, 1) and guard.last_reload is None

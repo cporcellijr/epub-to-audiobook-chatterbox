@@ -3000,3 +3000,53 @@ vote and no teller, raised `min()` of an empty list while lending an unnamed nar
 takes the usual path. Covered by a test.
 
 - Tests: 940 app tests pass in the container. Not deployed.
+
+## 48. Breeze slowdown guard (2026-10-02)
+
+### 48.1 What happened
+
+The owner expected the overnight queue to finish by morning. One book, "Whores Versus Sex Robots"
+(2026-10-01 18:13-23:46 EDT, 5.3 h of audio), took 5.6 h, about 3.5 h more than Breeze's normal speed
+allows. From the Breeze log (full chunks = 24-32 sentences):
+
+- Healthy books, before and after it (488 full chunks): median 3.11x real time, 5% under 1.77x.
+- That book (112 full chunks): median 1.21x, 75% under 1.43x. 32 of its 86 chunks of 32 took over 2 min
+  each (up to 640 s; normal is about 40 s), 150 min in all.
+- Its first five chunks ran at normal speed; then everything slowed and stayed slow until the book
+  ended and the app unloaded Breeze for the next cast analyses. Trad Wife, the next book after a fresh
+  load, ran at normal speed.
+
+Ruled out: the text (1.4% of units rejected and retried, against 1.2-1.8% for the next three books);
+Ollama (no requests during the book, and qwen2.5:14b had expired 6 min before Breeze loaded); Whisper
+(runs on the CPU). Not found: the cause. Docker's host monitor log had already rotated past that night.
+The GPU stood at 11.9 of 12.3 GB used during this morning's book, so GPU memory spilling into shared
+system memory under WSL fits the pattern but is unproven. Neither the RAM work (§38) nor the cast work
+(§40-§47) changed Breeze's speed: full chunks ran at 3.3-3.7x before both and 2.7-3.7x after.
+
+### 48.2 The guard (`breeze/server.py` `SlowdownGuard`)
+
+The server times every chunk already. A chunk of at least 3/4 of `BREEZE_MAX_BATCH` counts as full;
+small chunks run under real time by nature (1 sentence 0.2-0.4x). When the median of the last 4 full
+chunks is under 1.5x (`BREEZE_SLOW_RTF`, 0 = off), the server unloads and loads the model at the start
+of its next request, logging GPU memory before and after so the next slowdown shows whether memory was
+the cause. A reload that doesn't help logs `still slow`, and the next reload waits 30 min. An unload
+from the app drops a pending reload; a fresh load starts a fresh window.
+
+Rule chosen by replaying the Breeze log: "median of 4 under 1.5x" never fired in a healthy book (longest
+healthy run of full chunks under 1.6x: 2) and fired 24 min into the slow book. "3 in a row under 1.5x"
+fired an hour in; "median of 5 under 1.8x" fired once in a healthy book. Replaying the committed
+`SlowdownGuard` itself over the whole log: 0 reloads in healthy books, 8 in the slow one (first at
+22:37 UTC), at most ~5 min of reload time if reloading does nothing.
+
+Rejected: reloading from the app between chapters (the app would need the server's per-chunk timings,
+and a chapter is several requests, so the server reacts sooner); a speed baseline learned after each
+load (it would have worked here, since the first five chunks were normal, but a load into an
+already-slow GPU would learn the slow speed; 1.5x is measured on this GPU and set by an env var).
+
+### 48.3 Not yet known
+
+Whether a reload restores the speed: the only evidence is that a fresh load 45 min later (with cast
+analyses in between) ran normally. The next `slowed down` line in `docker logs breeze` answers it.
+
+- Tests: 26 Breeze server tests pass (6 new). App untouched. Breeze not yet redeployed: a book was
+  running.

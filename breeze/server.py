@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import statistics
 import sys
 import threading
 import time
@@ -30,6 +31,9 @@ INSTRUCTION_CFG = 4.0  # voice design and direction need guidance; plain cloning
 MAX_TOKENS_CAP = 1500
 CHARS_PER_SECOND = 15  # typical speech; used only to bound runaway generations
 LENGTH_SLACK = 3.0  # allow 3x the expected length, plus 3 s
+SLOW_REAL_TIME = 1.5  # BREEZE_SLOW_RTF; 0 turns the slowdown guard off
+SLOW_WINDOW = 4  # full batches
+SLOW_RELOAD_COOLDOWN_SECONDS = 1800
 
 
 class OutOfMemory(Exception):
@@ -48,6 +52,64 @@ def empty_cuda_cache() -> None:
     torch = sys.modules.get("torch")
     if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def gpu_memory_report() -> str:
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_available():
+        return "no CUDA"
+    free, total = torch.cuda.mem_get_info()
+    return (f"GPU free {free >> 20} of {total >> 20} MiB; this process reserves "
+            f"{torch.cuda.memory_reserved() >> 20} MiB, allocated {torch.cuda.memory_allocated() >> 20} MiB")
+
+
+class SlowdownGuard:
+    """Asks for a model reload when full batches have slowed far below their normal speed.
+
+    On 2026-10-01 one book's full batches fell from ~3x real time to a median of 1.2x and stayed
+    there for five hours; the next book, after an unload and load, ran at normal speed again. Over
+    488 healthy full batches the median of 4 in a row never fell under 1.5x; the slow book got
+    there 20 minutes in. If the cause is outside Breeze and a reload doesn't help, the next reload
+    waits out a cooldown, so a slow GPU doesn't also lose a reload every few batches."""
+
+    def __init__(self, threshold: float, full_batch: int, window: int = SLOW_WINDOW,
+                 cooldown: float = SLOW_RELOAD_COOLDOWN_SECONDS, clock=time.monotonic):
+        self.threshold = threshold
+        self.full_batch = full_batch
+        self.window = window
+        self.cooldown = cooldown
+        self.clock = clock
+        self.recent: list[float] = []
+        self.reload_due = False
+        self.last_reload: float | None = None
+
+    def record(self, size: int, real_time: float) -> None:
+        """Note one finished chunk's speed (seconds of audio per second of generating)."""
+        if self.threshold <= 0 or size < self.full_batch:
+            return  # small chunks are slow by nature
+        self.recent = (self.recent + [real_time])[-self.window:]
+        if len(self.recent) < self.window:
+            return
+        median = statistics.median(self.recent)
+        if median >= self.threshold:
+            return
+        self.recent = []
+        if self.last_reload is not None and self.clock() - self.last_reload < self.cooldown:
+            log.warning("still slow %.0f min after reloading: last %d full batches median %.2fx real time",
+                        (self.clock() - self.last_reload) / 60, self.window, median)
+            return
+        log.warning("slowed down: last %d full batches median %.2fx real time (under %.2fx); "
+                    "reloading the model before the next batch", self.window, median, self.threshold)
+        self.reload_due = True
+
+    def reset(self) -> None:
+        """A fresh model starts a fresh window."""
+        self.recent = []
+        self.reload_due = False
+
+    def reloaded(self) -> None:
+        self.reset()
+        self.last_reload = self.clock()
 
 
 def template_name(request: dict) -> str:
@@ -160,11 +222,26 @@ def max_tokens_for(frame_rate: float | None, longest_text: int) -> int:
     return min(MAX_TOKENS_CAP, math.ceil(seconds * frame_rate))
 
 
-def create_app(synth, voices_dir: str | None = None, max_batch: int | None = None) -> FastAPI:
+def create_app(synth, voices_dir: str | None = None, max_batch: int | None = None,
+               guard: SlowdownGuard | None = None) -> FastAPI:
     voices = Path(voices_dir or os.environ.get("BREEZE_VOICES_DIR", "/voices"))
     max_batch = max(1, int(max_batch or os.environ.get("BREEZE_MAX_BATCH", 32)))
+    if guard is None:  # a chunk of 3/4 of the batch size or more counts as full
+        guard = SlowdownGuard(float(os.environ.get("BREEZE_SLOW_RTF") or SLOW_REAL_TIME), math.ceil(max_batch * 0.75))
     lock = threading.Lock()  # one generation at a time; the GPU is shared and memory is tight
     app = FastAPI(title="Breeze TTS 2")
+
+    def ensure_loaded() -> None:
+        """Load the model if it isn't, or reload it if the guard asked. Call with the lock held."""
+        if guard.reload_due and synth.loaded:
+            log.warning("reloading: %s", gpu_memory_report())
+            synth.unload()
+            synth.load()
+            guard.reloaded()
+            log.info("reloaded: %s", gpu_memory_report())
+        elif not synth.loaded:
+            synth.load()
+            guard.reset()
 
     def prepare(item: BatchItem) -> dict:
         """Validate one item and turn it into a Breeze request."""
@@ -207,8 +284,9 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
         else:
             elapsed = time.perf_counter() - started
             seconds = sum(len(a) for a in audios) / SAMPLE_RATE
-            log.info("chunk of %d: %.1fs audio in %.1fs = %.2fx real time", len(chunk), seconds, elapsed,
-                     seconds / elapsed if elapsed > 0 else 0.0)
+            real_time = seconds / elapsed if elapsed > 0 else 0.0
+            log.info("chunk of %d: %.1fs audio in %.1fs = %.2fx real time", len(chunk), seconds, elapsed, real_time)
+            guard.record(len(chunk), real_time)
             for r, audio in zip(chunk, audios):
                 results[r["id"]] = (audio, None if len(audio) else "no audio generated")
             return
@@ -239,8 +317,7 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
         seed = body.seed if body.seed is not None else DEFAULT_SEED
         results: dict[str, tuple] = {}
         with lock:
-            if not synth.loaded:
-                synth.load()
+            ensure_loaded()
             chunk_index = 0
             for (_, cfg), group in groups.items():
                 group.sort(key=lambda r: len(r["text"]))  # a batch runs until its longest item ends
@@ -261,14 +338,14 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
     @app.post("/api/load")
     def load():
         with lock:
-            if not synth.loaded:
-                synth.load()
+            ensure_loaded()
         return {"loaded": True}
 
     @app.post("/api/unload")
     def unload():
         with lock:
             synth.unload()
+            guard.reset()
         return {"loaded": False}
 
     @app.post("/v1/batch")

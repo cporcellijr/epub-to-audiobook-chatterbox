@@ -20,6 +20,14 @@ one GPU with Chatterbox and the LLM; the app unloads it with `POST /api/unload`.
 
 WAV output is mono, 24 kHz, 16-bit. One generation runs at a time; other requests wait.
 
+## Slowdown guard
+
+A chunk of at least 3/4 of `BREEZE_MAX_BATCH` counts as full. When the median speed of the last 4
+full chunks falls under `BREEZE_SLOW_RTF` (1.5x real time), the server unloads and loads the model
+before its next request, logging `slowed down` and the GPU memory before and after. If speed stays
+low, it logs `still slow` and doesn't reload again for 30 minutes. One book on 2026-10-01 ran at a
+median 1.2x for five hours; healthy books never hit the threshold (WORKLOG §48).
+
 ## Environment
 
 | Variable | Default |
@@ -28,6 +36,7 @@ WAV output is mono, 24 kHz, 16-bit. One generation runs at a time; other request
 | `BREEZE_VOICES_DIR` | `/voices` |
 | `BREEZE_MAX_BATCH` | `32` |
 | `BREEZE_REPO_ID` | `BreezeBlue/Breeze-TTS-2` |
+| `BREEZE_SLOW_RTF` | `1.5` (0 turns the slowdown guard off) |
 
 ## Speed (RTX 4070, eager attention, voice cloning)
 
@@ -38,6 +47,9 @@ WAV output is mono, 24 kHz, 16-bit. One generation runs at a time; other request
 | 8 | 1.88x |
 | 16 | 3.94x |
 | 32 | 7.14x (8.2 GiB peak) |
+
+These are bake-off sentences. In real books full chunks run at 3.1x (median of 488; 5% under 1.8x),
+and a whole book at 2.5-2.8x including the speech check and retries.
 
 ## Licence
 
