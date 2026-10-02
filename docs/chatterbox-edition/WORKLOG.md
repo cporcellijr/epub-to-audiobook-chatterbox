@@ -3090,3 +3090,36 @@ The review asked for runs that say what made them and for the replay tooling in 
   §46 with 3 and 2 of 4 chapter narrators wrong, none after.
 - The README of `experiments/multivoice` says how to use them: replay for code that asks nothing new,
   three or more live runs per variant for prompt changes.
+
+### 49.3 A narrator only described, and point-of-view chapters
+
+The books analysed overnight on the §47 code were checked chapter by chapter. The Ugly Love of
+Monster Girls was wrong where it matters most. Its "I" is Markus (others call him by name, the
+narration never does), but the model labelled him "Man" in most chapters: 461 lines under "Man" (read
+in the narrator voice) and 370 under "Markus" (Gabriel), with chapters 29-39 narrated by "Markus" and
+so read in Gabriel's voice. The book marks its point-of-view chapters ("Nora's PoV:" chapter 6,
+"Yuki's PoV:" chapter 7, a "Selina PoV" section inside chapter 39), and the narrator choice also gave
+chapter 8 (whose narration names Yuki 20 times) to Yuki through the fold bug of §49.1, and 9 and 53 to
+Nora and a description. Three causes, all fixed:
+
+- **"Oh man!" was an address to "Man".** The address check ignored case; a name in direct address is
+  written with its capital. Names now match as written (the "hey"/"oh" before them in any case). The
+  ten replays and turn-taking are unchanged.
+- **A description could be a teller or the book narrator.** "Man", "the girl" and "The Narrator" are
+  labels, not names: never a teller, never the book narrator that overrules votes.
+- **Point-of-view chapters blocked the main teller.** Markus is named in the narration of Nora's and
+  Yuki's chapters, so he failed "never named in the story's narration". A chapter whose "I said" lines
+  went to another named person is now that person's: it neither counts for nor against a teller, nor
+  gets one. A chapter whose "I" is unnamed or only described takes the teller, with that label's lines
+  in the chapter.
+
+Rerun offline on the saved cast (no model; its "I said" lines already carry the chosen narrators):
+the deployed code gives every chapter to "Man"; the new code gives chapter 6 to Nora, 7 to Yuki and the
+other 53 to Markus, matching the book's headings; the Selina section inside chapter 39 stays Markus's
+(narrators are chosen per chapter). Master of Bodies (first-person chapters in a third-person book) is
+unchanged. Over 157 first-person chapters of ten books, the teller now names 95 right, leaves 62 alone
+and none wrong (Mom's Guidance now names Troy: its chapters' votes go to him, so a silent female "Troy"
+twin no longer splits his addresses). Goblin Stepsister Obsession still abstains: its narrator is
+split between "Rakos" and "Onii-chan", both with votes.
+
+- Tests: 946 app tests pass in the container.

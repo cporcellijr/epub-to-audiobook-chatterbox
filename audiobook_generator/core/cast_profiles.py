@@ -633,17 +633,30 @@ TELLER_MIN_ADDRESSES = 3  # times a story's "I" must be addressed by name before
 TELLER_MARGIN = 2         # ...and how many times more often than anyone else the narration doesn't name
 
 
+def _is_description(character: dict) -> bool:
+    """An unnamed "The Narrator" or a chapter-local description ("Man", "the girl"): no one's name."""
+    return character.get("name") == ANONYMOUS_NARRATOR or character.get("reference_scope") == "chapter"
+
+
 def addressed_tellers(members: List[ChapterText], characters: Dict[str, dict],
-                      log: logging.Logger = logger) -> Dict[int, str]:
+                      log: logging.Logger = logger, votes: Optional[Dict[int, Optional[str]]] = None) -> Dict[int, str]:
     """{chapter number: narrator} for the stories of a first-person run whose "I" the other people
     plainly call by name: the person addressed by name most often ("..., Vic?") by anyone else, among
     those the narration never names (could_say_i), at least TELLER_MIN_ADDRESSES times and
-    TELLER_MARGIN times the next. A run is split into stories where a chapter's text names
-    STORY_BREAK_MIN_CAST people and none the story so far named; who the model said speaks doesn't
-    count (seen live: lines of the next story went to the last one's narrator, joining them up).
-    Measured over 13 stories of eight books: 9 named right, 4 left alone, none wrong; looser
-    thresholds named wrong people (a collection story's other lead)."""
+    TELLER_MARGIN times the next; never a description. A run is split into stories where a chapter's
+    text names STORY_BREAK_MIN_CAST people and none the story so far named; who the model said speaks
+    doesn't count (seen live: lines of the next story went to the last one's narrator, joining them
+    up). A chapter whose "I said" lines (`votes`) went to another named person is theirs (seen live: a
+    novel's "Nora's PoV" chapters): it neither counts for a teller nor gets one. Measured over 13
+    stories of eight books: 9 named right, 4 left alone, none wrong; looser thresholds named wrong
+    people (a collection story's other lead)."""
     from collections import Counter
+    votes = votes or {}
+
+    def told_by(chapter: ChapterText) -> Optional[str]:
+        vote = votes.get(chapter.number)
+        return vote if vote in characters and not _is_description(characters[vote]) else None
+
     stories, people = [], set()
     for chapter in members:
         mine = _chapter_cast(chapter, characters, speakers=False)
@@ -653,26 +666,30 @@ def addressed_tellers(members: List[ChapterText], characters: Dict[str, dict],
         stories[-1].append(chapter)
         people |= mine
     patterns = {key: pattern for key, pattern in ((key, _address_pattern(character)) for key, character
-                                                  in characters.items()
-                                                  if character.get("name") != ANONYMOUS_NARRATOR) if pattern}
+                                                  in characters.items() if not _is_description(character)) if pattern}
     found: Dict[int, str] = {}
     for story in stories:
+        def theirs(key: str) -> List[ChapterText]:  # the story's chapters this person could tell
+            return [chapter for chapter in story if told_by(chapter) in (None, key)]
+
         counts = Counter()
         for chapter in story:
+            owner = told_by(chapter)
             for paragraph in chapter.paragraphs:
                 for segment in paragraph:
                     if segment.kind == DIALOGUE:
                         quote, speaker = _quote(segment.text), chapter.lines.get(segment.line_id)
                         counts.update(key for key, pattern in patterns.items()
-                                      if key != speaker and pattern.search(quote))
+                                      if key != speaker and owner in (None, key) and pattern.search(quote))
         ranked = [(n, key) for key, n in counts.most_common()
-                  if all(could_say_i(chapter, key, characters) for chapter in story)][:2]
+                  if all(could_say_i(chapter, key, characters) for chapter in theirs(key))][:2]
         if ranked and ranked[0][0] >= TELLER_MIN_ADDRESSES and \
                 ranked[0][0] >= TELLER_MARGIN * (ranked[1][0] if len(ranked) > 1 else 0):
             key = ranked[0][1]
-            found.update({chapter.number: key for chapter in story})
-            log.info(f"Cast: chapters {story[0].number}-{story[-1].number} told by {key}, addressed by name "
-                     f"{ranked[0][0]} times (next {ranked[1][0] if len(ranked) > 1 else 0})")
+            told = theirs(key)
+            found.update({chapter.number: key for chapter in told})
+            log.info(f"Cast: {len(told)} chapters from {told[0].number} to {told[-1].number} told by {key}, "
+                     f"addressed by name {ranked[0][0]} times (next {ranked[1][0] if len(ranked) > 1 else 0})")
     return found
 
 
@@ -696,8 +713,8 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
                                   for c, view in zip(chapters, views) if view}
     single_run_tone = (book_tone or {}).get("pov_key") if (
         len(stories) == 1 and (book_tone or {}).get("point_of_view") == "first") else None
-    if single_run_tone not in characters:
-        single_run_tone = None  # a key nobody in the cast has can't narrate
+    if single_run_tone not in characters or _is_description(characters[single_run_tone]):
+        single_run_tone = None  # a key nobody in the cast has, or a label ("Man"), names no narrator
     for story in stories:
         members = [chapters[i] for i in story]
         # Each chapter votes on its own: two first-person stories can sit side by side in a
@@ -712,7 +729,7 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
         pooled = _voted_narrator(members)
         unnamed = {key for key in own if (characters.get(key) or {}).get("name") == ANONYMOUS_NARRATOR}
         named_in_run = any(key and key not in unnamed for key in own)
-        tellers = addressed_tellers(members, characters, log)
+        tellers = addressed_tellers(members, characters, log, {c.number: key for c, key in zip(members, own)})
         for i, chapter in enumerate(members):
             def fits(key: Optional[str]) -> bool:
                 return bool(key) and could_say_i(chapter, key, characters)
@@ -721,6 +738,15 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
             book_narrator = teller or (single_run_tone if fits(single_run_tone) else None)
             found = own[i]
             tone = None
+            if teller and (found is None or _is_description(characters.get(found) or {})):
+                # The others call this chapter's "I" by name: they tell it, and the lines the model gave
+                # the "I" under a label are theirs (seen live: a novel's narrator labelled "Man" in most
+                # chapters, read in another voice than his own name's).
+                narrators[chapter.number] = {"point_of_view": "first", "narrator": teller}
+                if found and found != teller:
+                    narrators[chapter.number]["narrator_reference"] = found
+                own[i] = None  # not lent: another story's untagged chapter must not take this teller
+                continue
             if found in unnamed and named_in_run:
                 # The model left this chapter's "I" unnamed while others in the run are named: which
                 # story it belongs to is settled by who else is in it (_share_anonymous_narrator),
@@ -733,10 +759,6 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
                 # it, or else it keeps one unnamed narrator, an untagged chapter included
                 # (_share_anonymous_narrator joins them). Seen live: the book-wide guess named a
                 # woman he talks to instead, and her voice read his story.
-                if teller:
-                    narrators[chapter.number] = {"point_of_view": "first", "narrator": teller}
-                    own[i] = None  # its unnamed "I" is the teller now: nothing to lend to another story
-                    continue
                 lend = [(abs(j - i), j) for j, key in enumerate(own) if key]
                 if found or lend:
                     found = found or own[min(lend)[1]]
@@ -787,8 +809,8 @@ def _address_pattern(character: dict) -> Optional["re.Pattern"]:
     forms = name_forms(character)
     if not forms:
         return None
-    f = "(?:" + "|".join(re.escape(form) for form in forms) + ")"
-    return re.compile(rf"(?:^|[,;—–]\s*|\b(?:hey|oh|okay|listen|look)\s+){f}\s*[,.?!…—]|,\s*{f}\b", re.I)
+    f = "(?:" + "|".join(re.escape(form) for form in forms) + ")"  # as written: "Oh man!" is no address
+    return re.compile(rf"(?:^|[,;—–]\s*|\b(?i:hey|oh|okay|listen|look)\s+){f}\s*[,.?!…—]|,\s*{f}\b")
 
 
 def _quote(text: str) -> str:

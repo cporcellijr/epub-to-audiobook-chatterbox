@@ -5,7 +5,7 @@ import logging
 import unittest
 
 from audiobook_generator.core.cast_profiles import (
-    ChapterText, Passage, ProfileError, _ask_tone, _spread, addressed_tellers, apply_chapter_narrators, chapter_narrators, chapter_point_of_view,
+    ChapterText, Passage, ProfileError, _ask_tone, _spread, addressed_tellers, addresses, apply_chapter_narrators, chapter_narrators, chapter_point_of_view,
     character_passages, could_say_i, describe_book, drop_unsupported_accents, first_lines, name_forms, narration_passages,
     parse_profile, parse_tone, profile_cast, profile_candidates, render_excerpts, select_passages,
     turn_taking,
@@ -459,6 +459,23 @@ class TestChapterNarrators(unittest.TestCase):
         found = chapter_narrators(cast, chapters, None)
         self.assertEqual([found[n]["narrator"] for n in (1, 2, 3, 4)], ["oliver", "oliver", "oliver", None])
 
+    def test_a_narrator_only_described_takes_the_name_others_call_him_beside_another_tellers_chapter(self):
+        # Seen live: a novel's "I" was labelled "Man" in most chapters and read in another voice than his
+        # own name's; its "Nora's PoV" chapters, whose narration names him, had blocked the teller.
+        cast = self._cast(1, 2, 3, 4)
+        cast["characters"]["man"] = {"name": "Man", "aliases": [], "gender": "male", "age": "adult", "lines": 6,
+                                     "reference_scope": "chapter"}
+        chapters = [_story(n, _FIRST_PERSON, {1: "bettie", 2: "man", 3: "man"}) for n in (1, 2, 3)]
+        hers = f"Oliver waited for me by the gate, as he always did.{M}" * 6 + _FIRST_PERSON
+        chapters.append(_story(4, hers, {1: "oliver", 2: "bettie", 3: "bettie"}))
+        for chapter in chapters:
+            cast["chapters"][f"h{chapter.number}"]["lines"] = {str(k): v for k, v in chapter.lines.items()}
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2, 3, 4)],
+                         ["oliver", "oliver", "oliver", "bettie"])
+        self.assertEqual([dict(c.lines) for c in chapters[:3]], [{1: "bettie", 2: "oliver", 3: "oliver"}] * 3)
+        self.assertNotIn("man", cast["characters"])
+
     def test_a_teller_needs_three_addresses_twice_anyone_elses_and_a_narration_that_never_names_them(self):
         def story(*extra):
             text = _FIRST_PERSON + "".join(M + line for line in extra)
@@ -783,6 +800,13 @@ class TestTurnTaking(unittest.TestCase):
         self.assertEqual(self._fix(far, ["ada", "ada", "ada", "ada"]), {})  # Ada twice in a row at the end
         beat = M.join(['"One."', '"Two."', 'He nodded, and they went in. "Look," Tom said.'])
         self.assertEqual(self._fix(beat, ["tom", "tom", "tom"]), {})
+
+    def test_a_name_is_addressed_as_written(self):
+        hope, man = {"name": "Hope", "aliases": []}, {"name": "Man", "aliases": []}
+        self.assertTrue(addresses('"Hope, wait!"', hope))
+        self.assertTrue(addresses('"Hey Hope."', hope))
+        self.assertFalse(addresses('"Well, hope is all we have."', hope))
+        self.assertFalse(addresses('"Oh man, that hurt."', man))
 
     def test_a_line_never_goes_to_the_person_it_addresses(self):
         text = M.join(['"Ready?" Ada asked.', '"Yes, Tom."', '"Go."'])
