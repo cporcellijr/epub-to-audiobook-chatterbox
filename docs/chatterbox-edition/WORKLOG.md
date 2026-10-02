@@ -3270,3 +3270,74 @@ passed. Breeze was unloaded afterwards, as it was found.
 
 - Tests: 956 app tests pass (1 skipped); 28 Breeze server tests (2 new). The provider and speech-check
   tests were written by a Sonnet subagent and reviewed here.
+
+## 51. A real book on §50, and GPU memory under WSL (2026-10-02)
+
+### 51.1 Glass Children: the first whole book on length-sorted batches
+
+The owner queued a small cast book, Glass Children: 8 chapters, 2,056 units, 166 min of audio.
+- **Speed:** it finished in 46.5 min including the checks, retries and the M4B, which is 3.6x real
+  time. Whole books ran at 2.5-2.8x before §50. Full chunks had a median of 3.85x (it was 3.1x).
+- **Checks:** generation waited on them for 16 s in all.
+- **Retries:** 27 units were retried (1.3%, the usual 1.2-1.8%). Three were kept although no attempt
+  passed: 0:36:16 (Zoe, a 3-character line that came out as 5 s, match 0.0), 0:53:41 (Zoe, 0.67)
+  and 1:39:50 (Nina Peterson, a 432-character unit, 30.9 s, 0.33).
+- **Guard:** it never fired; the slowest full chunk ran at 1.45x. The book had one directed batch.
+- **Listening:** the owner's verdict is pending.
+
+Speed now falls inside each chapter, since its longest units go first; compare chapters by their
+first batch. Chapter 8's first batch ran at about half the usual seconds generated per second of
+audio. The logs can't say whether one long take or memory caused it.
+
+### 51.2 The spill, measured
+
+With the book done and Breeze still loaded, Windows showed the WSL VM holding 11.18 GB of the
+card's dedicated memory plus 2.26 GB of shared (system) memory. Unloading took the card from 11.68
+to 1.16 GB and the shared memory from 2.27 to 0.24 GB. That spill is larger than the 0.67 GB seen
+in §50.5 or the 1.6 GB in §48.
+
+### 51.3 Experiment: three allocator settings on one fixed workload
+
+**Logging first.** Every `chunk of N` line now ends with `GPU peak N MiB, reserved M MiB`: the
+chunk's own peak (`max_memory_allocated` since a reset) and what PyTorch keeps reserved afterwards.
+
+**The workload.** Three chapters' batch shapes, all grouped as the app does, with fixed seeds:
+171 long Crichton sentences (Chloe voice), the Whores Versus Sex Robots chapter with 9 directed
+units, and a Master of Bodies chapter. Each setting got a fresh container. A PowerShell sampler read
+the Windows GPU adapter counters every 2 s.
+
+| Setting | Workload | Chunk peaks | Reserved | Windows dedicated max | Shared max |
+|---|---|---|---|---|---|
+| Default allocator | 406.1 s | 7.5-9.2 GB | 9.68 GB, flat | 10.37 GB | 0.15 GB |
+| `expandable_segments:True` | 407.2 s | 7.5-9.1 GB | 9.23 GB, flat | 10.15 GB | 0.12 GB |
+| `empty_cache()` after each chunk | 402.6 s | 7.5-9.2 GB | 7.6-10.2 GB | 10.22 GB | 0.12 GB |
+
+None of the settings spilled. 7 minutes on a fresh load doesn't reach the state a 46-minute book
+left behind. None of them changed the speed either: each chunk took within a few percent of the
+same time.
+
+**Chosen: `expandable_segments:True`.** Compose sets it by default as
+`PYTORCH_CUDA_ALLOC_CONF=${BREEZE_CUDA_ALLOC_CONF-expandable_segments:True}`, and an empty
+`BREEZE_CUDA_ALLOC_CONF` turns it off. Its reserve sat about 0.1 GB above the peak, against 0.5 GB
+with the default. Its segments grow and shrink in place, so it resists the fragmentation suspected in
+Glass Children. After that book the card held 11.68 GB, against 10.37 GB at this workload's highest
+point, and 2.27 GB had spilled; a bigger peak in the book can't be ruled out.
+
+**Rejected: emptying the cache after each chunk.** It was tried behind an env switch and then
+removed. Between chunks the reserve fell, but while it grew back it fragmented, and its highest
+point (10.2 GB) was above the default's. The highest point is what decides a spill.
+
+### 51.4 Deployed; not yet known
+
+The Breeze container was rebuilt with the queue idle; it reports `PYTORCH_CUDA_ALLOC_CONF=
+expandable_segments:True` and `/opt/breeze-infer/server.py` matches the working tree. Live: one
+sentence generated, with the new memory figures on its log line. Breeze was unloaded afterwards.
+
+Still unknown: whether the reserve stays flat through a whole book now. The next book answers that.
+- In `docker logs breeze`, the `reserved` figure across the book should stay near the chunk peaks
+  (about 9.2 GB).
+- After the book, the Windows counter `\GPU Process Memory(*)\Shared Usage` should be well under the
+  2.26 GB seen here.
+- If the reserve still creeps up, the next step is a model reload between chapters.
+
+- Tests: 28 Breeze server tests pass.

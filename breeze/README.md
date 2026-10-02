@@ -44,6 +44,11 @@ median 1.2x for five hours; healthy books never hit the threshold (WORKLOG §48)
 | `BREEZE_MAX_BATCH` | `32` |
 | `BREEZE_REPO_ID` | `BreezeBlue/Breeze-TTS-2` |
 | `BREEZE_SLOW_RTF` | `1.5` (0 turns the slowdown guard off) |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True`, set by compose from `BREEZE_CUDA_ALLOC_CONF` (empty turns it off) |
+
+Every `chunk of N` log line ends with the chunk's peak GPU memory and what PyTorch keeps reserved
+afterwards. A reserve creeping far above the peaks over a long book means fragmentation; under WSL
+it spills into shared system memory (Windows counter `\GPU Process Memory(*)\Shared Usage`).
 
 ## Speed (RTX 4070, eager attention, voice cloning)
 

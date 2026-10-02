@@ -54,6 +54,25 @@ def empty_cuda_cache() -> None:
         torch.cuda.empty_cache()
 
 
+def reset_peak_memory() -> None:
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def chunk_memory_note() -> str:
+    """'; GPU peak N MiB, reserved M MiB' for the chunk just generated, or '' without CUDA. Peak is what
+    the chunk itself needed (since reset_peak_memory); reserved is what the allocator keeps afterwards.
+    A reserve far above the peak is cached, fragmented memory, which under WSL can push the process
+    past the card's dedicated memory into shared system memory (WORKLOG §51; compose sets
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True against it)."""
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_available():
+        return ""
+    return (f"; GPU peak {torch.cuda.max_memory_allocated() >> 20} MiB, "
+            f"reserved {torch.cuda.memory_reserved() >> 20} MiB")
+
+
 def gpu_memory_report() -> str:
     torch = sys.modules.get("torch")
     if torch is None or not torch.cuda.is_available():
@@ -311,6 +330,7 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
         longest = max(len(r["text"]) for r in chunk)
         tokens = max_tokens_for(getattr(synth, "frame_rate", None), longest)
         started = time.perf_counter()
+        reset_peak_memory()
         try:
             audios = synth.generate(chunk, cfg, seed, tokens)
             if len(audios) != len(chunk):
@@ -326,7 +346,8 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
             elapsed = time.perf_counter() - started
             seconds = sum(len(a) for a in audios) / SAMPLE_RATE
             real_time = seconds / elapsed if elapsed > 0 else 0.0
-            log.info("chunk of %d: %.1fs audio in %.1fs = %.2fx real time", len(chunk), seconds, elapsed, real_time)
+            log.info("chunk of %d: %.1fs audio in %.1fs = %.2fx real time%s", len(chunk), seconds, elapsed,
+                     real_time, chunk_memory_note())
             guard.record(len(chunk), real_time)
             for r, audio in zip(chunk, audios):
                 results[r["id"]] = (audio, None if len(audio) else "no audio generated")

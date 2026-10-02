@@ -377,3 +377,4 @@ def test_the_synthesizer_routes_reference_encoding_through_its_cache(monkeypatch
     synth.unload()
     templates._encode_prompt_audio("tok", str(clip))
     assert calls == [str(clip)] * 2
+
