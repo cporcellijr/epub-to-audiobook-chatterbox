@@ -28,6 +28,11 @@ MODEL_ENV = "SPEECH_CHECK_MODEL"
 MODEL_SIZE = "small"
 PASS_SCORE = 0.70
 _PAD_MS = 200  # silence around a take: Whisper hears a clipped first or last word better
+# Takes transcribe() can work on at once, each on _THREADS CPU threads. On the 24-thread host, 3 x 4
+# heard 32 real Breeze takes in 17.3 s against 23.0 s for 1 x 8, with the same transcripts
+# (2026-10-02, WORKLOG §50); Breeze's checks hear a batch this way, other callers one take at a time.
+WORKERS = 3
+_THREADS = 4
 
 
 @dataclass
@@ -40,7 +45,9 @@ class SpeechChecker:
     def __init__(self, model):
         self._model = model
 
-    def transcribe(self, audio: AudioSegment) -> Heard:
+    def transcribe(self, audio: AudioSegment, words: bool = True) -> Heard:
+        """What the take says. Word times cost Whisper an extra alignment pass and only the lead-in
+        cut needs them; words=False leaves Heard.words empty."""
         import numpy as np
 
         pad = AudioSegment.silent(_PAD_MS, frame_rate=16000)
@@ -48,11 +55,11 @@ class SpeechChecker:
         samples = np.frombuffer(pcm.raw_data, dtype=np.int16).astype(np.float32) / 32768
         segments, _ = self._model.transcribe(
             samples, language="en", beam_size=5, temperature=0, condition_on_previous_text=False,
-            vad_filter=False, word_timestamps=True)
+            vad_filter=False, word_timestamps=words)
         segments = list(segments)
-        words = [(w.word.strip(), round(w.start * 1000) - _PAD_MS, round(w.end * 1000) - _PAD_MS)
+        times = [(w.word.strip(), round(w.start * 1000) - _PAD_MS, round(w.end * 1000) - _PAD_MS)
                  for s in segments for w in (s.words or [])]
-        return Heard("".join(s.text for s in segments).strip(), words)
+        return Heard("".join(s.text for s in segments).strip(), times)
 
 
 _checker: Optional[SpeechChecker] = None
@@ -75,7 +82,7 @@ def get() -> Optional[SpeechChecker]:
             logger.info("Downloading the speech-check model (Whisper %s, about 480 MB) to %s", MODEL_SIZE, path)
             download_model(MODEL_SIZE, output_dir=path)
         _checker = SpeechChecker(WhisperModel(path, device="cpu", compute_type="int8",
-                                              cpu_threads=min(8, os.cpu_count() or 1)))
+                                              cpu_threads=min(_THREADS, os.cpu_count() or 1), num_workers=WORKERS))
         logger.info("Speech check on: Whisper %s from %s", MODEL_SIZE, path)
     except Exception as error:  # a missing package, a failed download or a bad model file
         logger.warning("Speech check off: could not load Whisper from %s (%s)", path, error)

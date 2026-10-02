@@ -339,3 +339,41 @@ def test_unload_drops_a_pending_reload(voices):
     c.post("/api/unload")
     post(c, [item("a")])
     assert (synth.loads, synth.unloads) == (2, 1) and guard.last_reload is None
+
+
+def test_reference_cache_encodes_a_clip_once_until_it_changes(tmp_path):
+    clip = tmp_path / "Ann.wav"
+    clip.write_bytes(b"one")
+    encoded = []
+    cache = server.ReferenceCache(lambda tokenizer, path: encoded.append(path) or f"codes {len(encoded)}")
+    assert [cache("tok", str(clip)) for _ in range(3)] == ["codes 1"] * 3
+    clip.write_bytes(b"replaced")  # a new clip under the same name
+    assert [cache("tok", str(clip)) for _ in range(2)] == ["codes 2"] * 2
+    cache.clear()
+    assert cache("tok", str(clip)) == "codes 3"
+    assert encoded == [str(clip)] * 3
+
+
+def test_the_synthesizer_routes_reference_encoding_through_its_cache(monkeypatch, tmp_path):
+    import sys
+    import types
+    calls = []
+    templates = types.ModuleType("breeze_infer.templates")
+    templates._encode_prompt_audio = lambda tokenizer, path: calls.append(path) or "codes"
+    package = types.ModuleType("breeze_infer")
+    package.templates = templates
+    monkeypatch.setitem(sys.modules, "breeze_infer", package)
+    monkeypatch.setitem(sys.modules, "breeze_infer.templates", templates)
+    clip = tmp_path / "Ann.wav"
+    clip.write_bytes(b"x")
+    synth = server.BreezeSynthesizer(model_dir=str(tmp_path))
+    synth._cache_references()
+    synth._cache_references()  # a reload doesn't wrap the cache in another
+    assert isinstance(templates._encode_prompt_audio, server.ReferenceCache)
+    assert not isinstance(templates._encode_prompt_audio.encode, server.ReferenceCache)
+    for _ in range(3):
+        assert templates._encode_prompt_audio("tok", str(clip)) == "codes"
+    assert calls == [str(clip)]
+    synth.unload()
+    templates._encode_prompt_audio("tok", str(clip))
+    assert calls == [str(clip)] * 2

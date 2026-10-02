@@ -40,7 +40,9 @@ The repo holds the whole stack:
 - **Breeze TTS 2** (`./breeze`, shown when `BREEZE_BASE_URL` is set, and then the default engine): a
   3B model that clones the same voice files much more naturally than Chatterbox. One sentence at a
   time it is slow on a 12 GB card (0.45× real time), so chapters are made in batches of 32 sentences
-  (5–7× real time), every take checked by Whisper and the failures retried in the next batch. It
+  of similar length (a batch runs until its longest sentence ends; whispered lines go in batches of
+  their own), every take checked by Whisper, three at a time, while the next batch generates, and the
+  failures retried together. It
   needs the exact words of each voice clip, which the app transcribes once with Whisper and caches
   (`voice_transcripts.json`). The server loads its model only when a Breeze book starts and the app
   unloads it for a cast analysis, since Breeze (~8 GB) and the LLM can't share the GPU. Before Breeze

@@ -20,6 +20,13 @@ one GPU with Chatterbox and the LLM; the app unloads it with `POST /api/unload`.
 
 WAV output is mono, 24 kHz, 16-bit. One generation runs at a time; other requests wait.
 
+Each voice clip is encoded once and reused (keyed by path, size and modification time, so a replaced
+clip is encoded again; cleared on unload). The pinned runtime would otherwise encode it for every
+item, twice for a directed one: 35-50 ms each, 1-3 s of a 32-item batch.
+
+The app sorts a chapter's units before batching (directed apart from plain, longest first), since a
+chunk runs until its longest item finishes.
+
 ## Slowdown guard
 
 A chunk of at least 3/4 of `BREEZE_MAX_BATCH` counts as full. When the median speed of the last 4
@@ -49,7 +56,9 @@ median 1.2x for five hours; healthy books never hit the threshold (WORKLOG §48)
 | 32 | 7.14x (8.2 GiB peak) |
 
 These are bake-off sentences. In real books full chunks run at 3.1x (median of 488; 5% under 1.8x),
-and a whole book at 2.5-2.8x including the speech check and retries.
+and a whole book at 2.5-2.8x including the speech check and retries. That was with chapters sent in
+book order. Sorted by length (2026-10-02, WORKLOG §50), a 108-unit chapter's generating time fell
+from 307 s to 189-201 s, and its total time with the checks from 325 s to 198-209 s.
 
 ## Licence
 

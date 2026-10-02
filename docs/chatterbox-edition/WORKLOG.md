@@ -3148,3 +3148,125 @@ that both get "I said" votes (Goblin Stepsister Obsession's "Rakos" and "Onii-ch
 
 Casts analysed before these changes keep their narrators: re-analyse a book (Monster Girls, Goblin)
 before generating it.
+
+## 50. Faster Breeze chapters: length-sorted batches, cached references, quicker checks (2026-10-02)
+
+The owner asked Codex how to speed up Breeze generation, and asked Claude to make the changes it
+agreed with. Codex proposed five. Three were done, one measured change was added, and two were left.
+
+| Codex's proposal | Outcome |
+|---|---|
+| 1. Group a chapter's units by delivery and length before batching | Done (§50.1) |
+| 2. Cache encoded voice references in the server | Done (§50.2) |
+| 3. Skip Whisper's word times for Breeze | Done (§50.3): 7% faster checks |
+| 4. Try shorter references | Not done (§50.5) |
+| 5. Lean model loader to cut memory | Not done (§50.5) |
+| (added) Hear 3 takes at once | Done (§50.3): the checks had become the bottleneck |
+
+### 50.1 Length-sorted batches (`_breeze_batches`)
+
+A batch generates until its longest take ends. The app used to send units in book order, 32 at a
+time, and the server then split each request by template, so directed lines became small calls of
+their own. In the Breeze log for Master of Bodies, 36 small chunks (under 24 units) held 13% of the
+units and took 25% of the generating time (688 of 2,754 s). One chunk of 4 units took 32 s, about
+what a full chunk takes.
+
+Now each attempt's pending units are split into plain and directed, sorted longest text first, and
+cut into batches of 32. A group's leftover partial batch holds its shortest units. Equal lengths
+keep book order. The takes still go back in unit order.
+
+Evidence:
+- **Simulation over the 7 finished Breeze books' clip maps.** The cost is the sum of each call's
+  longest take, first attempt only. Savings: Apex Prey 2 39%, Depths of Desire 41%, Forbidden
+  Temptation 31%, Master of Bodies 36%, On Earth as it is Beneath 37%, Trad Wife 49% (310 → 299
+  calls), Whores Versus Sex Robots 36% (174 → 162 calls). Codex's estimates were 28-47%. This
+  version also puts each group's leftover batch last.
+- **Replay on the live server.** Units kept their real voice, transcript, instruction and text
+  length; their words were sentences of the same length from another book. Same seeds both ways,
+  run in the order book, grouped, grouped, book.
+  - Master of Bodies chapter (101 units): book order 138 and 137 s, grouped 84 and 87 s (62%).
+  - Whores Versus Sex Robots chapter (183 units, 9 directed): book order 324 and 338 s, grouped
+    190 and 185 s (57%).
+- **End to end through `OpenAITTSProvider`.** Real Breeze and Whisper, one 108-unit chapter in the
+  Chloe voice, seeds pinned. Run in a fresh model load in the order new, old, new: 197.7 s,
+  325.2 s, 209.0 s. Generating time was 189 and 201 s against 307 s. No retries in any run.
+
+### 50.2 Reference cache (`breeze/server.py` `ReferenceCache`)
+
+The pinned runtime reads and encodes the voice clip for every item, and twice for a directed item
+(its guidance prompt again). Each encode takes 35-50 ms on the 4070, so 1.1-1.6 s of every
+32-item batch. `BreezeSynthesizer` now routes `breeze_infer.templates._encode_prompt_audio` through
+a cache keyed by path and checked against size and modification time. Unloading clears it. If a
+future pin drops that function, the server logs a warning and runs uncached.
+
+Checked in the container: repeated fresh encodes of 4 clips are bit-identical, so a cached clip
+gives exactly what a fresh one would. 32 lookups through the runtime's own path took 0.06-0.10 s,
+mostly the `os.stat` on the Windows-mounted `/voices`. The saving is about 3% of a batch.
+
+### 50.3 Speech check: no word times, three takes at once
+
+`SpeechChecker.transcribe(audio, words=False)` skips faster-whisper's word alignment. Only
+Chatterbox's lead-in cut uses the word times. On 64 real Breeze takes (3 alternating runs), the
+median fell from 791 to 736 ms per take, with all 64 transcripts identical.
+
+With length-sorted batches, the later batches of shorter units generated in 14-31 s, while
+hearing 32 takes took 27-39 s. Generation waited on the checks: 8.4 and 7.0 s in the first end-to-end run, plus
+about 20 s of checks after the last batch. Whisper is now loaded with `num_workers=3` and 4 threads
+each, and `_check_breeze_batch` hears a batch's non-silent takes 3 at a time. Takes per 32 on the
+24-thread host, all with the same 64 transcripts:
+
+| Threads x workers | Per 32 takes |
+|---|---|
+| 8 x 1 (before) | 23.0 s |
+| 6 x 2 | 19.7 s |
+| 8 x 2 | 20.8 s |
+| 4 x 3 | 17.3 s |
+| 6 x 3 | 17.6 s |
+
+Memory: 736 MB peak RSS with one worker, 758 MB with three (the weights are shared). In the end-to-end
+runs, checks went from 39.4/30.2/26.6 s to 26.6/20.0/18.5 s, and generation no longer waited.
+
+Not measured: one take at a time on 4 threads instead of 8, which is how the Chatterbox path, voice
+transcripts and voice design use it. Chatterbox is stopped.
+
+### 50.4 New log lines (app)
+
+- `Breeze attempt n/3, batch i of k: N units (directed), seed=…`
+- `Breeze attempt n/3: checked N takes in Xs`
+- `Breeze attempt n/3 waited Xs for the checks of batch i` (only when it waited at least 1 s)
+
+Together with the server's `chunk of N` lines, these split a chapter's time into generating,
+checking and waiting.
+
+### 50.5 Not done, and what was seen
+
+- **Shorter references (4).** The live voices are 6.4-15.3 s, except "good morning.wav" (25.4 s).
+  The 26 s clip suspected in §36.1 is no longer in the folder. Trimming changes the voice, so the
+  owner's ear would decide; there's little left to gain.
+- **Lean loader (5).** It needs an audit of the pinned runtime and an isolated memory test. Today's
+  runs add evidence for that direction. In one end-to-end run, after the old code's runs, the WSL
+  process held 11.2 GB of dedicated GPU memory and 0.67 GB of shared memory. The identical first
+  batch (same seeds, same audio lengths to 0.1 s) then took 176.7 s, against 109.3 s before. After
+  an unload and load it took 104.2 and 115.0 s. This is the first direct sign that a reload restores
+  speed, which the §48 guard relies on.
+- **Codex's web findings** (upstream `--fast-all`, audio.cpp, BreezeRT) weren't pursued, for the
+  reasons Codex gave: memory, hardware and latency-not-throughput.
+
+Risks and things to watch:
+- **The §48 guard counts a chunk of at least 24 units as full.** Books with many soft lines now make
+  full directed chunks. These run slower per item (cfg 4.0, two prompts). One per chapter can't pull
+  the median of 4 below 1.5x, but a book that is mostly whispers might. If a `slowed down` line
+  follows directed chunks, that's why.
+- **A unit retried on its own is still slow.** One long take ran at 0.37x (77.6 s) in the live check.
+  This is not new.
+- **No whole book has been run yet.**
+
+### 50.6 Deployed and checked
+
+Both containers were rebuilt with the queue empty and paused; `/opt/breeze-infer/server.py` and the
+two changed app files match the working tree. Live check on the deployed `/app_src`: a 34-unit
+chapter went out as batches of 32 and 2. One near-silent take was re-sent alone with a new seed and
+passed. Breeze was unloaded afterwards, as it was found.
+
+- Tests: 956 app tests pass (1 skipped); 28 Breeze server tests (2 new). The provider and speech-check
+  tests were written by a Sonnet subagent and reviewed here.

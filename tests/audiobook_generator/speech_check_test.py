@@ -111,6 +111,9 @@ class TestLoading(unittest.TestCase):
             whisper.WhisperModel.assert_called_once()
             self.assertEqual(whisper.WhisperModel.call_args.args, (folder,))
             self.assertEqual(whisper.WhisperModel.call_args.kwargs["device"], "cpu")
+            # Breeze's checks hear several takes at once; each worker gets its own threads.
+            self.assertEqual(whisper.WhisperModel.call_args.kwargs["num_workers"], speech_check.WORKERS)
+            self.assertLessEqual(whisper.WhisperModel.call_args.kwargs["cpu_threads"], 4)
 
     def test_transcribe_pads_the_take_and_reports_word_times_within_it(self):
         model = MagicMock()
@@ -122,6 +125,20 @@ class TestLoading(unittest.TestCase):
         samples = model.transcribe.call_args.args[0]
         self.assertEqual(len(samples), 16000 * 1400 // 1000)
         self.assertEqual(model.transcribe.call_args.kwargs["language"], "en")
+
+    def test_word_times_are_only_asked_of_the_model_when_wanted(self):
+        words = [SimpleNamespace(word=" Kiss", start=0.25, end=0.5)]
+        model = MagicMock()
+        # Like faster-whisper: no word list unless word_timestamps is on.
+        model.transcribe.side_effect = lambda *a, **k: (
+            iter([SimpleNamespace(text=" Kiss", words=words if k["word_timestamps"] else None)]), None)
+        checker = speech_check.SpeechChecker(model)
+        audio = AudioSegment.silent(1000, frame_rate=24000)
+        heard = checker.transcribe(audio, words=False)
+        self.assertIs(model.transcribe.call_args.kwargs["word_timestamps"], False)
+        self.assertEqual((heard.text, heard.words), ("Kiss", []))
+        self.assertTrue(checker.transcribe(audio).words)
+        self.assertIs(model.transcribe.call_args.kwargs["word_timestamps"], True)
 
 
 if __name__ == "__main__":

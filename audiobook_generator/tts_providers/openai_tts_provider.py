@@ -173,6 +173,22 @@ def _chatterbox_input(text: str) -> str:
     return text
 
 
+def _breeze_batches(pending: List[int], items: List[dict]) -> List[List[int]]:
+    """The units to send (indexes into items) as requests of up to BREEZE_BATCH_SIZE, each one model
+    call that ends as early as it can. A batch generates until its longest take is done, so a small
+    batch holding a long unit costs about what a full one does (2026-10-02: a call of 4 units took
+    32 s, full calls 25-60 s). The server also runs directed and plain items as separate calls, so a
+    few whispered lines in a book-order batch became a call of their own. So directed and plain
+    units are batched apart, longest text first: units of similar length share a batch, and a
+    group's leftover batch holds its shortest units. Equal lengths keep their order."""
+    batches = []
+    for directed in (False, True):
+        group = sorted((i for i in pending if bool(items[i]["instruction"]) == directed),
+                       key=lambda i: -len(items[i]["text"]))
+        batches += [group[i:i + BREEZE_BATCH_SIZE] for i in range(0, len(group), BREEZE_BATCH_SIZE)]
+    return batches
+
+
 def _tiny_quote(text: str) -> bool:
     quoted = text.strip()
     return (2 < len(quoted) <= _SHORT_UNIT_CHARS
@@ -1106,9 +1122,11 @@ class OpenAITTSProvider(BaseTTSProvider):
                       audio_tags: AudioTags) -> List[Tuple[AudioSegment, dict, int, Optional[str]]]:
         """Every unit's take from the Breeze server, in unit order.
 
-        The units go out in requests of BREEZE_BATCH_SIZE. The checks of one batch (near-silence, then
-        the speech check's transcript through _verdict, for every take) run in a worker thread while
-        the next batch generates: Whisper uses the CPU, generation the GPU. Generation never gets
+        The units go out in requests of BREEZE_BATCH_SIZE, grouped by _breeze_batches (directed apart
+        from plain, similar lengths together); the takes still come back in unit order. The checks of
+        one batch (near-silence, then the speech check's transcript through _verdict, for every take;
+        no word times, which only Chatterbox's lead-in cut needs) run in a worker thread while the
+        next batch generates: Whisper uses the CPU, generation the GPU. Generation never gets
         more than one batch ahead of the checks. Units that fail are sent again together, in new
         batches with a new seed, for up to _BAD_CLIP_RETRIES more rounds; the best take is kept
         when none passes (as _speak_take does), and a unit fails the chapter only when the server
@@ -1141,14 +1159,19 @@ class OpenAITTSProvider(BaseTTSProvider):
         for attempt in range(_BAD_CLIP_RETRIES + 1):
             seed = _new_seed(seed)
             label = f"attempt {attempt + 1}/{_BAD_CLIP_RETRIES + 1}"
-            batches = [pending[i:i + BREEZE_BATCH_SIZE] for i in range(0, len(pending), BREEZE_BATCH_SIZE)]
+            batches = _breeze_batches(pending, items)
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="breeze-check") as checks:
                 futures = []
                 for number, batch in enumerate(batches, 1):
                     if len(futures) >= 2:
+                        waited = time.perf_counter()
                         futures[-2].result()  # the checks of the batch before last are done
-                    logger.info("Breeze %s, batch %d of %d: %d units, seed=%d", label, number, len(batches),
-                                len(batch), seed)
+                        waited = time.perf_counter() - waited
+                        if waited >= 1:  # the checks, not the GPU, are holding the chapter up
+                            logger.info("Breeze %s waited %.1fs for the checks of batch %d", label, waited,
+                                        number - 2)
+                    logger.info("Breeze %s, batch %d of %d: %d units%s, seed=%d", label, number, len(batches),
+                                len(batch), " (directed)" if items[batch[0]]["instruction"] else "", seed)
                     takes = breeze_client.synthesize_batch([items[i] for i in batch], seed)
                     futures.append(checks.submit(self._check_breeze_batch, batch, takes, units, items, ids, seed,
                                                  attempt, label, checker))
@@ -1187,7 +1210,18 @@ class OpenAITTSProvider(BaseTTSProvider):
         (detail: the tuple _breeze_takes ranks the unit's rejected takes by). A near-silent take
         ranks last, so it is kept only when nothing else exists. A directed take's instruction goes
         into its params (the clip map records it), and a rejected one is logged with its mood so a
-        listening test can see whether whispers or shouts fail the checks more often."""
+        listening test can see whether whispers or shouts fail the checks more often. Whisper hears
+        speech_check.WORKERS takes at once: the checks, not the GPU, set the pace of a batch of
+        short units."""
+        started = time.perf_counter()
+        silent = {index: _long_silence_ms(take) for index, take in zip(batch, takes) if not isinstance(take, str)}
+        heard = {}
+        if checker is not None:
+            to_hear = [(index, take) for index, take in zip(batch, takes)
+                       if index in silent and silent[index] < _BAD_CLIP_SILENCE_MS]
+            with ThreadPoolExecutor(speech_check.WORKERS, thread_name_prefix="breeze-check-hear") as hearing:
+                heard = dict(zip([index for index, _ in to_hear], hearing.map(
+                    lambda pair: self._hear(checker, pair[1], ids[pair[0]], words=False), to_hear)))
         outcomes = []
         for index, take in zip(batch, takes):
             unit, chunk_id = units[index][1], ids[index]
@@ -1199,19 +1233,19 @@ class OpenAITTSProvider(BaseTTSProvider):
             params = {"seed": seed}
             if items[index]["instruction"]:
                 params["_instruction"] = items[index]["instruction"]
-            silent_ms = _long_silence_ms(take)
+            silent_ms = silent[index]
             if silent_ms >= _BAD_CLIP_SILENCE_MS:
                 logger.warning("Breeze returned %.1fs of near-silence for %s (%s, mood=%s)",
                                silent_ms / 1000, chunk_id, label, mood)
                 outcomes.append((index, "reject", (2, silent_ms, attempt, take, params, "near-silent audio")))
                 continue
-            heard = self._hear(checker, take, chunk_id) if checker is not None else None
-            params, verdict = self._verdict(take, unit, params, heard, chunk_id, label)
+            params, verdict = self._verdict(take, unit, params, heard.get(index), chunk_id, label)
             if verdict is None:
                 outcomes.append((index, "pass", (take, params, attempt + 1, None)))
             else:
                 logger.info("Breeze rejected %s (%s, mood=%s): %s", chunk_id, label, mood, verdict[2])
                 outcomes.append((index, "reject", (verdict[0], verdict[1], attempt, take, params, verdict[2])))
+        logger.info("Breeze %s: checked %d takes in %.1fs", label, len(batch), time.perf_counter() - started)
         return outcomes
 
     def _speak_take(self, request_kwargs: dict, unit: str,
@@ -1352,9 +1386,10 @@ class OpenAITTSProvider(BaseTTSProvider):
         return params, (0, -score, "speech mismatch")
 
     @staticmethod
-    def _hear(checker, audio: AudioSegment, chunk_id: str) -> Optional["speech_check.Heard"]:
+    def _hear(checker, audio: AudioSegment, chunk_id: str, **options) -> Optional["speech_check.Heard"]:
+        """The checker's transcript of a take (`options` go to transcribe), or None if it failed."""
         try:
-            return checker.transcribe(audio)
+            return checker.transcribe(audio, **options)
         except Exception as error:  # a checker failure costs the check, never the chapter
             logger.warning("Speech check skipped for %s: %s", chunk_id, error)
             return None

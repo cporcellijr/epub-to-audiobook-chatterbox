@@ -112,6 +112,31 @@ class SlowdownGuard:
         self.last_reload = self.clock()
 
 
+class ReferenceCache:
+    """Encoded voice clips, so a clip is read and encoded once rather than for every item that uses
+    it. The pinned runtime encodes the reference anew for each item of a batch (and again for a
+    directed item's guidance prompt): 35-50 ms each on the RTX 4070, 1-3 s of every 32-item batch.
+    An entry is keyed by the clip's path and checked against its size and modification time, so a
+    replaced clip is encoded afresh; the synthesizer clears the cache when the model unloads. The
+    codes are small CPU tensors (a 13 s clip is 165 x 16 int16) that the runtime only reads."""
+
+    def __init__(self, encode):
+        self.encode = encode
+        self.codes: dict[str, tuple[tuple[int, int], object]] = {}
+
+    def __call__(self, audio_tokenizer, audio_path):
+        stat = os.stat(audio_path)
+        signature = (stat.st_size, stat.st_mtime_ns)
+        entry = self.codes.get(str(audio_path))
+        if entry is None or entry[0] != signature:
+            entry = (signature, self.encode(audio_tokenizer, audio_path))
+            self.codes[str(audio_path)] = entry
+        return entry[1]
+
+    def clear(self) -> None:
+        self.codes.clear()
+
+
 def template_name(request: dict) -> str:
     """Same rule as breeze_infer.templates.select_template_name, kept here so grouping needs no torch."""
     instruction = request.get("instruction")
@@ -130,6 +155,7 @@ class BreezeSynthesizer:
         self.model_dir = Path(model_dir or os.environ.get("BREEZE_MODEL_DIR", "/models/breeze-tts-2"))
         self.repo_id = repo_id or os.environ.get("BREEZE_REPO_ID", "BreezeBlue/Breeze-TTS-2")
         self._runtime = None
+        self.references: ReferenceCache | None = None
 
     @property
     def loaded(self) -> bool:
@@ -149,6 +175,7 @@ class BreezeSynthesizer:
         update_generation_config_for_breeze(model)
         self._runtime = (tokenizer, model, audio_tokenizer)
         self.frame_rate = self._read_frame_rate()
+        self._cache_references()
         log.info("model loaded in %.1fs (codec %s frames/s)", time.perf_counter() - started, self.frame_rate)
 
     def _read_frame_rate(self) -> float | None:
@@ -159,8 +186,22 @@ class BreezeSynthesizer:
         except (OSError, KeyError, ValueError, ZeroDivisionError):
             return None
 
+    def _cache_references(self) -> None:
+        """Route the runtime's reference encoding (templates._encode_prompt_audio, which every audio
+        segment goes through) via a ReferenceCache, once per process."""
+        if self.references is not None:
+            return
+        from breeze_infer import templates
+        encode = getattr(templates, "_encode_prompt_audio", None)
+        if not callable(encode):
+            log.warning("reference cache off: breeze_infer.templates has no _encode_prompt_audio")
+            return
+        self.references = templates._encode_prompt_audio = ReferenceCache(encode)
+
     def unload(self) -> None:
         self._runtime = None
+        if self.references is not None:
+            self.references.clear()  # codes belong to the codec that made them
         gc.collect()
         try:
             import torch
