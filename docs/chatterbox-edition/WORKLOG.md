@@ -3123,3 +3123,28 @@ twin no longer splits his addresses). Goblin Stepsister Obsession still abstains
 split between "Rakos" and "Onii-chan", both with votes.
 
 - Tests: 946 app tests pass in the container.
+
+### 49.4 Deployed and checked live; the rest of the review deferred
+
+`0cfb3db` (with §49.1-49.3) was deployed after Master of Bodies finished, the queue paused and
+empty; the container matched the commit. Live runs on the deployed code, each with a manifest
+(commit `0cfb3db`, model digest recorded):
+
+| Run | Before | Live now |
+|---|---|---|
+| You Like It Darker | 100 wrong, chapter narrators 0 of 4 wrong | identical |
+| Apex Prey 3 | 7 wrong + 1 unresolved, Polly throughout | identical |
+| Six Wakes | 2 wrong | identical |
+| Monster Girls chapters 2-9, 29-31, 53 | the saved cast: 5 of 12 chapter narrators wrong, "Man" and "Markus" two voices | 12 of 12 match the book's PoV headings; no "Man" in the cast |
+
+In the Monster Girls run the model voted Nora for Yuki's chapter; the narration check dropped it.
+
+Measured and not done: re-asking whole untagged exchanges whose answers break turn-taking. Of You
+Like It Darker's 100 wrong lines, such exchanges hold 52 lines, 26 of them wrong; the other test books
+have none. The best case is about 26 lines on one book, at the risk of the 26 the model has right, so
+it was left as an idea (scratch patch only, nothing committed). The listening comparison of voice
+choices (review point 5) is for the owner. Not done either: merging a narrator split under two names
+that both get "I said" votes (Goblin Stepsister Obsession's "Rakos" and "Onii-chan").
+
+Casts analysed before these changes keep their narrators: re-analyse a book (Monster Girls, Goblin)
+before generating it.
