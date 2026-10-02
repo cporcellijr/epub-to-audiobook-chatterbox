@@ -933,7 +933,10 @@ def _share_anonymous_narrator(cast: dict, chapters: List[ChapterText], narrators
             old = final.get(chapter.number)
             if old is None:
                 continue
-            fitting = [item for item in named if _same_story(chapter, item[1], theirs[item[1]], characters)]
+            # Never someone this chapter's narration names: in a novel whose chapters alternate
+            # between two first-person tellers, the other teller is named all through it.
+            fitting = [item for item in named if could_say_i(chapter, item[1], characters)
+                       and _same_story(chapter, item[1], theirs[item[1]], characters)]
             if fitting:
                 shared = min(fitting, key=lambda item: (abs(item[0] - n), item[0] > n))[1]
             else:

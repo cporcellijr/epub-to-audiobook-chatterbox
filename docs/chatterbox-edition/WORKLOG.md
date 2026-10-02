@@ -3055,3 +3055,18 @@ analyses in between) ran normally. The next `slowed down` line in `docker logs b
   GB free with the model loaded, so the logged "free" may understate use; the reserved/allocated
   figures are the server's own. The Windows counter `\GPU Process Memory(*)\Shared Usage` shows the
   spill into system memory (1.6 GB during a normal book on 2026-10-02).
+
+## 48. Review follow-ups (2026-10-02)
+
+§47 (`47db4bd`) was deployed after its entry was written; the container's code matched `e9b461b`.
+
+### 48.1 The fold ignored the narration check
+
+An outside review found that `_share_anonymous_narrator` folded a chapter's unnamed "I" into the
+nearest named narrator whose story it fits without asking `could_say_i`: a chapter whose narration
+names Oliver in six paragraphs was rejected for him by `chapter_narrators`, then handed to him anyway
+with its "I said" lines (reproduced). In a novel alternating between two first-person tellers, where
+the model names one and leaves the other "The Narrator", that gives the second teller's chapters to
+the first. The fold now only picks a narrator who could be the chapter's "I"; otherwise the chapter
+keeps its own unnamed narrator. Test covers the whole flow. The ten exact replays (§46.4) score the
+same.

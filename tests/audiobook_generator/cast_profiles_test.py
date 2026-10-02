@@ -504,6 +504,19 @@ class TestChapterNarrators(unittest.TestCase):
         chat = ScriptedChat(json.dumps(dict(TestBookTone.TONE, pov_character="Bettie")))
         self.assertIsNone(chapter_narrators(cast, [untagged], self._book_tone("Bettie"), chat)[1]["narrator"])
 
+    def test_an_unnamed_i_is_not_folded_into_a_teller_its_narration_names(self):
+        # Review finding: chapters alternate between two first-person tellers; the model named one
+        # and left the other's "I" unnamed, and the fold handed the second teller's chapter to the first.
+        cast = self._anonymous_cast(["narrator 2"], (2,))
+        cast["chapters"]["h1"] = {"number": 1, "lines": {"1": "bettie", "2": "oliver", "3": "oliver"}}
+        hers = f"Oliver waited for me by the gate, as he always did.{M}" * 6 + _FIRST_PERSON
+        chapters = [_story(1, _FIRST_PERSON, {1: "bettie", 2: "oliver", 3: "oliver"}),
+                    _story(2, hers, {1: "bettie", 2: "narrator 2", 3: "narrator 2"})]
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2)], ["oliver", "narrator 2"])
+        self.assertEqual(dict(chapters[1].lines), {1: "bettie", 2: "narrator 2", 3: "narrator 2"})
+        self.assertEqual(cast["chapters"]["h2"]["lines"], {"1": "bettie", "2": "narrator 2", "3": "narrator 2"})
+
     def test_message_labels_and_framed_documents_do_not_name_the_narrator(self):
         oliver = _ANTHOLOGY_CHARACTERS["oliver"]
         texts = f"Oliver: on my way{M}" * 6 + f"I opened the letter.{M}" + f"Dear Oliver, come home.{M}" * 3 \
