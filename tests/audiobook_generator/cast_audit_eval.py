@@ -1,7 +1,12 @@
 """Offline evaluator: score a cast against a source-linked speaker reference.
 
 The reference holds the book's own text, so it stays outside the repository (default: the
-stack's data/diagnostics folder; override with --reference or CAST_AUDIT_REFERENCE)."""
+stack's data/diagnostics folder; override with --reference or CAST_AUDIT_REFERENCE), and so does a
+book's alias file (--aliases: {"the model's name for someone": "reference speaker id"}).
+Reported separately: wrong speakers, unresolved lines, identity splits and false merges (pairs of
+lines), the narrator's lines and voice, chapter narrators (when the reference lists them), and voice
+routes. An unnamed "The Narrator" is judged as whoever most of its lines belong to: one voice, one
+person."""
 
 from __future__ import annotations
 
@@ -15,6 +20,7 @@ from pathlib import Path
 REFERENCE = Path(os.environ.get("CAST_AUDIT_REFERENCE") or Path(__file__).resolve().parents[3] / "data"
                  / "diagnostics" / "apex3_2026-10-01" / "expected_speakers_source_linked.json")
 UNKNOWN = {"", "unknown", "null", "none", "unassigned", "unresolved"}
+ANONYMOUS_NARRATOR = "the narrator"  # cast_llm.Roster's name for a never-named "I"
 
 
 def _key(document, line):
@@ -99,6 +105,17 @@ def evaluate(reference, predictions, voice_routes=None, speaker_aliases=None):
         if gold_a == gold_b and pred_a != pred_b:
             identity_splits += 1
 
+    chapter_narrators = None
+    if reference.get("chapter_narrators") is not None:
+        told = {}
+        for row in predictions:
+            told.setdefault(int(row["document"]), _speaker(row.get("chapter_narrator"), speaker_aliases))
+        wrong_tellers = [{"document": int(document), "expected": teller, "actual": told.get(int(document))}
+                         for document, teller in sorted(reference["chapter_narrators"].items(), key=lambda i: int(i[0]))
+                         if int(document) in told and told[int(document)] != teller]
+        chapter_narrators = {"checked": sum(int(d) in told for d in reference["chapter_narrators"]),
+                             "wrong": wrong_tellers}
+
     review_counts = {}
     uncertain_reference_lines = []
     for key, row in expected.items():
@@ -140,6 +157,7 @@ def evaluate(reference, predictions, voice_routes=None, speaker_aliases=None):
             "voices": sorted(narrator_voices),
             "voice_consistent": narrator_voice_coverage == sum(row["speaker_id"] == narrator for row in expected.values()) and len(narrator_voices) == 1,
         },
+        "chapter_narrators": chapter_narrators,
         "wrong_voice_routes": {
             "checked_lines": route_coverage,
             "count": len(wrong_routes),
@@ -148,7 +166,17 @@ def evaluate(reference, predictions, voice_routes=None, speaker_aliases=None):
     }
 
 
-def _load_predictions(path, reference):
+def summary(result) -> str:
+    """One line per scored cast: each kind of error on its own."""
+    tellers = result.get("chapter_narrators")
+    return (f"wrong {result['misattributions']['count']} of {result['total_lines']}, "
+            f"unresolved {result['unresolved_lines']['count']}, "
+            f"split pairs {result['identity_splits']['pair_count']}, merged pairs {result['false_merges']['pair_count']}"
+            + (f", wrong chapter narrators {len(tellers['wrong'])} of {tellers['checked']}" if tellers else "")
+            + f", wrong voice routes {result['wrong_voice_routes']['count']}")
+
+
+def _load_predictions(path, reference, aliases=None):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(data, list):
         return data, None, None
@@ -176,6 +204,12 @@ def _load_predictions(path, reference):
                 previous = target_for_alias.get(normalized)
                 target_for_alias[normalized] = canonical if previous in (None, canonical) else ""
     speaker_aliases = {alias: canonical for alias, canonical in target_for_alias.items() if canonical}
+    given = {str(k).strip().casefold(): v for k, v in (aliases or {}).items()}
+    for key, character in characters.items():
+        tokens = [key, character.get("name"), *character.get("aliases", [])]
+        known = next((given[str(t).strip().casefold()] for t in tokens if t and str(t).strip().casefold() in given), None)
+        if known:
+            speaker_aliases[str(key).casefold()] = known
     narrator_voice = data.get("narrator_voice")
     narrator_id = reference["narrator_speaker_id"]
     if narrator_voice:
@@ -201,7 +235,15 @@ def _load_predictions(path, reference):
                 voice = chapter_narrator_voice
             else:
                 voice = (character or {}).get("voice") or fallback_voice
-            rows.append({"document": document, "line": line, "speaker": speaker, "voice": voice})
+            rows.append({"document": document, "line": line, "speaker": speaker, "voice": voice,
+                         "chapter_narrator": declared})
+    expected = _reference_lines(reference)
+    for key, character in characters.items():
+        if str(character.get("name", "")).strip().casefold() == ANONYMOUS_NARRATOR:
+            theirs = [expected[k]["speaker_id"] for k in (_key(r["document"], r["line"]) for r in rows
+                                                          if r["speaker"] == key) if k in expected]
+            if theirs:
+                speaker_aliases[str(key).casefold()] = max(set(theirs), key=theirs.count)
     return rows, canonical_routes, speaker_aliases
 
 
@@ -210,13 +252,17 @@ def main():
     parser.add_argument("predictions", help="JSON line predictions or a saved cast JSON")
     parser.add_argument("--reference", default=REFERENCE, type=Path)
     parser.add_argument("--voice-routes", type=Path, help="JSON mapping canonical speaker IDs to this run's selected voices")
+    parser.add_argument("--aliases", type=Path, help="JSON mapping the model's names for people to reference speaker IDs")
+    parser.add_argument("--summary", action="store_true", help="Print one line instead of the full report")
     args = parser.parse_args()
     reference = json.loads(args.reference.read_text(encoding="utf-8"))
-    rows, embedded_routes, speaker_aliases = _load_predictions(args.predictions, reference)
+    aliases = json.loads(args.aliases.read_text(encoding="utf-8")) if args.aliases else None
+    rows, embedded_routes, speaker_aliases = _load_predictions(args.predictions, reference, aliases)
     routes = embedded_routes
     if args.voice_routes:
         routes = json.loads(args.voice_routes.read_text(encoding="utf-8"))
-    print(json.dumps(evaluate(reference, rows, routes, speaker_aliases), ensure_ascii=False, indent=2))
+    result = evaluate(reference, rows, routes, speaker_aliases)
+    print(summary(result) if args.summary else json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

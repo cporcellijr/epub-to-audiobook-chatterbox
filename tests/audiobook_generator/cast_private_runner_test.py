@@ -12,6 +12,9 @@ RUNNER = (Path(__file__).resolve().parents[2] / "docs" / "chatterbox-edition" /
 spec = importlib.util.spec_from_file_location("private_cast_evaluator", RUNNER)
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
+spec = importlib.util.spec_from_file_location("private_cast_replay", RUNNER.with_name("replay_cast.py"))
+replay = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replay)
 
 
 class ScriptedChat:
@@ -61,6 +64,62 @@ class TestPrivateRunner(unittest.TestCase):
             self.assertEqual((result["status"], calls), ("done", 1))
             self.assertEqual(observed["chapter_selection"], [2, 4])
             self.assertFalse(observed["auto_pick_voices"])
+
+    def test_a_manifest_says_which_code_model_input_and_settings_made_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+
+            def analyze(settings, chat):
+                chat([{"role": "user", "content": "x"}])
+                return {"status": "done"}
+
+            runner.run(args, analyze=analyze, chat_factory=lambda *_: ScriptedChat("{}"), api_key=lambda: "",
+                       model_info=lambda base_url, model: {"digest": "sha256:abc"})
+            manifest = json.loads(args.cast_file.with_suffix(".manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(manifest["code"]["tree_sha256"]), 64)
+            self.assertEqual(manifest["model"], {"name": "local-test-model", "base_url": "http://offline.invalid/v1",
+                                                 "digest": "sha256:abc"})
+            self.assertEqual(manifest["input"]["file"], "book.epub")
+            self.assertEqual(manifest["settings"]["chapter_selection"], [2, 4])
+            self.assertEqual((manifest["chat_calls"], manifest["status"]), (1, "done"))
+
+            def fails(settings, chat):
+                raise RuntimeError("model went away")
+
+            (Path(tmp) / "again").mkdir()
+            args = self._args(Path(tmp) / "again")
+            with self.assertRaises(RuntimeError):
+                runner.run(args, analyze=fails, chat_factory=lambda *_: ScriptedChat("{}"), api_key=lambda: "",
+                           model_info=lambda *_: {})
+            manifest = json.loads(args.cast_file.with_suffix(".manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "failed")
+
+    def test_a_replay_answers_each_request_with_the_saved_reply_and_counts_new_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            saved = root / "saved"
+            saved.mkdir()
+            asked = [{"role": "user", "content": "who speaks line 1?"}]
+            (saved / "requests.jsonl").write_text(json.dumps({"call": 1, "messages": asked, "reply": "Wren"}) + "\n",
+                                                  encoding="utf-8")
+            (saved / "cast.json").write_text(json.dumps({"chapter_selection": [3]}), encoding="utf-8")
+            (root / "book.epub").write_bytes(b"offline fixture")
+            replies = []
+
+            def analyze(settings, chat):
+                replies.append(chat(asked))
+                try:
+                    chat([{"role": "user", "content": "a question the saved run never asked"}])
+                except RuntimeError:
+                    pass
+                return {"status": "done"}
+
+            result = replay.replay(root / "book.epub", saved, root / "out", analyze=analyze)
+            self.assertEqual(replies, ["Wren"])
+            self.assertEqual((result["status"], result["unanswered"]), ("done", 1))
+            manifest = json.loads((root / "out" / "cast.manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual((manifest["replayed_from"], manifest["unanswered"]), (str(saved), 1))
+            self.assertEqual(manifest["settings"]["chapter_selection"], [3])
 
     def test_refuses_existing_outputs_before_constructing_the_chat_client(self):
         with tempfile.TemporaryDirectory() as tmp:

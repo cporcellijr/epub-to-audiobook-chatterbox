@@ -3070,3 +3070,23 @@ the model names one and leaves the other "The Narrator", that gives the second t
 the first. The fold now only picks a narrator who could be the chapter's "I"; otherwise the chapter
 keeps its own unnamed narrator. Test covers the whole flow. The ten exact replays (§46.4) score the
 same.
+
+### 48.2 A reproducible benchmark
+
+The review asked for runs that say what made them and for the replay tooling in one place.
+
+- `evaluate_cast.py` writes `cast.manifest.json` beside each run: commit (read from `.git`, since the
+  container has no git) plus a hash of every app source file, model name and Ollama digest, the
+  input's hash, settings, the answer key's hash (`--reference`), calls, time and status (also when the
+  run fails).
+- `replay_cast.py` (moved in from the session scratchpad) replays a saved run through the runner, so
+  replays get manifests too; it counts the requests the saved run never made and stops when the code
+  asks different attribution questions than the code that made the run.
+- `cast_audit_eval.py` takes a book's alias file (kept outside git with its answer key; the three
+  test books have one now), judges an unnamed "The Narrator" as whoever most of its lines belong to,
+  checks chapter narrators where the key lists them, and prints a one-line `--summary`. On the ten
+  replayed casts it matches the session's scratch scorer, with unresolved lines now counted apart
+  (Apex Prey 3: 7 wrong + 1 unresolved, previously 8 wrong), and it flags the window-16 runs before
+  §46 with 3 and 2 of 4 chapter narrators wrong, none after.
+- The README of `experiments/multivoice` says how to use them: replay for code that asks nothing new,
+  three or more live runs per variant for prompt changes.

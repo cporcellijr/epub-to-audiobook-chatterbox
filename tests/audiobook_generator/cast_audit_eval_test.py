@@ -100,6 +100,32 @@ class TestEvaluator(unittest.TestCase):
         mara_routes = {(row["document"], int(row["line"])): row["voice"] for row in rows if row["document"] == 2}
         self.assertEqual(mara_routes, {(2, 2): "Gianna.wav", (2, 3): "Lucy.wav"})
 
+    def _scored(self, prediction, reference, aliases=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cast.json"
+            path.write_text(json.dumps(prediction), encoding="utf-8")
+            rows, routes, speaker_aliases = evaluator._load_predictions(path, reference, aliases)
+        return evaluator.evaluate(reference, rows, routes, speaker_aliases)
+
+    def test_alias_file_unnamed_narrator_and_chapter_narrators(self):
+        # Two invented stories: Wren tells chapter 1, an unnamed "I" (really Dex) tells chapter 2.
+        reference = {"narrator_speaker_id": None, "chapter_narrators": {"1": "wren", "2": "dex"}, "lines": [
+            _row(1, 1, "rob"), _row(1, 2, "wren"), _row(2, 1, "dex"), _row(2, 2, "dex"), _row(2, 3, "mara")]}
+        prediction = {"characters": {"wren": {"name": "Wren"}, "robbie": {"name": "Robbie"},
+                                     "narrator 2": {"name": "The Narrator"}, "mara": {"name": "Mara"}},
+                      "chapters": {"a": {"number": 1, "narrator": "wren", "lines": {"1": "robbie", "2": "wren"}},
+                                   "b": {"number": 2, "narrator": "narrator 2",
+                                         "lines": {"1": "narrator 2", "2": "narrator 2", "3": "narrator 2"}}}}
+        result = self._scored(prediction, reference, {"Robbie": "rob"})
+        self.assertEqual(result["misattributions"]["lines"],  # the unnamed "I" is Dex; Mara's line is not his
+                         [{"document": 2, "line": 3, "expected": "mara", "actual": "dex", "confidence": "high"}])
+        self.assertEqual(result["chapter_narrators"], {"checked": 2, "wrong": []})
+        prediction["chapters"]["b"]["narrator"] = "wren"
+        self.assertEqual(self._scored(prediction, reference, {"Robbie": "rob"})["chapter_narrators"]["wrong"],
+                         [{"document": 2, "expected": "dex", "actual": "wren"}])
+        self.assertEqual(evaluator.summary(result), "wrong 1 of 5, unresolved 0, split pairs 0, merged pairs 2, "
+                                                    "wrong chapter narrators 0 of 2, wrong voice routes 0")
+
 
 if __name__ == "__main__":
     unittest.main()

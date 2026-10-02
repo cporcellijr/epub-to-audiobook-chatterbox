@@ -30,3 +30,25 @@ docker run --rm --network tts -e PYTHONPATH=/app_src \
 `-e LLM_UNLOAD_CHATTERBOX=off` keeps Chatterbox loaded during the pass; `--no-sample` skips the
 narration. Output: `validate_out/attribution.json` (every prediction), `validate_out/sample_book/*.mp3`
 (the sample), `validate_out/sample_cast.json` (the cast it used).
+
+## Cast benchmark (private books)
+
+Behind `WORKLOG.md` §41-48. Real books are scored against source-linked answer keys that hold the
+books' text, so the keys, each book's alias file and every run stay outside the repository, in the
+stack's `data/diagnostics/<book>/` folders. Three tools:
+
+- `evaluate_cast.py`: one live run of the production cast analysis on chosen chapters. It saves the
+  cast, every request and reply (`requests.jsonl`) and `cast.manifest.json`: the commit and a hash of
+  the app's code, the model and its digest, the input's hash, the settings, the answer key's hash
+  (`--reference`), the call count and how long it took.
+- `replay_cast.py --saved-run <run> --out <new folder>`: the current code on a saved run, every
+  request answered with the reply the model gave to that same request. Only the code differs, so one
+  replay is enough for a change that asks the model nothing new (narrator choice, reconciliation).
+  First check that the code the run was made with reproduces its scores; a change to prompts or
+  attribution windows asks new questions and the replay stops at the first one.
+- `tests/audiobook_generator/cast_audit_eval.py <cast.json> --reference <key> --aliases <book's
+  aliases.json> --summary`: wrong speakers, unresolved lines, identity splits, false merges, wrong
+  chapter narrators and wrong voice routes, each on its own.
+
+Prompt changes move the local model's errors around: single live runs of the same chapters differ
+by about 15 lines in 900. Judge them over at least three live runs per variant, on every book.
