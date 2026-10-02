@@ -3341,3 +3341,23 @@ Still unknown: whether the reserve stays flat through a whole book now. The next
 - If the reserve still creeps up, the next step is a model reload between chapters.
 
 - Tests: 28 Breeze server tests pass.
+
+### 51.5 The same book again, with expandable segments
+
+The owner re-ran Glass Children into a second folder ("Glass Children-1"). Same cast and text; the
+seeds were random. Both runs, side by side:
+
+| | First run (default allocator) | Re-run (`expandable_segments:True`) |
+|---|---|---|
+| Book time | 46.5 min (3.6x) | 42.1 min |
+| Generating | 42.3 min | 38.2 min |
+| Full chunks: median / slowest | 3.85x / 1.45x | 4.15x / 2.00x |
+| Units retried | 36 | 20 |
+| Kept after failing every attempt | 3 | 2 |
+| Highest chunk peak | not logged | 9.86 GB |
+| Reserved | not logged | 7.6 GB at load, 10.24 GB after 5 min, then flat (10.27 GB at the end) |
+| After the book: card / shared | 11.68 GB / 2.27 GB | 10.77 GB / under 0.2 GB |
+
+The spill is gone, and the reserve stayed flat over the 42 minutes, 0.4 GB above the book's biggest
+peak. The speed gain is partly luck (the re-run needed fewer retries); one run each can't separate
+the two. A long book is the next check that memory stays flat over hours.
