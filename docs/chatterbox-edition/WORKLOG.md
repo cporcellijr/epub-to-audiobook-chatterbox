@@ -3634,3 +3634,25 @@ against 25 s).
   - **The fault:** chapter 2's first batch, the 32 longest lines, overflowed the card. It was split
     16 + 16 after 57 s, and the halves peaked at 8.2 and 8.8 GB.
 
+## 54. Breeze reads every line plain: no directed lines (2026-10-05)
+
+The owner doesn't care for directed lines and asked to drop them if that speeds things up.
+
+On Breeze, adaptive delivery only ever directed soft speech: whispers, murmurs, lines said under the
+breath (§47's listening ruled out loud directions). Each directed line ran in a small batch of its
+own through the guided (CFG) path. That path makes two backbone passes per frame, and its depth loop
+has no cache and no graph (§53.7). In the two books timed in §53.1, directed lines took 4% of batch
+time (Showering With Jennifer, 44 lines) and 8% (Stranded, 41 lines). With plain batches now about
+twice as fast, that share roughly doubles. The single directed line in A Tale of Two Nannies chapter 1
+took 12 s for 2.2 s of audio.
+
+- **`build_config`:** a Breeze book always runs with adaptive delivery off, books queued earlier
+  included.
+- **Queue:** settings store it off for Breeze.
+- **UI:** the Adaptive delivery checkbox shows only for Chatterbox.
+- **Unchanged:** units and voices. On Breeze, adaptive and plain units are split the same way; adaptive
+  only added the mood. Chatterbox keeps adaptive delivery. Breeze's instruction support stays for voice
+  design.
+- **Tests:** three Breeze UI tests now expect plain lines, including a book queued with delivery on.
+  The app suite passes, 959 tests with 1 skipped.
+- **Deploy:** waits for an idle queue, since restarting the app mid-book loses the chapter in progress.

@@ -752,7 +752,9 @@ def build_config(input_file, output_dir: str, voice: str, speed: float, chapter_
         config.model_name = "breeze"
         config.openai_base_url = None
         config.paced_unit_mode = "sentence"
-        config.adaptive_delivery = bool(adaptive_delivery)
+        # No directed (whispered) lines on Breeze, for books queued earlier too: the owner doesn't
+        # want them, and each ran as a small guided batch, 4-8% of a book's batch time (WORKLOG §54).
+        config.adaptive_delivery = False
         config.delivery_exaggeration = config.delivery_cfg_weight = config.delivery_temperature = None
         config.tone_match = bool(tone_match)
     else:
@@ -944,7 +946,7 @@ def queue_settings(library_book, input_file, chapter_table, output_dir: str, voi
         "log_level": log_level, "paced_unit_mode": paced_unit_mode or "sentence",
         "engine": engine,
         "voice_mode": voice_mode, "dialogue_voice": dialogue_voice or None, "cast_file": queued_cast_file,
-        "adaptive_delivery": bool(adaptive_delivery) and engine != "kokoro",
+        "adaptive_delivery": bool(adaptive_delivery) and engine == "chatterbox",
         "delivery_exaggeration": delivery_exaggeration if engine == "chatterbox" else None,
         "delivery_cfg_weight": delivery_cfg_weight if engine == "chatterbox" else None,
         "delivery_temperature": delivery_temperature if engine == "chatterbox" else None,
@@ -2082,8 +2084,8 @@ def engine_changed(engine: str) -> tuple:
     """Switching the Make tab's engine swaps the Voice, Dialogue voice and cast-editor voice
     dropdowns to that engine's own choices and default (Chatterbox's file list, or Kokoro's
     English voices from its live API; Breeze clones the same voice files as Chatterbox), and shows
-    the adaptive delivery checkbox for Chatterbox and Breeze (Breeze speaks the moods as voice
-    directions) but its baseline line only for Chatterbox: Kokoro has no delivery at all."""
+    the adaptive delivery checkbox and its baseline line only for Chatterbox: Kokoro has no
+    delivery at all, and Breeze reads every line plain (WORKLOG §54)."""
     if engine == "kokoro":
         choices, default = kokoro_voices_and_default()
     else:
@@ -2091,7 +2093,7 @@ def engine_changed(engine: str) -> tuple:
         default = default_openai_voice(choices)
     is_chatterbox = engine not in ("kokoro", "breeze")
     return (gr.update(choices=choices, value=default), _dialogue_voice_update(choices, default),
-            gr.update(choices=choices, value=None), gr.update(visible=engine != "kokoro"),
+            gr.update(choices=choices, value=None), gr.update(visible=is_chatterbox),
             gr.update(visible=is_chatterbox))
 
 
@@ -2363,10 +2365,10 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                                                   "found: the narrator's voice unless you pick another.")
             with gr.Row(equal_height=True):
                 adaptive_delivery = gr.Checkbox(
-                    True, label="Adaptive delivery", visible=initial_engine != "kokoro",
+                    True, label="Adaptive delivery", visible=initial_engine == "chatterbox",
                     info="Dialogue tagged whispered/shouted (and, in Cast mode, the LLM's own read) is spoken "
                          "softer or more excited instead of one flat delivery: Chatterbox shifts its settings "
-                         "around this book's baseline, Breeze is given a spoken direction for the line.")
+                         "around this book's baseline.")
                 delivery_baseline_info = gr.Markdown(
                     delivery_baseline_text(saved["exaggeration"], saved["cfg_weight"], saved["temperature"]),
                     visible=initial_engine == "chatterbox")
