@@ -3499,3 +3499,138 @@ memory freed)`, and the cast ran.
 The next book (Showering With Jennifer) loaded the model at 15:18 in 17.5 s. Its full chunks ran at
 about 4-6x real time. The reserve stayed at 9.0-10.0 GB, with peaks up to 9.8 GB, and there were no
 allocator faults through 16:12.
+
+## 53. Faster Breeze: the depth decoder as a CUDA graph, quicker speech checks (2026-10-05)
+
+### 53.1 Where a chapter's time went
+
+Two books after §52 (Showering With Jennifer and three chapters of Stranded): 18 chapters, 136 min.
+- **Time:** generating 91%, gaps between batches 4%, assembling and saving chapters 5%. Retry rounds
+  were about 6%, counted within those.
+- **Whole chapters:** 3.0-4.3x real time, with no downward trend over the evening. Within each chapter
+  the speed falls from about 5x to 2.3x and then to 0.4-1.5x for the retry batches, because units go
+  longest first (§50). That fall is what looked like a slowdown.
+- **Checks:** 0.51-0.62 s per take in every chapter. Generation waited on them 0-21 s per chapter.
+- **While generating:** the GPU was 17-40% busy at 45-65 W of 200 W, and the server sat at 100% of
+  one CPU core. Generation was limited by launch and host overhead, not by GPU compute.
+
+### 53.2 The depth decoder was three quarters of it
+
+A Sonnet subagent read the pinned upstream loop, and the key lines were checked by hand. Every frame
+of plain (no-CFG) generation runs a whole Hugging Face `generate()` for the depth decoder
+(`generation_breeze.py` ~977): a 2-token prefill (the backbone's hidden state and codebook 0), then
+14 one-token steps through 12 layers. Each call builds a fresh DynamicCache and syncs with the host
+once per step. Timed around that call with the stock code, it was 17.0 of a 32-medium chunk's
+22.7 s and 8.8 of a 32-short chunk's 12.1 s: 75%, about 195 ms per frame.
+
+### 53.3 `breeze/fast_depth.py`
+
+- **Same math, fixed shapes:** the same modules run on fixed buffers: a 16-slot KV cache, and RoPE
+  and causal masks precomputed. The sampling steps are the same: reserved codec ids suppressed,
+  temperature 0.9, top-k 50.
+- **Graphs:** the 15 steps are captured once per row count (1, 2, 4, 8, 12, 16, 24, 32, up to
+  `BREEZE_MAX_BATCH`), largest first, sharing one memory pool, when the model loads (4.2 s for ten).
+  A frame copies its rows in, replays one graph and copies the codes out. Inside the graph, sampling
+  is the exponential race (argmax of p / Exp(1), an exact categorical draw), so nothing needs the
+  host.
+- **Exact mode:** samples with `multinomial` as `generate()` does. Run beside the stock decoder on
+  every frame of two batches with the CUDA RNG rewound (`experiments/breeze-speed/check_depth.py`),
+  97.8% of 2,026 frames and 99.6% of 34,442 codes came out identical. The rest are bf16 rounding from
+  the fixed-size attention flipping one draw, and the rest of that frame after it. An offset or
+  position error would break nearly every code.
+- **Switch:** `BREEZE_FAST_DEPTH=0` keeps the stock decoder, and a failed capture logs why and does
+  the same. Directed (CFG) lines still use upstream's own loop.
+- **A bug found on the way:** the first version created the static cache inside the capture function
+  and didn't keep it. After capture its memory went to new tensors, the backbone's `input_ids` among
+  them, and every replay wrote keys and values over them. That showed up as garbage codes, device
+  asserts and segfaults that seemed to depend on bucket size. Keeping the cache with its graph fixed
+  all three, and `torch.cuda.empty_cache()` between replays is then safe (30 of 30 replays clean). The
+  server calls it on its out-of-memory path.
+
+### 53.4 Results
+
+Fixed workload of real Stranded sentences, four voices, fixed seed, in a throwaway container
+(`experiments/breeze-speed/`, workload kept out of git):
+
+| Chunk | Stock | Fast | Peak memory (stock → fast) |
+|---|---|---|---|
+| 32 short | 11.8 s (4.67x) | 5.0 s (10.8x) | 8.64 → 8.77 GB |
+| 32 medium | 23.7 s (5.67x) | 10.4 s (12.7x) | 8.72 → 8.85 GB |
+| 32 long | 112.8 s (7.32x) | 50.5 s (16.0x) | 10.27 → 10.40 GB |
+| 64 medium | 28.9 s (8.83x) | 12.6 s (20.2x) | 10.08 → 10.21 GB |
+
+Per frame at 32 rows: 255-275 ms down to 100-115 ms.
+
+Whisper on every saved take, judged as the app judges (pass at 0.70):
+
+| | Stock | Fast |
+|---|---|---|
+| 32 short | 32/32 | 32/32 |
+| 64 short | 63/64 | 63/64 |
+| 32 medium | 32/32 | 32/32 |
+| 64 medium | 64/64 | 64/64 |
+| 32 long | 30/32 | 30/32 |
+
+Mean match was equal or higher with the fast decoder (0.992 → 0.999 on 32 short). The deployed module
+timed the same as the prototype, run back to back: 13.0 against 13.0 s and 51.8 against 51.3 s.
+
+### 53.5 Measured and not taken
+
+- **SDPA attention instead of eager:** with the graph, frames were no faster (110 against 100 ms on 32
+  medium), with about 100 MB less memory. Kept eager.
+- **96 short lines in one chunk:** the stock decoder hit `device not ready` (§52). 64 fits at
+  10.0-10.2 GB.
+- **Upstream's own CUDA-graph fast path:** it handles one request at a time (it asserts a batch of 1)
+  and pairs rows for CFG, so it doesn't fit batched books.
+- **Whisper competing for the CPU:** the same takes generated while the speech check ran (12 threads)
+  took 25% longer for 32 short, 17% for 32 medium and 10% for 64 medium. The decode loop is bound to
+  one core.
+
+### 53.6 Speech check: 6 workers x 3 threads, greedy for batch checks
+
+The same 96 fast takes, time per 32:
+
+| Setting | Short | Medium | Long | Verdicts |
+|---|---|---|---|---|
+| 3 x 4, beam 5 (before) | 13.6 s | 16.5 s | 38.8 s | |
+| 3 x 4, beam 1 | 13.5 s | 15.6 s | 29.4 s | 96/96 the same |
+| 6 x 3, beam 1 (now) | 11.5 s | 13.4 s | 25.1 s | 96/96 the same |
+
+`transcribe()` takes a `beam_size`. Breeze's batch checks pass `speech_check.BATCH_BEAM` (1). A voice
+clip's words, which Breeze clones from, and the voice-design check keep beam 5.
+
+With generation 2.2-2.4x faster, the checks now set the pace of short and medium batches: 32 checks
+take 11.5-13.4 s against 5-10 s of generating. Long batches stay bound by generation (about 50 s
+against 25 s).
+
+### 53.7 Next
+
+- **Faster checks first:** bigger batches for short and medium lines (64 medium runs at 20x) only pay
+  once the checks keep up. Two candidates: Whisper on the GPU inside the Breeze process, or a quick
+  first pass with a smaller model, with Whisper small only for the takes it doubts.
+- **The backbone:** it is now the main GPU cost, about 65-100 ms per frame at 32 rows. A static cache
+  and a graph there are the next generation lever.
+- **Directed (CFG) lines:** they still run upstream's loop, two depth forwards per step and no cache.
+
+### 53.8 Tests and deploy
+
+- **Tests:** 38 Breeze server tests pass (5 new: the switch, the batch size, a failed capture). The
+  app suite passes, 959 tests with 1 skipped (one new test for the beam setting; the fake checkers now
+  take `beam_size`).
+- **Deploy:** `breeze` and `epub-to-audiobook` were rebuilt with the queue paused. The containers'
+  `server.py`, `fast_depth.py`, `speech_check.py` and `openai_tts_provider.py` match the working tree.
+- **Live (A Tale of Two Nannies, cast mode, from 19:16):**
+
+| Chapter | Audio | Time | Speed |
+|---|---|---|---|
+| 1 | 27.4 min | 4.8 min | 5.68x |
+| 2 | 22.4 min | 5.4 min | 4.14x (one allocator fault) |
+| 3 | 23.1 min | 4.2 min | 5.45x |
+| All three | 72.9 min | 14.5 min | 5.04x |
+
+  Before this change, whole chapters ran at 3.0-4.3x (§53.1). The graphs loaded in 3.7 s.
+  - **Checks:** 0.38-0.43 s per take (it was 0.51-0.62 s). Generation now waits on them 47-62 s per
+    chapter, about a fifth of the time, as §53.6 predicted.
+  - **The fault:** chapter 2's first batch, the 32 longest lines, overflowed the card. It was split
+    16 + 16 after 57 s, and the halves peaked at 8.2 and 8.8 GB.
+

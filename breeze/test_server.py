@@ -404,6 +404,55 @@ def test_reference_cache_encodes_a_clip_once_until_it_changes(tmp_path):
     assert encoded == [str(clip)] * 3
 
 
+class FakeDepthModel:
+    class depth_decoder:
+        pass
+
+    def __init__(self):
+        self.depth_decoder = FakeDepthModel.depth_decoder()
+        self.depth_decoder.generate = self.stock = lambda **kw: "stock"
+
+
+def fake_fast_depth(monkeypatch, fail=False):
+    import sys
+    import types
+    calls = []
+
+    def install(model, max_rows):
+        calls.append(max_rows)
+        model.depth_decoder.generate = lambda **kw: "fast"  # a capture that breaks halfway
+        if fail:
+            raise RuntimeError("capture failed")
+        return types.SimpleNamespace(buckets=(1, max_rows))
+    monkeypatch.setitem(sys.modules, "fast_depth", types.SimpleNamespace(install=install))
+    return calls
+
+
+def test_fast_depth_is_installed_for_the_batch_size(monkeypatch):
+    calls = fake_fast_depth(monkeypatch)
+    monkeypatch.setenv("BREEZE_MAX_BATCH", "48")
+    model = FakeDepthModel()
+    server.BreezeSynthesizer._fast_depth(model)
+    assert calls == [48] and model.depth_decoder.generate() == "fast"
+
+
+@pytest.mark.parametrize("switch", ["0", "off", "False"])
+def test_fast_depth_switched_off(monkeypatch, switch):
+    calls = fake_fast_depth(monkeypatch)
+    monkeypatch.setenv("BREEZE_FAST_DEPTH", switch)
+    model = FakeDepthModel()
+    server.BreezeSynthesizer._fast_depth(model)
+    assert calls == [] and model.depth_decoder.generate is model.stock
+
+
+def test_a_failed_capture_keeps_the_stock_depth_decoder(monkeypatch):
+    calls = fake_fast_depth(monkeypatch, fail=True)
+    monkeypatch.delenv("BREEZE_MAX_BATCH", raising=False)
+    model = FakeDepthModel()
+    server.BreezeSynthesizer._fast_depth(model)
+    assert calls == [32] and model.depth_decoder.generate is model.stock
+
+
 def test_the_synthesizer_routes_reference_encoding_through_its_cache(monkeypatch, tmp_path):
     import sys
     import types

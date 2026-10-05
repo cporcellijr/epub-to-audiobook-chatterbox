@@ -31,8 +31,13 @@ _PAD_MS = 200  # silence around a take: Whisper hears a clipped first or last wo
 # Takes transcribe() can work on at once, each on _THREADS CPU threads. On the 24-thread host, 3 x 4
 # heard 32 real Breeze takes in 17.3 s against 23.0 s for 1 x 8, with the same transcripts
 # (2026-10-02, WORKLOG §50); Breeze's checks hear a batch this way, other callers one take at a time.
-WORKERS = 3
-_THREADS = 4
+# 6 x 3 with BATCH_BEAM heard 32 short / medium / long takes in 11.5 / 13.4 / 25.1 s against 13.6 /
+# 16.5 / 38.8 s for 3 x 4 with beam 5, with the same verdict on all 96 (2026-10-05, WORKLOG §53).
+WORKERS = 6
+_THREADS = 3
+# Greedy decoding for Breeze's batch checks, which only need pass or fail; a voice clip's words, which
+# Breeze then clones from, keep the default beam search.
+BATCH_BEAM = 1
 
 
 @dataclass
@@ -45,7 +50,7 @@ class SpeechChecker:
     def __init__(self, model):
         self._model = model
 
-    def transcribe(self, audio: AudioSegment, words: bool = True) -> Heard:
+    def transcribe(self, audio: AudioSegment, words: bool = True, beam_size: int = 5) -> Heard:
         """What the take says. Word times cost Whisper an extra alignment pass and only the lead-in
         cut needs them; words=False leaves Heard.words empty."""
         import numpy as np
@@ -54,7 +59,7 @@ class SpeechChecker:
         pcm = pad + audio.set_channels(1).set_frame_rate(16000).set_sample_width(2) + pad
         samples = np.frombuffer(pcm.raw_data, dtype=np.int16).astype(np.float32) / 32768
         segments, _ = self._model.transcribe(
-            samples, language="en", beam_size=5, temperature=0, condition_on_previous_text=False,
+            samples, language="en", beam_size=beam_size, temperature=0, condition_on_previous_text=False,
             vad_filter=False, word_timestamps=words)
         segments = list(segments)
         times = [(w.word.strip(), round(w.start * 1000) - _PAD_MS, round(w.end * 1000) - _PAD_MS)

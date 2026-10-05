@@ -1221,7 +1221,8 @@ class OpenAITTSProvider(BaseTTSProvider):
                        if index in silent and silent[index] < _BAD_CLIP_SILENCE_MS]
             with ThreadPoolExecutor(speech_check.WORKERS, thread_name_prefix="breeze-check-hear") as hearing:
                 heard = dict(zip([index for index, _ in to_hear], hearing.map(
-                    lambda pair: self._hear(checker, pair[1], ids[pair[0]], words=False), to_hear)))
+                    lambda pair: self._hear(checker, pair[1], ids[pair[0]], words=False,
+                                            beam_size=speech_check.BATCH_BEAM), to_hear)))
         outcomes = []
         for index, take in zip(batch, takes):
             unit, chunk_id = units[index][1], ids[index]

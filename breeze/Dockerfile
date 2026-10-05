@@ -14,6 +14,6 @@ WORKDIR /opt/breeze-infer
 RUN python -m pip install -r requirements.txt huggingface_hub hf_transfer
 
 # Last so edits to the server don't rebuild the layers above.
-COPY server.py test_server.py ./
+COPY server.py fast_depth.py test_server.py ./
 EXPOSE 8005
 CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8005"]

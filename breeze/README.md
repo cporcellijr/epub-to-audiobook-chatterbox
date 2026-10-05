@@ -16,6 +16,27 @@ one GPU with Chatterbox and the LLM; the app unloads it with `POST /api/unload`.
   an instruction), sorted by length and run in chunks of `BREEZE_MAX_BATCH`. A chunk that runs out of
   GPU memory is split and retried; an item that still fails comes back with `error` set.
 
+## Fast depth decoder
+
+Each audio frame takes one backbone step and then 15 depth-decoder steps (codebooks 1-15 through 12
+small layers). The stock code ran those 15 as a whole Hugging Face `generate()` per frame: per-call
+setup, a fresh cache and a host sync per step. That was 75% of a batch's time, with the GPU 17-40%
+busy and the server pinned to one CPU core. `fast_depth.py` runs the same math on fixed buffers and
+captures it as a CUDA graph per row count (1, 2, 4, 8, 12, 16, 24, 32 and up to `BREEZE_MAX_BATCH`),
+taken when the model loads (about 4 s), so a frame's depth decoding is one graph replay.
+
+On the RTX 4070 (fixed workload, same takes; WORKLOG §53):
+
+| Chunk | Stock | Fast |
+| --- | --- | --- |
+| 32 short lines | 11.8 s (4.7x) | 5.0 s (10.8x) |
+| 32 medium lines | 23.7 s (5.7x) | 10.4 s (12.7x) |
+| 32 long lines | 112.8 s (7.3x) | 50.5 s (16.0x) |
+
+Whisper passed the same takes at the same rate either way, and the exact mode of the same code gave
+the stock decoder's tokens for 99.6% of codes. Directed (CFG) lines still use the stock loop.
+`BREEZE_FAST_DEPTH=0` turns it off; a capture that fails logs why and keeps the stock decoder.
+
 ## Allocator faults (WSL)
 
 Under WSL, with expandable segments on, a full card doesn't raise PyTorch's out-of-memory error. The
@@ -56,13 +77,14 @@ median 1.2x for five hours; healthy books never hit the threshold (WORKLOG §48)
 | `BREEZE_MAX_BATCH` | `32` |
 | `BREEZE_REPO_ID` | `BreezeBlue/Breeze-TTS-2` |
 | `BREEZE_SLOW_RTF` | `1.5` (0 turns the slowdown guard off) |
+| `BREEZE_FAST_DEPTH` | on (`0` keeps the stock depth decoder) |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True`, set by compose from `BREEZE_CUDA_ALLOC_CONF` (empty turns it off) |
 
 Every `chunk of N` log line ends with the chunk's peak GPU memory and what PyTorch keeps reserved
 afterwards. A reserve creeping far above the peaks over a long book means fragmentation; under WSL
 it spills into shared system memory (Windows counter `\GPU Process Memory(*)\Shared Usage`).
 
-## Speed (RTX 4070, eager attention, voice cloning)
+## Speed (RTX 4070, eager attention, voice cloning, before the fast depth decoder)
 
 | Batch | Real time |
 | --- | --- |

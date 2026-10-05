@@ -207,17 +207,17 @@ class TestBreezeBatchOrder(unittest.TestCase):
         self.assertTrue(any(item["instruction"] for items, _ in run.server.calls for item in items))
         self.assertEqual(_takes(run), [1000 + n for n in range(1, len(_takes(run)) + 1)])
 
-    def test_the_breeze_checker_is_asked_for_no_word_times(self):
+    def test_the_breeze_checker_is_asked_for_no_word_times_and_a_greedy_transcript(self):
         asked = []
 
         class Checker:
-            def transcribe(self, audio, words=True):
-                asked.append(words)
+            def transcribe(self, audio, words=True, beam_size=5):
+                asked.append((words, beam_size))
                 return speech_check.Heard("words of Dark.wav", [])
         run = _Run(self, _text(3), checker=Checker())
         self.assertIsNone(run.error)
         self.assertTrue(asked)
-        self.assertEqual(set(asked), {False})
+        self.assertEqual(set(asked), {(False, speech_check.BATCH_BEAM)})
 
     def test_the_log_marks_a_directed_batch(self):
         with self.assertLogs(PROVIDER, level="INFO") as logs:
@@ -307,7 +307,7 @@ class TestBreezeAdaptiveDelivery(unittest.TestCase):
 
     def test_the_mood_is_logged_with_a_rejected_take(self):
         class Checker:
-            def transcribe(self, audio, words=True):
+            def transcribe(self, audio, words=True, beam_size=5):
                 return speech_check.Heard("completely different words", [])
         with self.assertLogs(PROVIDER, level="INFO") as logs:
             run = _Run(self, MOODY, FakeBreeze(), checker=Checker(), adaptive_delivery=True)
@@ -361,7 +361,7 @@ class TestBreezeRetries(unittest.TestCase):
             return _tone(1002 + (round - 1) * 100) if _chunk(item) == 2 else None
 
         class Checker:
-            def transcribe(self, audio, words=True):
+            def transcribe(self, audio, words=True, beam_size=5):
                 if len(audio) in heard_by_length:
                     return speech_check.Heard(heard_by_length[len(audio)], [])
                 return speech_check.Heard(_unit_text(len(audio) - 1001), [])
@@ -412,7 +412,7 @@ class TestBreezeChecksInAThread(unittest.TestCase):
                 return super().__call__(items, seed)
 
         class Checker:
-            def transcribe(self, audio, words=True):
+            def transcribe(self, audio, words=True, beam_size=5):
                 checked_in.append(threading.current_thread().name)
                 if not gate_opened:  # the very first take waits for batch two's request
                     gate_opened.append(second_batch_started.wait(timeout=10))
@@ -434,7 +434,7 @@ class TestBreezeChecksInAThread(unittest.TestCase):
                 return super().__call__(items, seed)
 
         class Checker:
-            def transcribe(self, audio, words=True):
+            def transcribe(self, audio, words=True, beam_size=5):
                 checked.append(1)
                 return speech_check.Heard(_unit_text(len(audio) - 1001), [])
         run = _Run(self, _text(96), Server(), checker=Checker())
@@ -447,7 +447,7 @@ class TestBreezeChecksInAThread(unittest.TestCase):
         active, peak = [0], [0]
 
         class Checker:
-            def transcribe(self, audio, words=True):
+            def transcribe(self, audio, words=True, beam_size=5):
                 with lock:
                     active[0] += 1
                     peak[0] = max(peak[0], active[0])
@@ -463,7 +463,7 @@ class TestBreezeChecksInAThread(unittest.TestCase):
 
     def test_a_failed_speech_check_never_fails_the_chapter(self):
         class Checker:
-            def transcribe(self, audio, words=True):
+            def transcribe(self, audio, words=True, beam_size=5):
                 raise RuntimeError("whisper broke")
         run = _Run(self, _text(2), checker=Checker())
         self.assertIsNone(run.error)
@@ -525,7 +525,7 @@ class TestBreezeClipMap(unittest.TestCase):
 
     def test_the_speech_checks_match_is_recorded(self):
         class Checker:
-            def transcribe(self, audio, words=True):
+            def transcribe(self, audio, words=True, beam_size=5):
                 return speech_check.Heard(_unit_text(len(audio) - 1001), [])
         run = _Run(self, _text(2), checker=Checker())
         self.assertEqual([c["match"] for c in run.clips()], [1.0, 1.0])

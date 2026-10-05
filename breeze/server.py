@@ -212,7 +212,27 @@ class BreezeSynthesizer:
         self._runtime = (tokenizer, model, audio_tokenizer)
         self.frame_rate = self._read_frame_rate()
         self._cache_references()
+        self._fast_depth(model)
         log.info("model loaded in %.1fs (codec %s frames/s)", time.perf_counter() - started, self.frame_rate)
+
+    @staticmethod
+    def _fast_depth(model) -> None:
+        """Plain depth decoding as CUDA graph replays (fast_depth.py; 2.2-2.4x faster batches on
+        2026-10-05, WORKLOG §53). BREEZE_FAST_DEPTH=0 keeps the stock decoder, as does a failed capture."""
+        if os.environ.get("BREEZE_FAST_DEPTH", "1").strip().lower() in ("0", "off", "false", "no"):
+            log.info("fast depth decoder off (BREEZE_FAST_DEPTH)")
+            return
+        stock = model.depth_decoder.generate
+        started = time.perf_counter()
+        try:
+            import fast_depth
+            fast = fast_depth.install(model, max_rows=max(1, int(os.environ.get("BREEZE_MAX_BATCH", 32))))
+        except Exception:
+            model.depth_decoder.generate = stock
+            log.exception("fast depth decoder off: capturing its CUDA graphs failed")
+            return
+        log.info("fast depth decoder: CUDA graphs for %s rows in %.1fs", "/".join(map(str, fast.buckets)),
+                 time.perf_counter() - started)
 
     def _read_frame_rate(self) -> float | None:
         """Codec frames per second = sample rate / samples per frame, from the audio tokenizer's config."""

@@ -140,6 +140,16 @@ class TestLoading(unittest.TestCase):
         self.assertTrue(checker.transcribe(audio).words)
         self.assertIs(model.transcribe.call_args.kwargs["word_timestamps"], True)
 
+    def test_beam_search_unless_a_caller_asks_for_less(self):
+        model = MagicMock()
+        model.transcribe.side_effect = lambda *a, **k: (iter([SimpleNamespace(text=" Kiss", words=None)]), None)
+        checker = speech_check.SpeechChecker(model)
+        audio = AudioSegment.silent(1000, frame_rate=24000)
+        checker.transcribe(audio)  # a voice clip's words, which Breeze clones from
+        self.assertEqual(model.transcribe.call_args.kwargs["beam_size"], 5)
+        checker.transcribe(audio, words=False, beam_size=speech_check.BATCH_BEAM)
+        self.assertEqual(model.transcribe.call_args.kwargs["beam_size"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
