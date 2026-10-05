@@ -127,6 +127,14 @@ class EpubBookParser(BaseBookParser):
     _BLOCK_TAGS = ["p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "pre", "tr", "dt", "dd",
                    "section", "article", "header", "footer", "aside", "figcaption"]
     _CELL_TAGS = ["td", "th"]
+    # ponytail: English numbered labels only; add other languages when a source needs them.
+    _CHAPTER_LABEL = re.compile(
+        r"chapter\s+(?:\d+|[ivxlcdm]+|(?:one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+        r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|and)"
+        r"(?:[ -]+(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+        r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|"
+        r"forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|and))*)[.:]?", re.I)
 
     @classmethod
     def _mark_paragraphs(cls, soup) -> None:
@@ -145,7 +153,7 @@ class EpubBookParser(BaseBookParser):
             line_break.replace_with("\n")
 
     def _chapter_sections(self):
-        """Text and heading per contents-linked section, or per spine document as before."""
+        """Contents-linked sections, with numbered block headings as a fallback."""
         def links(entries):
             for entry in entries:
                 if isinstance(entry, (tuple, list)):
@@ -159,6 +167,8 @@ class EpubBookParser(BaseBookParser):
             if not href.scheme and not href.netloc:
                 by_file.setdefault(posixpath.normpath(unquote(href.path)), []).append((unquote(href.fragment), link.title))
         headings = ("h1", "h2", "h3", "h4", "h5", "h6")
+        pending = None
+        previous_fallback = False
         for item in self._reading_order_documents():
             soup = BeautifulSoup(item.get_content(), "lxml-xml")
             boundaries = {}
@@ -169,13 +179,25 @@ class EpubBookParser(BaseBookParser):
                 heading = target if target.name in headings else target.find_parent(headings)
                 boundary = heading if heading is not None else target
                 boundaries.setdefault(id(boundary), heading.get_text() if heading is not None else title)
+            fallback = False
+            if len(boundaries) < 2:
+                labels = [(tag, " ".join(tag.get_text().split()))
+                          for tag in soup.find_all(("p", *headings))]
+                if any(self._CHAPTER_LABEL.fullmatch(title) for _, title in labels):
+                    fallback = True
+                    boundaries = {id(tag): title for tag, title in labels
+                                  if self._CHAPTER_LABEL.fullmatch(title)
+                                  or title.lower() in ("prologue", "epilogue", "foreword", "afterword")}
+                    # A file cut can fall inside a chapter. Head metadata is not its continuation.
+                    if soup.head is not None:
+                        soup.head.decompose()
             self._mark_paragraphs(soup)
             tag_title = next((soup.find(level).text for level in ("title", "h1", "h2", "h3")
                               if soup.find(level) is not None), "")
-            if len(boundaries) < 2:
+            if len(boundaries) < 2 and not fallback:
                 sections = [(soup.get_text(strip=False), tag_title)]
             else:
-                sections, strings, title = [], [], tag_title
+                sections, strings, title = [], [], None if fallback else tag_title
                 for node in soup.descendants:
                     if id(node) in boundaries:
                         raw = "".join(strings)
@@ -188,7 +210,16 @@ class EpubBookParser(BaseBookParser):
                 if raw.strip():
                     sections.append((raw, title))
             soup.decompose()
-            yield from sections
+            for raw, title in sections:
+                if fallback and title is None and previous_fallback and pending is not None:
+                    pending = (pending[0] + "\n\n" + raw, pending[1])
+                else:
+                    if pending is not None:
+                        yield pending
+                    pending = (raw, title if title is not None else tag_title)
+            previous_fallback = fallback
+        if pending is not None:
+            yield pending
 
     def get_chapters(self, break_string) -> List[Tuple[str, str]]:
         chapters = []

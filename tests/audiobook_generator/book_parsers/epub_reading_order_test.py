@@ -189,6 +189,42 @@ class TestEpubReadingOrder(unittest.TestCase):
         self.assertEqual(chapters[:2], [("First", "First words."), ("Second", "Second words.")])
         self.assertEqual(len(chapters), 4)
 
+    def test_plain_chapter_labels_preserve_front_matter_and_file_continuations(self):
+        documents = []
+        for name, body in [
+            ("text00000.html", '<p>Book and author.</p><p><font>Chapter One</font></p>'
+             '<p>over<em>whelmed</em>.</p><p>Chapter Two</p><p>First half.</p>'),
+            ("text00001.html", '<p>Second half.</p><p>Chapter Three</p>'
+             '<p>Last words.</p><p>Epilogue</p><p>Ending.</p>'),
+        ]:
+            doc = MagicMock()
+            doc.get_name.return_value = name
+            doc.get_content.return_value = f'<html><head><title>{name}</title></head><body>{body}</body></html>'
+            documents.append(doc)
+        self.parser._reading_order_documents = lambda: documents
+        self.parser.book.toc = [epub.Link(doc.get_name(), doc.get_name(), str(i))
+                                for i, doc in enumerate(documents)]
+        for mode in ("auto", "tag_text", "first_few"):
+            self.parser.config.title_mode = mode
+            chapters = self.parser.get_chapters(" @BRK# ")
+            self.assertEqual([text for _, text in chapters], [
+                "Book and author.", "Chapter One @BRK# overwhelmed.",
+                "Chapter Two @BRK# First half. @BRK# Second half.",
+                "Chapter Three @BRK# Last words.", "Epilogue @BRK# Ending."])
+            if mode != "first_few":
+                self.assertEqual([title for title, _ in chapters[1:]],
+                                 ["Chapter One", "Chapter Two", "Chapter Three", "Epilogue"])
+
+    def test_heading_fallback_accepts_numbers_but_does_not_split_prose(self):
+        body = ('<h2>Chapter 1</h2><p>Chapter Two was memorable.</p>'
+                '<p>Chapter twenty-one</p><p>More words.</p><p>Chapter XXII</p><p>Final words.</p>')
+        _write_epub(self.path, body)
+        chapters = EpubBookParser(_config(self.path)).get_chapters(" ")
+        self.assertEqual([title for title, _ in chapters[:3]],
+                         ["Chapter 1", "Chapter twenty-one", "Chapter XXII"])
+        self.assertIn("Chapter Two was memorable.", chapters[0][1])
+        self.assertEqual(len(chapters), 5)
+
 
 if __name__ == "__main__":
     unittest.main()
