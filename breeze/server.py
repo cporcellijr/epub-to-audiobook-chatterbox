@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import signal
 import statistics
 import sys
 import threading
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -46,6 +47,22 @@ def is_oom(exc: BaseException) -> bool:
     torch = sys.modules.get("torch")  # not imported yet means the error can't be torch's
     oom = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
     return oom is not None and isinstance(exc, oom)
+
+
+def is_allocator_fault(exc: BaseException) -> bool:
+    """PyTorch's expandable-segments allocator failing to grow, which under WSL is a RuntimeError, not
+    an OutOfMemoryError. On 2026-10-05 a full card first gave 'CUDA driver error: device not ready'
+    (a growth that failed half-mapped), then every later growth over those pages '!handles_.at(i)
+    INTERNAL ASSERT FAILED at .../CUDACachingAllocator.cpp' (pytorch#166234, #188008): a chunk of 32
+    long units lost all 32 takes, three attempts running. Kernel errors read 'CUDA error: ...' and
+    are not this."""
+    message = str(exc)
+    return isinstance(exc, RuntimeError) and ("CUDA driver error" in message or "CUDACachingAllocator" in message)
+
+
+def restart_process() -> None:
+    """Let uvicorn shut down; compose's restart policy (unless-stopped) starts a fresh process."""
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 def empty_cuda_cache() -> None:
@@ -283,12 +300,15 @@ def max_tokens_for(frame_rate: float | None, longest_text: int) -> int:
 
 
 def create_app(synth, voices_dir: str | None = None, max_batch: int | None = None,
-               guard: SlowdownGuard | None = None) -> FastAPI:
+               guard: SlowdownGuard | None = None, restart=restart_process) -> FastAPI:
     voices = Path(voices_dir or os.environ.get("BREEZE_VOICES_DIR", "/voices"))
     max_batch = max(1, int(max_batch or os.environ.get("BREEZE_MAX_BATCH", 32)))
     if guard is None:  # a chunk of 3/4 of the batch size or more counts as full
         guard = SlowdownGuard(float(os.environ.get("BREEZE_SLOW_RTF") or SLOW_REAL_TIME), math.ceil(max_batch * 0.75))
     lock = threading.Lock()  # one generation at a time; the GPU is shared and memory is tight
+    # Set by an allocator fault: the half-mapped pages stay until the process ends (unloading the
+    # model doesn't free them), so the next unload restarts the server instead.
+    allocator_damaged = threading.Event()
     app = FastAPI(title="Breeze TTS 2")
 
     def ensure_loaded() -> None:
@@ -326,7 +346,8 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
         return request
 
     def run_chunk(chunk: list[dict], cfg: float, seed: int, results: dict) -> None:
-        """Generate one chunk into results[id] = (audio, error). On out-of-memory, split and retry."""
+        """Generate one chunk into results[id] = (audio, error). On out-of-memory (or an allocator
+        fault, which is how WSL runs out), split and retry."""
         longest = max(len(r["text"]) for r in chunk)
         tokens = max_tokens_for(getattr(synth, "frame_rate", None), longest)
         started = time.perf_counter()
@@ -336,7 +357,8 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
             if len(audios) != len(chunk):
                 raise RuntimeError(f"model returned {len(audios)} takes for {len(chunk)} items")
         except Exception as exc:
-            if not is_oom(exc):
+            fault = is_allocator_fault(exc)
+            if not (fault or is_oom(exc)):
                 log.exception("chunk of %d failed", len(chunk))
                 for r in chunk:
                     results[r["id"]] = (None, f"{type(exc).__name__}: {exc}")
@@ -355,6 +377,11 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
 
         # Leave the exception handler first: its traceback can hold GPU tensors from generate().
         empty_cuda_cache()
+        if fault and not allocator_damaged.is_set():
+            allocator_damaged.set()
+            log.error("GPU allocator fault at a chunk of %d (%s); %s. Chunks that need more are split; "
+                      "the next unload restarts the server to clear it", len(chunk), error.strip(),
+                      gpu_memory_report())
         if len(chunk) > 1:
             half = len(chunk) // 2
             log.warning("out of memory at batch %d; retrying as %d + %d", len(chunk), half, len(chunk) - half)
@@ -404,10 +431,14 @@ def create_app(synth, voices_dir: str | None = None, max_batch: int | None = Non
         return {"loaded": True}
 
     @app.post("/api/unload")
-    def unload():
+    def unload(background: BackgroundTasks):
         with lock:
             synth.unload()
             guard.reset()
+        if allocator_damaged.is_set():
+            # After the reply: the app unloads before the cast LLM runs, so nothing waits on Breeze.
+            log.warning("restarting the server to clear the GPU allocator fault")
+            background.add_task(restart)
         return {"loaded": False}
 
     @app.post("/v1/batch")

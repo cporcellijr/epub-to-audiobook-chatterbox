@@ -15,6 +15,18 @@ one GPU with Chatterbox and the LLM; the app unloads it with `POST /api/unload`.
   `instruction` is voice design. Items are grouped by template and cfg scale (1.0 for cloning, 4.0 with
   an instruction), sorted by length and run in chunks of `BREEZE_MAX_BATCH`. A chunk that runs out of
   GPU memory is split and retried; an item that still fails comes back with `error` set.
+
+## Allocator faults (WSL)
+
+Under WSL, with expandable segments on, a full card doesn't raise PyTorch's out-of-memory error. The
+first failed growth is `CUDA driver error: device not ready`, and it leaves pages half-mapped until
+the process ends. Every later growth over them is `!handles_.at(i) INTERNAL ASSERT FAILED at
+.../CUDACachingAllocator.cpp` (pytorch#166234, #188008). The server treats both as out of memory and
+splits the chunk, and logs `GPU allocator fault` once. Unloading the model doesn't clear the damage,
+so the next `POST /api/unload` (the app sends one before the cast LLM runs) replies and then restarts
+the server; compose's `restart: unless-stopped` brings it back within seconds. On 2026-10-05 a
+chapter's 32 longest units lost all their takes this way, three attempts running, before this
+handling existed.
 - `POST /v1/audio/speech` -> `{"input", "voice", "ref_text", "instruction", "response_format": "wav"}`,
   returns a WAV (a batch of one).
 

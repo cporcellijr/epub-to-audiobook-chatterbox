@@ -3361,3 +3361,99 @@ seeds were random. Both runs, side by side:
 The spill is gone, and the reserve stayed flat over the 42 minutes, 0.4 GB above the book's biggest
 peak. The speed gain is partly luck (the re-run needed fewer retries); one run each can't separate
 the two. A long book is the next check that memory stays flat over hours.
+
+## 52. Breeze under WSL: allocator faults instead of out-of-memory (2026-10-05)
+
+### 52.1 What happened
+
+Widow's Point (2025): 19 chapters, 573,981 characters, cast mode with adaptive delivery.
+- **First run (10:50-13:35):** chapter 5 ("Video/audio footage #1A", 1,354 units in 43 batches)
+  failed. Its 32 longest units got no audio in all three attempts (10:55, 11:24, 11:29), and a unit
+  the server never voices fails its chapter (§50). So no M4B. Chapter 14's third-attempt batch of 32
+  hit the same error at 13:26, but that chapter still converted on takes kept from earlier attempts.
+- **Retry (13:36):** chapter 5's batch 1 failed again at 13:38, and so did batch 2 at 13:41 (it had
+  passed in the first run). The owner stopped the book at 13:49 so this could be fixed first.
+
+The Breeze log:
+- The first failure, at 10:55, five minutes after a fresh model load, was `RuntimeError: CUDA driver
+  error: device not ready`, raised by an allocation in the attention code.
+- Every failure after that was `!handles_.at(i) INTERNAL ASSERT FAILED at
+  "/pytorch/c10/cuda/CUDACachingAllocator.cpp":430`.
+- Failing chunks of 32 ran 155-172 s before failing, against about 55 s for healthy full chunks in
+  the same chapter.
+- The reserve went 7.79 GB at load, 9.38 GB at 10:52, then 11.44 GB from 10:56 on, flat. The
+  biggest chunk that succeeded that day peaked at 10.29 GB. `nvidia-smi` showed 11,924 of 12,282 MiB
+  in use.
+
+### 52.2 Cause
+
+Breeze runs torch 2.9.1+cu128 with `expandable_segments:True` (§51). Line 430 is
+`TORCH_INTERNAL_ASSERT(!handles_.at(i))` in `ExpandableSegment::map`. The open issue pytorch#166234
+reports the same assert on the same line (torch 2.9.0, WSL, an RTX 4090). pytorch#188008 explains
+it: `map()` records a handle for each page and then maps the pages one by one. If a driver call fails
+partway, the recorded but unmapped pages stay recorded, and every later growth over them trips the
+assert, until the process ends.
+
+So on a full card under WSL, PyTorch never raises out-of-memory. The first failed growth is a driver
+error, and every growth after it is the assert. Both are plain RuntimeErrors. The server split a
+chunk only on `torch.cuda.OutOfMemoryError`, so the whole chunk failed, and the same 32 units failed
+on every attempt.
+
+Why these batches needed more memory is less certain. Chapter 13's longest sentences are as long as
+chapter 5's (its 32 longest sentences total 13,536 characters against 12,816) and it went through.
+The failing chunks ran about 3x as long as healthy ones, which fits a take running on toward the
+token cap (3x the expected length plus 3 s).
+
+### 52.3 Decisions
+
+**The server treats both errors as running out of memory and splits the chunk**
+(`is_allocator_fault`: a RuntimeError naming `CUDA driver error` or `CUDACachingAllocator`).
+- A damaged process still works within the memory it has already mapped. After each fault it ran
+  full chunks peaking at up to 10.29 GB inside its 11.44 GB reserve; only growth past the reserve
+  fails. Half a chunk needs less.
+- Kernel errors (`CUDA error: ...`) are not split. They usually break the CUDA context, and a split
+  wouldn't help.
+
+**The next unload restarts the server.**
+- Unloading the model doesn't clear the stranded pages, so only a new process does.
+- The first fault sets a flag and logs `GPU allocator fault` once, with the GPU memory figures.
+- `POST /api/unload` then replies and, as a background task, sends SIGTERM to its own process.
+  Uvicorn is PID 1 and shuts down cleanly; compose's `restart: unless-stopped` starts a fresh
+  process.
+- The app unloads Breeze only before a cast LLM run (`engine_gpu.unload_breeze_if_loaded`), so no
+  book is waiting, and the next load is minutes away.
+
+**Rejected:**
+- *Restarting right after the faulting request.* That would land mid-book. A reload costs 20-35 s,
+  the card is just as full afterwards, so the next long batch would fault again, and the split
+  already copes.
+- *Turning expandable segments off.* With the default allocator, WSL spills an overfull card into
+  Windows RAM instead of failing: the 2.26 GB spill of §51, and the 2026-10-01 VM crash.
+- *Reporting the damage in `/health`.* Docker doesn't restart an unhealthy container, and the app
+  doesn't read it.
+- *Upgrading PyTorch.* pytorch#187955 (merged 2026-06-23) makes the failed mapping roll back. Which
+  release ships it wasn't checked, and a new base image would mean re-checking the pinned
+  `breeze-tts` runtime.
+
+**Not done:** a chunk that faults still uses its 2.5 min before it splits. Capping the first batch
+of very long units would avoid that; first see how often it happens.
+
+### 52.4 Checked; not yet known
+
+- **Tests:** 33 Breeze server tests pass (28 before). The 5 new ones check that:
+  - a fault is split like out-of-memory;
+  - the server restarts only after a fault, and only at an unload;
+  - other CUDA errors and non-RuntimeErrors are neither split nor followed by a restart.
+- **Restart in a throwaway container** (new image, no GPU): SIGTERM to uvicorn as PID 1 gave
+  `Finished server process`, exit 0, restart count 1, and the server came back up.
+- **End to end with a fake synthesizer raising the assert:**
+  - a 4-item batch came back with every item's audio;
+  - the unload replied 200;
+  - the server logged `restarting the server to clear the GPU allocator fault` and came back up.
+- **Deployed with the queue idle:** the `breeze` container was recreated, and
+  `/opt/breeze-infer/server.py` matches the working tree. The new process starts with a clean
+  allocator.
+- **Not yet seen live:** chapter 5 re-run. `docker logs breeze` should show `GPU allocator fault at a
+  chunk of 32`, then `out of memory at batch 32; retrying as 16 + 16`, then the chunks of 16
+  finishing. After the next cast analysis it should show `restarting the server to clear the GPU
+  allocator fault`.

@@ -236,6 +236,56 @@ def test_oom_single_item_fails_others_succeed(voices):
     assert by_id["small1"]["error"] is None and by_id["small2"]["error"] is None
 
 
+HALF_MAPPED = RuntimeError("CUDA driver error: device not ready")
+DAMAGED = RuntimeError('!handles_.at(i) INTERNAL ASSERT FAILED at "/pytorch/c10/cuda/CUDACachingAllocator.cpp":430, '
+                       "please report a bug to PyTorch. ")
+
+
+def make_restartable(voices, fail):
+    restarts = []
+    synth = FakeSynth(fail=fail)
+    client = TestClient(create_app(synth, voices_dir=str(voices), restart=lambda: restarts.append(1)))
+    return synth, client, restarts
+
+
+def test_allocator_fault_is_split_like_oom(voices):
+    # WSL's way of running out: the first growth fails half-mapped, later ones trip the assert
+    faults = iter([HALF_MAPPED])
+    synth, c, restarts = make_restartable(
+        voices, lambda chunk, cfg: next(faults, DAMAGED) if len(chunk) > 2 else None)
+    items = [item(f"i{n}", "x" * (n + 1)) for n in range(8)]
+    out = post(c, items).json()["items"]
+    assert all(o["error"] is None and o["wav_b64"] for o in out)
+    assert [len(call["ids"]) for call in synth.calls] == [8, 4, 2, 2, 4, 2, 2]
+    assert restarts == []  # never in the middle of a book
+
+
+def test_unload_restarts_the_server_only_after_an_allocator_fault(voices):
+    fail = {"exc": None}
+    synth, c, restarts = make_restartable(voices, lambda chunk, cfg: fail["exc"] if len(chunk) > 1 else None)
+    post(c, [item("a"), item("b")])
+    assert c.post("/api/unload").json() == {"loaded": False}
+    assert restarts == []
+    fail["exc"] = DAMAGED
+    post(c, [item("a"), item("b")])
+    fail["exc"] = None
+    post(c, [item("a"), item("b")])  # still damaged: the process keeps it until it ends
+    assert restarts == []
+    assert c.post("/api/unload").json() == {"loaded": False}
+    assert restarts == [1] and synth.unloads == 2
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("CUDA error: an illegal memory access was encountered"),
+                                 RuntimeError("expected a CUDA driver"), ValueError("CUDA driver error")])
+def test_other_cuda_errors_are_not_allocator_faults(voices, exc):
+    synth, c, restarts = make_restartable(voices, lambda chunk, cfg: exc)
+    out = post(c, [item("a"), item("b")]).json()["items"]
+    assert all(o["wav_b64"] is None and type(exc).__name__ in o["error"] for o in out)
+    assert len(synth.calls) == 1  # not split
+    c.post("/api/unload")
+    assert restarts == []
+
+
 def test_other_exception_isolated_to_chunk(voices):
     synth, c = make(voices, max_batch=2, fail=lambda chunk, cfg: ValueError("bad") if "x" * 30 in chunk[0]["text"] else None)
     items = [item("a", "x" * 5), item("b", "x" * 6), item("c", "x" * 30), item("d", "x" * 31)]
