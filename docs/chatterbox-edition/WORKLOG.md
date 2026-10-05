@@ -3488,3 +3488,14 @@ fix and has 41 flagged takes; the 32 units of its third-attempt batch lost that 
 Still to see: the restart at the next unload. The Breeze process has carried the fault flag since
 14:03 (restart count 0), so the next cast analysis should log `restarting the server to clear the
 GPU allocator fault`.
+
+### 52.6 Live: the restart at the next unload
+
+The owner's next cast analysis unloaded Breeze at 14:49:45, and the server logged `restarting the
+server to clear the GPU allocator fault` after its 200 reply. Uvicorn shut down cleanly, and Docker
+had it back up 4 s later (restart count 1). The app saw nothing wrong: `Breeze model unloaded (GPU
+memory freed)`, and the cast ran.
+
+The next book (Showering With Jennifer) loaded the model at 15:18 in 17.5 s. Its full chunks ran at
+about 4-6x real time. The reserve stayed at 9.0-10.0 GB, with peaks up to 9.8 GB, and there were no
+allocator faults through 16:12.
