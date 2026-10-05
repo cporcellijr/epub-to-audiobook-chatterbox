@@ -3457,3 +3457,34 @@ of very long units would avoid that; first see how often it happens.
   chunk of 32`, then `out of memory at batch 32; retrying as 16 + 16`, then the chunks of 16
   finishing. After the next cast analysis it should show `restarting the server to clear the GPU
   allocator fault`.
+
+### 52.5 Live: Widow's Point chapter 5 on the new server
+
+The owner restarted the book at 14:00 with finished chapters kept, so only chapter 5 ran. The model
+loaded in 18.6 s in the freshly deployed process.
+
+- **14:03:21:** batch 1, the 32 longest units, failed again with `CUDA driver error: device not
+  ready`, this time in a fresh process. So the batch really doesn't fit the card; earlier damage
+  wasn't the reason. After emptying the cache, the server logged `GPU allocator fault` (GPU free
+  3,626 of 12,281 MiB, reserve 7,378 MiB) and split the batch 16 + 16. The halves made 300.1 s of
+  audio in 184.2 s (peak 9,357 MiB) and 326.2 s in 82.1 s (peak 8,606 MiB). With the 155 s spent
+  before the fault, that batch took about 7 min instead of about 1.
+- **14:39:23:** the third attempt's batch of 30 split 15 + 15. The fault line is logged only once,
+  by design.
+- **Every other chunk:** 42 full chunks of 32 ran without a fault. The highest peak was 9,947 MiB.
+- **14:42:33:** chapter 5 converted: 1,354 units, 133.6 min. 1,311 units passed on the first take,
+  13 on the second, and 30 went to a third.
+- **14:43:01:** the M4B was built from all 19 chapters, 10.80 h.
+
+Of the 32 units that never got audio before the fix, 29 passed on their first take and 2 on their
+second. The last one, a 270-character line, was kept after failing all three (match 0.14).
+
+A separate pattern, not linked to the fault: chapter 5 has 28 takes kept after failing the check,
+all in Cora.wav. Nearly all are short lines (6-50 characters), all flagged as speech mismatch. Across
+the book Cora's flag rate is 2.3% (28 of 1,226 units), against 0.5% for the narrator (Chloe, 24 of
+4,379). Gabriel (5 of 214) and Everett (9 of 462) are also around 2%. Chapter 14 was made before the
+fix and has 41 flagged takes; the 32 units of its third-attempt batch lost that attempt to the fault.
+
+Still to see: the restart at the next unload. The Breeze process has carried the fault flag since
+14:03 (restart count 0), so the next cast analysis should log `restarting the server to clear the
+GPU allocator fault`.
