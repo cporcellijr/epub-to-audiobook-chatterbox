@@ -1067,10 +1067,11 @@ class OpenAITTSProvider(BaseTTSProvider):
                                  if key in params},
                     **({"flagged": flagged} if flagged else {}),
                 })
-                logger.info("Clip %s: chapter %.3f–%.3fs, seed=%s, settings=%s",
-                            chunk_id, clip_entries[-1]["start_ms"] / 1000,
-                            clip_entries[-1]["end_ms"] / 1000, params.get("seed", "default"),
-                            clip_entries[-1]["settings"])
+                # one line per unit, hundreds a chapter; the clip map (.clips.json) keeps the same facts
+                logger.debug("Clip %s: chapter %.3f–%.3fs, seed=%s, settings=%s",
+                             chunk_id, clip_entries[-1]["start_ms"] / 1000,
+                             clip_entries[-1]["end_ms"] / 1000, params.get("seed", "default"),
+                             clip_entries[-1]["settings"])
             previous_paragraph = paragraph
 
         self._finish_units(pieces, spoken, audio_format)

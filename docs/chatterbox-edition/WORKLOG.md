@@ -3886,5 +3886,6 @@ lines a chapter since §55, which buried the app's own lines. It is the library'
   logger, set from the job's log level by `setup_logging`, logs DEBUG. Warnings and errors pass
   unchanged.
 - **Tests:** a new test checks both log levels; the app suite passes, 966 tests with 1 skipped.
-- **Deploy:** waits for an idle queue (Bewitched! is running), since restarting the app mid-book loses
-  the chapter in progress.
+- **The app's own per-unit line too:** `Clip chapter-N_..._chunk_K_of_M: chapter a-b s, seed=...` is
+  now DEBUG. That is one line per unit, and the clip map (`.clips.json`) keeps the same facts.
+- **Deploy:** the owner stopped Bewitched! for it.
