@@ -3755,3 +3755,73 @@ real cut-off takes before changing anything.
 - **Next:** with generation the limit again, bigger batches for short and medium lines are the next
   lever (64 medium lines run at 20x against 12.7x for 32, §53.4), then a per-take length cap for
   runaway takes.
+
+## 56. Bigger batches for short units (2026-10-05)
+
+### 56.1 Measured
+
+After §55 generation was the limit again. The test sent the same 64 units as one request and as two
+of 32, on the fixed workload (`harness.py`, with offsets) in two new length groups beside §53's, at
+seeds 4242 and 777:
+
+| Units (characters) | 2 x 32 | 1 x 64 | Faster | Peak memory at 64 |
+|---|---|---|---|---|
+| short (6-28) | 8.9 / 9.6 s | 7.7 / 7.2 s | 13% / 25% | 10.0 GB |
+| medium (45-75) | 18.4 / 15.6 s | 12.8 / 12.4 s | 30% / 21% | 10.2 GB |
+| mid (90-150) | 28.4 / 28.2 s | 28.7 / 22.2 s | -1% / 21% | 10.6-10.8 GB |
+| midlong (150-248) | 50.9 / 43.1 s | out of memory, both seeds | | |
+
+A frame costs 60% more at 64 rows than at 32, and a request runs until its longest take ends. So 64
+pays where takes are short and similar. From 90 characters it is a toss-up near the memory limit,
+and from 150 it doesn't fit. The desktop held 1.4 GB of the card during these runs (0.6 GB earlier
+in the day).
+
+### 56.2 What changed
+
+- **App:** `_breeze_batches` makes a request of 64 units (`BREEZE_SHORT_BATCH_SIZE`) when its longest
+  text is at most 80 characters (`BREEZE_SHORT_BATCH_CHARS`), else 32 as before. Units go longest
+  first, so a request's first unit sets its size.
+- **Server:** `DEFAULT_MAX_BATCH` and compose's `BREEZE_MAX_BATCH` are now 64, so graphs are captured
+  up to 64 rows.
+- **Slowdown guard:** 3/4 of the batch size, but at most 24 rows, counts as a full chunk, so chunks of
+  32 long units still count.
+- **Queue estimate:** `BREEZE_GENERATION_SPEED` was a guessed 4.0. In the estimate's own units
+  (characters / 20.2 per second of wall time), Stranded's last three chapters ran at 7.3-8.2x, so it
+  is now 7.5. Estimates were about twice too long.
+- **Expected gain:** units of up to 80 characters were about 40% of generation time (§53.1), so
+  chapters should be about 8-10% faster. That is a smaller step than §53 and §55.
+
+### 56.3 Tests and deploy
+
+- **Tests:** the app suite passes, 966 tests with 1 skipped. Batch tests now expect 64 for short
+  units, and a new one keeps units over 80 characters at 32. Tests about order, retries and the
+  check thread fix the short size at 32, since they test something else. The 38 Breeze server tests
+  pass.
+- **Deploy:** `breeze` and `epub-to-audiobook` were rebuilt with the queue paused. `/health` reports
+  `max_batch` 64, and the files match the working tree.
+- **Live (A Tale of Two Nannies chapters 5-7):**
+
+| Chapter | Characters | Time | Estimate units | Audio | 64-unit requests |
+|---|---|---|---|---|---|
+| 5 | 30,429 | 185 s | 8.14x | 8.99x | 4, at 13.5x |
+| 6 | 24,921 | 235 s | 5.25x (one fault) | 6.39x | 5, at 12.1x |
+| 7 | 17,815 | 112 s | 7.87x | 9.10x | 5, at 13.8x |
+
+  - **The 64-unit requests:** they peaked at 10.2 GB and never faulted. Retries stayed normal (7, 7
+    and 4 units sent again).
+  - **The gain:** chapters 5 and 7 ran at 7.9-8.1x in estimate units, against Stranded's 7.3-8.2x
+    without them (§55). That is within book-to-book variation: a few percent at most, less than the
+    8-10% expected.
+- **The fault, now the bigger loss:** chapter 6's first request, 32 of its longest units, overflowed
+  the card after 52 s and was split 16 + 16. With chapter 2 (§53.8) that is 2 of this book's 7 chapters
+  so far, each losing about a minute, roughly 20% of the chapter.
+
+  A straight-line fit to the bench peaks gives about 7.5 GB with no units, plus about 34 MB per unit,
+  plus 0.13 MB per unit per frame. By that:
+  - 32 units of about 400 characters fit while their takes end normally (measured 10.4 GB).
+  - If one take runs on to the current cap (3x the expected length plus 3 s, about 1,040 frames), the
+    whole request runs that long and needs about 12.8 GB, which doesn't fit.
+  - At 16 units it would need about 10.1 GB.
+  - At 32 units with a 2x cap, about 11.4 GB, still at the edge.
+
+  Next: smaller requests for the longest units, and a per-take length cap.

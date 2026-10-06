@@ -39,6 +39,11 @@ short = list(dict.fromkeys([m.group(0) for t in texts for m in QUOTED.finditer(t
 rng.shuffle(short)
 short = sorted(short[:128], key=len, reverse=True)
 out = {"long": items(long_, "L"), "medium": items(medium, "M"), "short": items(short, "S")}
+# Batch-size tests (WORKLOG §56): the lengths between medium and long.
+for name, low, high, tag in (("mid", 90, 150, "D"), ("midlong", 150, 250, "G")):
+    group = [t for t in texts if low <= len(t) <= high]
+    rng.shuffle(group)
+    out[name] = items(sorted(group[:128], key=len, reverse=True), tag)
 json.dump(out, open("/tmp/workload.json", "w"), ensure_ascii=False, indent=0)
 for k, v in out.items():
     ls = [len(i["text"]) for i in v]

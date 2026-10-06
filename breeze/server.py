@@ -35,6 +35,9 @@ LENGTH_SLACK = 3.0  # allow 3x the expected length, plus 3 s
 SLOW_REAL_TIME = 1.5  # BREEZE_SLOW_RTF; 0 turns the slowdown guard off
 SLOW_WINDOW = 4  # full batches
 SLOW_RELOAD_COOLDOWN_SECONDS = 1800
+# The app sends up to 64 short units or 32 longer ones per request (WORKLOG §56); BREEZE_MAX_BATCH.
+DEFAULT_MAX_BATCH = 64
+FULL_CHUNK = 24  # rows from which a chunk counts as full for the slowdown guard
 
 
 class OutOfMemory(Exception):
@@ -226,7 +229,7 @@ class BreezeSynthesizer:
         started = time.perf_counter()
         try:
             import fast_depth
-            fast = fast_depth.install(model, max_rows=max(1, int(os.environ.get("BREEZE_MAX_BATCH", 32))))
+            fast = fast_depth.install(model, max_rows=max(1, int(os.environ.get("BREEZE_MAX_BATCH", DEFAULT_MAX_BATCH))))
         except Exception:
             model.depth_decoder.generate = stock
             log.exception("fast depth decoder off: capturing its CUDA graphs failed")
@@ -322,9 +325,10 @@ def max_tokens_for(frame_rate: float | None, longest_text: int) -> int:
 def create_app(synth, voices_dir: str | None = None, max_batch: int | None = None,
                guard: SlowdownGuard | None = None, restart=restart_process) -> FastAPI:
     voices = Path(voices_dir or os.environ.get("BREEZE_VOICES_DIR", "/voices"))
-    max_batch = max(1, int(max_batch or os.environ.get("BREEZE_MAX_BATCH", 32)))
-    if guard is None:  # a chunk of 3/4 of the batch size or more counts as full
-        guard = SlowdownGuard(float(os.environ.get("BREEZE_SLOW_RTF") or SLOW_REAL_TIME), math.ceil(max_batch * 0.75))
+    max_batch = max(1, int(max_batch or os.environ.get("BREEZE_MAX_BATCH", DEFAULT_MAX_BATCH)))
+    if guard is None:  # 3/4 of the batch size counts as full, at most FULL_CHUNK: 32 long units are a full chunk too
+        guard = SlowdownGuard(float(os.environ.get("BREEZE_SLOW_RTF") or SLOW_REAL_TIME),
+                              min(FULL_CHUNK, math.ceil(max_batch * 0.75)))
     lock = threading.Lock()  # one generation at a time; the GPU is shared and memory is tight
     # Set by an allocator fault: the half-mapped pages stay until the process ends (unloading the
     # model doesn't free them), so the next unload restarts the server instead.

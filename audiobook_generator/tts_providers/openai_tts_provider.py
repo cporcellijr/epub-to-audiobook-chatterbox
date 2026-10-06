@@ -59,6 +59,11 @@ _BAD_CLIP_RETRIES = 2
 # Breeze is fast only when many sentences are generated together (7.1x real time at 32 per request,
 # 0.45x at 1; 2026-10-01), so a chapter goes to its server in requests of this many units.
 BREEZE_BATCH_SIZE = 32
+# Units of up to BREEZE_SHORT_BATCH_CHARS go 64 at a time. On the same 64 units, one request took
+# 13-30% less time than two of 32 for 6-75 characters, the same or 21% less for 90-150 (peaking at
+# 10.8 GB), and ran out of memory for 150-250 (2026-10-05, WORKLOG §56).
+BREEZE_SHORT_BATCH_SIZE = 64
+BREEZE_SHORT_BATCH_CHARS = 80
 _SHORT_UNIT_CHARS = 25
 _SHORT_QUOTE_CONTEXT = "The room was quiet, and the window was open."
 
@@ -174,18 +179,24 @@ def _chatterbox_input(text: str) -> str:
 
 
 def _breeze_batches(pending: List[int], items: List[dict]) -> List[List[int]]:
-    """The units to send (indexes into items) as requests of up to BREEZE_BATCH_SIZE, each one model
-    call that ends as early as it can. A batch generates until its longest take is done, so a small
-    batch holding a long unit costs about what a full one does (2026-10-02: a call of 4 units took
-    32 s, full calls 25-60 s). The server also runs directed and plain items as separate calls, so a
-    few whispered lines in a book-order batch became a call of their own. So directed and plain
-    units are batched apart, longest text first: units of similar length share a batch, and a
-    group's leftover batch holds its shortest units. Equal lengths keep their order."""
+    """The units to send (indexes into items) as requests of up to BREEZE_BATCH_SIZE, or
+    BREEZE_SHORT_BATCH_SIZE when a request's longest text is short, each one model call that ends
+    as early as it can. A batch generates until its longest take is done, so a small batch holding a
+    long unit costs about what a full one does (2026-10-02: a call of 4 units took 32 s, full calls
+    25-60 s). The server also runs directed and plain items as separate calls, so a few whispered
+    lines in a book-order batch became a call of their own. So directed and plain units are batched
+    apart, longest text first: units of similar length share a batch, and a group's leftover batch
+    holds its shortest units. Equal lengths keep their order."""
     batches = []
     for directed in (False, True):
         group = sorted((i for i in pending if bool(items[i]["instruction"]) == directed),
                        key=lambda i: -len(items[i]["text"]))
-        batches += [group[i:i + BREEZE_BATCH_SIZE] for i in range(0, len(group), BREEZE_BATCH_SIZE)]
+        start = 0
+        while start < len(group):  # the first unit of a batch is its longest
+            short = len(items[group[start]]["text"]) <= BREEZE_SHORT_BATCH_CHARS
+            size = BREEZE_SHORT_BATCH_SIZE if short else BREEZE_BATCH_SIZE
+            batches.append(group[start:start + size])
+            start += size
     return batches
 
 

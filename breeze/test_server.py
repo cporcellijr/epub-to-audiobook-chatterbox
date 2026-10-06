@@ -450,7 +450,7 @@ def test_a_failed_capture_keeps_the_stock_depth_decoder(monkeypatch):
     monkeypatch.delenv("BREEZE_MAX_BATCH", raising=False)
     model = FakeDepthModel()
     server.BreezeSynthesizer._fast_depth(model)
-    assert calls == [32] and model.depth_decoder.generate is model.stock
+    assert calls == [server.DEFAULT_MAX_BATCH] and model.depth_decoder.generate is model.stock
 
 
 def test_the_synthesizer_routes_reference_encoding_through_its_cache(monkeypatch, tmp_path):

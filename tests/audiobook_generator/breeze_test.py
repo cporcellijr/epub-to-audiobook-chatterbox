@@ -515,9 +515,10 @@ class TestBreezeInTheUi(unittest.TestCase):
         jobs = [{"status": "queued", "title": "Book", "settings": {"engine": "breeze", "voice": "Elena.wav"}}]
         self.assertEqual(chatterbox_ui._voice_in_use("Elena.wav", jobs), "Book")
 
-    def test_the_estimate_uses_chatterbox_speech_pace_and_four_times_real_time(self):
+    def test_the_estimate_uses_chatterbox_speech_pace_and_breezes_measured_speed(self):
         self.assertEqual(chatterbox_ui._engine_estimate_constants("breeze"),
-                         (chatterbox_ui.CHARS_PER_AUDIO_SECOND, 4.0, 1.0))
+                         (chatterbox_ui.CHARS_PER_AUDIO_SECOND, chatterbox_ui.BREEZE_GENERATION_SPEED, 1.0))
+        self.assertEqual(chatterbox_ui.BREEZE_GENERATION_SPEED, 7.5)  # timed on real chapters, WORKLOG §56
         self.assertEqual(chatterbox_ui._engine_estimate_constants("chatterbox")[0],
                          chatterbox_ui.CHARS_PER_AUDIO_SECOND)
 

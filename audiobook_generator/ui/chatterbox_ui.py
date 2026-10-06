@@ -1911,10 +1911,11 @@ PACED_GENERATION_OVERHEAD = 1.26
 KOKORO_CHARS_PER_AUDIO_SECOND = 16.9
 KOKORO_GENERATION_SPEED = 52.9
 KOKORO_PACED_GENERATION_OVERHEAD = 3.07
-# Breeze speaks about as fast as Chatterbox (same chars per audio second). Its server generates at 7.1x
-# real time with 32 sentences per request (measured 2026-10-01); with the speech check on every take and
-# the retried ones that is a GUESS of 4x until a real book has been timed.
-BREEZE_GENERATION_SPEED = 4.0
+# Breeze, in these units (characters / CHARS_PER_AUDIO_SECOND per second of wall time, speech check
+# and retries included): Stranded's last three chapters took 151, 178 and 144 s for 25,046, 28,382 and
+# 21,346 characters, 7.3-8.2x, with the fast depth decoder and the quick speech check (2026-10-05,
+# WORKLOG §55-56). It was a guess of 4x before any book had been timed.
+BREEZE_GENERATION_SPEED = 7.5
 CHAPTER_COLUMNS = ["#", "Include", "Chapter", "Starts with", "Listening"]
 _SENTENCE_END = re.compile(r"[.!?\u2026]+[\"'\u201d\u2019)\]]*(?=\s|$)")
 
