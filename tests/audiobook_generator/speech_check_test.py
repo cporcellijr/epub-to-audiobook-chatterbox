@@ -48,6 +48,17 @@ class TestMatch(unittest.TestCase):
         self.assertEqual(match("“Kiss me!”", ""), 0)
 
 
+class TestQuickPass(unittest.TestCase):
+    def test_a_close_transcript_or_unjudgeable_text_settles_a_take(self):
+        heard = lambda text: speech_check.Heard(text, [])
+        self.assertTrue(speech_check.quick_pass("Kiss me now.", heard("Kiss me now.")))
+        self.assertTrue(speech_check.quick_pass("Room 101.", heard("anything")))  # digits: match() can't judge
+        # passes small's 0.70 but not the quick hearing's stricter mark: small hears it again
+        self.assertGreaterEqual(match("Come here and kiss me now.", "Come here and kiss"), PASS_SCORE)  # 0.83
+        self.assertFalse(speech_check.quick_pass("Come here and kiss me now.", heard("Come here and kiss")))
+        self.assertFalse(speech_check.quick_pass("Kiss me now.", None))  # the quick hearing failed
+
+
 class TestLeaked(unittest.TestCase):
     def test_a_cut_take_starting_with_a_lead_in_word_leaked(self):
         self.assertTrue(speech_check.leaked("“Kiss me!”", "Open. Kiss me!", CARRIER))
@@ -114,6 +125,32 @@ class TestLoading(unittest.TestCase):
             # Breeze's checks hear several takes at once; each worker gets its own threads.
             self.assertEqual(whisper.WhisperModel.call_args.kwargs["num_workers"], speech_check.WORKERS)
             self.assertLessEqual(whisper.WhisperModel.call_args.kwargs["cpu_threads"], 4)
+
+    def test_the_quick_model_lives_beside_the_main_one_and_downloads_itself(self):
+        whisper = SimpleNamespace(WhisperModel=MagicMock())
+        utils = SimpleNamespace(download_model=MagicMock())
+        self.addCleanup(setattr, speech_check, "_quick_loaded", False)
+        self.addCleanup(setattr, speech_check, "_quick", None)
+        speech_check._quick_loaded, speech_check._quick = False, None
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.dict(os.environ, {speech_check.MODEL_ENV: os.path.join(folder, "faster-whisper-small")}), \
+                patch.dict(sys.modules, {"faster_whisper": whisper, "faster_whisper.utils": utils}):
+            os.environ.pop(speech_check.QUICK_MODEL_ENV, None)
+            quick = speech_check.get_quick()
+            self.assertIs(speech_check.get_quick(), quick)
+            expected = os.path.join(folder, "faster-whisper-tiny.en")
+            utils.download_model.assert_called_once_with("tiny.en", output_dir=expected)
+            self.assertEqual(whisper.WhisperModel.call_args.args, (expected,))
+
+    def test_the_quick_model_can_be_switched_off_and_needs_the_speech_check(self):
+        for env in ({speech_check.MODEL_ENV: "/models/small", speech_check.QUICK_MODEL_ENV: "off"},
+                    {speech_check.QUICK_MODEL_ENV: "/models/tiny"}):
+            speech_check._quick_loaded, speech_check._quick = False, None
+            with self.subTest(env=env), patch.dict(os.environ, env):
+                if speech_check.MODEL_ENV not in env:
+                    os.environ.pop(speech_check.MODEL_ENV, None)
+                self.assertIsNone(speech_check.get_quick())
+        speech_check._quick_loaded = False
 
     def test_transcribe_pads_the_take_and_reports_word_times_within_it(self):
         model = MagicMock()

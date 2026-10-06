@@ -1151,6 +1151,7 @@ class OpenAITTSProvider(BaseTTSProvider):
             items.append({"id": ids[number], "text": _chatterbox_input(unit), "voice": voice,
                           "ref_text": ref_text, "instruction": instruction, "cfg_scale": None})
         checker = speech_check.get()
+        quick = speech_check.get_quick() if checker is not None else None
         kept: dict = {}                            # unit index -> the take that passed
         rejected = {n: [] for n in range(total)}   # unit index -> (kind, badness, attempt, audio, params, reason)
         errors: dict = {}                          # unit index -> the server's last error for it
@@ -1174,7 +1175,7 @@ class OpenAITTSProvider(BaseTTSProvider):
                                 len(batch), " (directed)" if items[batch[0]]["instruction"] else "", seed)
                     takes = breeze_client.synthesize_batch([items[i] for i in batch], seed)
                     futures.append(checks.submit(self._check_breeze_batch, batch, takes, units, items, ids, seed,
-                                                 attempt, label, checker))
+                                                 attempt, label, checker, quick))
                 results = [future.result() for future in futures]
             pending = []
             for batch_results in results:
@@ -1204,25 +1205,34 @@ class OpenAITTSProvider(BaseTTSProvider):
         return takes
 
     def _check_breeze_batch(self, batch: List[int], takes: list, units: List[tuple], items: List[dict],
-                            ids: List[str], seed: int, attempt: int, label: str, checker) -> list:
+                            ids: List[str], seed: int, attempt: int, label: str, checker, quick=None) -> list:
         """(unit index, outcome, detail) for each take of one batch, run in the checking thread:
         "error" (detail: the server's message), "pass" (detail: the finished take) or "reject"
         (detail: the tuple _breeze_takes ranks the unit's rejected takes by). A near-silent take
         ranks last, so it is kept only when nothing else exists. A directed take's instruction goes
         into its params (the clip map records it), and a rejected one is logged with its mood so a
         listening test can see whether whispers or shouts fail the checks more often. Whisper hears
-        speech_check.WORKERS takes at once: the checks, not the GPU, set the pace of a batch of
-        short units."""
+        speech_check.WORKERS takes at once. With a `quick` checker (speech_check.get_quick), it hears
+        every take first and Whisper small only the ones it doesn't settle, so a take that fails is
+        always judged by small."""
         started = time.perf_counter()
         silent = {index: _long_silence_ms(take) for index, take in zip(batch, takes) if not isinstance(take, str)}
         heard = {}
+        again = 0
         if checker is not None:
             to_hear = [(index, take) for index, take in zip(batch, takes)
                        if index in silent and silent[index] < _BAD_CLIP_SILENCE_MS]
+
+            def hear_with(model):
+                return lambda pair: self._hear(model, pair[1], ids[pair[0]], words=False,
+                                               beam_size=speech_check.BATCH_BEAM)
             with ThreadPoolExecutor(speech_check.WORKERS, thread_name_prefix="breeze-check-hear") as hearing:
-                heard = dict(zip([index for index, _ in to_hear], hearing.map(
-                    lambda pair: self._hear(checker, pair[1], ids[pair[0]], words=False,
-                                            beam_size=speech_check.BATCH_BEAM), to_hear)))
+                if quick is not None:
+                    heard = dict(zip([index for index, _ in to_hear], hearing.map(hear_with(quick), to_hear)))
+                    to_hear = [(index, take) for index, take in to_hear
+                               if not speech_check.quick_pass(units[index][1], heard[index])]
+                    again = len(to_hear)
+                heard.update(zip([index for index, _ in to_hear], hearing.map(hear_with(checker), to_hear)))
         outcomes = []
         for index, take in zip(batch, takes):
             unit, chunk_id = units[index][1], ids[index]
@@ -1246,7 +1256,8 @@ class OpenAITTSProvider(BaseTTSProvider):
             else:
                 logger.info("Breeze rejected %s (%s, mood=%s): %s", chunk_id, label, mood, verdict[2])
                 outcomes.append((index, "reject", (verdict[0], verdict[1], attempt, take, params, verdict[2])))
-        logger.info("Breeze %s: checked %d takes in %.1fs", label, len(batch), time.perf_counter() - started)
+        logger.info("Breeze %s: checked %d takes in %.1fs%s", label, len(batch), time.perf_counter() - started,
+                    f" ({again} heard again by Whisper {speech_check.MODEL_SIZE})" if quick is not None else "")
         return outcomes
 
     def _speak_take(self, request_kwargs: dict, unit: str,

@@ -29,3 +29,8 @@ and the live `breeze` container should be unloaded (`curl -X POST localhost:8005
    Whisper hears every saved take as the app's check does (`speech_check.match`, pass at 0.70).
 5. **Check speed**: `whisper_bench.py` times speech-check settings (workers x threads, beam) on the
    same takes and reports whether their verdicts agree.
+6. **Quick first hearing** (WORKLOG §55): `two_stage.py [small tiny.en base.en]` hears every take, plus
+   takes made bad three ways (another line's text, cut to 60%, a runaway tail of another take), with
+   each model and saves the transcripts. `two_stage_thresholds.py` then counts, for each quick model
+   and pass mark, the real takes sent on to small and the bad takes passed that small would reject.
+   The quick models live beside small: `download_model("tiny.en", output_dir=...)`.

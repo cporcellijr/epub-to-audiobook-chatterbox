@@ -86,7 +86,8 @@ def _first_attempt(server) -> list:
 class _Run:
     """One chapter through the provider with a fake server, a fake transcript and a fake checker."""
 
-    def __init__(self, test, text, server=None, checker=None, transcript=lambda voice: f"words of {voice}", **extra):
+    def __init__(self, test, text, server=None, checker=None, transcript=lambda voice: f"words of {voice}",
+                 quick=None, **extra):
         self.server = server or FakeBreeze()
         self.provider = _provider(**extra)
         self.dir = tempfile.TemporaryDirectory()
@@ -101,6 +102,7 @@ class _Run:
         with patch(f"{PROVIDER}.breeze_client.synthesize_batch", self.server), \
                 patch(f"{PROVIDER}.voice_transcripts.transcript", side_effect=transcript) as self.transcripts, \
                 patch(f"{PROVIDER}.speech_check.get", return_value=checker), \
+                patch(f"{PROVIDER}.speech_check.get_quick", return_value=quick), \
                 patch.object(self.provider, "_combine_and_export", side_effect=capture):
             self.error = None
             try:
@@ -529,6 +531,49 @@ class TestBreezeClipMap(unittest.TestCase):
                 return speech_check.Heard(_unit_text(len(audio) - 1001), [])
         run = _Run(self, _text(2), checker=Checker())
         self.assertEqual([c["match"] for c in run.clips()], [1.0, 1.0])
+
+
+class Hearing:
+    """A fake Whisper: hears each take's own unit, except `garbles` (take numbers) or raises for `fails`."""
+
+    def __init__(self, garbles=(), fails=()):
+        self.garbles, self.fails, self.heard = set(garbles), set(fails), []
+
+    def transcribe(self, audio, words=True, beam_size=5):
+        number = len(audio) - 1000
+        self.heard.append(number)
+        if number in self.fails:
+            raise RuntimeError("whisper broke")
+        return speech_check.Heard("completely different words" if number in self.garbles
+                                  else _unit_text(number - 1), [])
+
+
+class TestBreezeQuickHearing(unittest.TestCase):
+
+    def test_takes_the_quick_hearing_passes_never_reach_whisper_small(self):
+        quick, small = Hearing(), Hearing()
+        run = _Run(self, _text(5), checker=small, quick=quick)
+        self.assertIsNone(run.error)
+        self.assertEqual(sorted(quick.heard), [1, 2, 3, 4, 5])
+        self.assertEqual(small.heard, [])
+        self.assertEqual([c["match"] for c in run.clips()], [1.0] * 5)
+
+    def test_only_doubted_takes_are_heard_again_and_small_decides_them(self):
+        quick, small = Hearing(garbles={2}, fails={4}), Hearing()
+        with self.assertLogs(PROVIDER, level="INFO") as logs:
+            run = _Run(self, _text(5), checker=small, quick=quick)
+        self.assertIsNone(run.error)
+        self.assertEqual(sorted(small.heard), [2, 4])
+        self.assertEqual([c["attempts"] for c in run.clips()], [1] * 5)  # small heard them right
+        self.assertTrue(any("checked 5 takes" in line and "(2 heard again by Whisper small)" in line
+                            for line in logs.output))
+
+    def test_a_take_both_hearings_fail_is_rejected_and_sent_again(self):
+        quick, small = Hearing(garbles={3}), Hearing(garbles={3})
+        run = _Run(self, _text(4), checker=small, quick=quick)
+        self.assertIsNone(run.error)
+        self.assertEqual([_chunk(item) for item in run.server.calls[1][0]], [3])  # only unit 3 again
+        self.assertGreater(run.clips()[2]["attempts"], 1)
 
 
 class TestOtherEnginesUnchanged(unittest.TestCase):

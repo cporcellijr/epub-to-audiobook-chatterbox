@@ -70,6 +70,36 @@ class SpeechChecker:
 _checker: Optional[SpeechChecker] = None
 _loaded = False
 
+# A quick first hearing for Breeze's batch checks: Whisper tiny.en hears every take, and only a take
+# it doesn't pass at QUICK_PASS_SCORE goes on to Whisper small. On 472 real takes and 790 made-bad
+# ones (wrong words, cut to 60%, a runaway tail of someone else's words), tiny at 0.85 sent 5% of the
+# real takes on and passed none that small rejects; it hears 32 takes in 2.1-5.3 s against small's
+# 11.2-25.3 s (2026-10-05, WORKLOG §55). base.en was slower and passed a runaway tail at every mark.
+# The folder defaults to one beside the main model's; QUICK_MODEL_ENV=off hears everything with small.
+QUICK_MODEL_ENV = "SPEECH_CHECK_QUICK_MODEL"
+QUICK_MODEL_SIZE = "tiny.en"
+QUICK_PASS_SCORE = 0.85
+_quick: Optional[SpeechChecker] = None
+_quick_loaded = False
+
+
+def _load(path: str, size: str, megabytes: int, what: str) -> Optional[SpeechChecker]:
+    """A checker on the Whisper model in `path`, downloaded there first if missing; None (logged) when
+    it can't be loaded."""
+    try:
+        from faster_whisper import WhisperModel
+        if not os.path.isfile(os.path.join(path, "model.bin")):
+            from faster_whisper.utils import download_model
+            logger.info("Downloading the %s model (Whisper %s, about %d MB) to %s", what, size, megabytes, path)
+            download_model(size, output_dir=path)
+        checker = SpeechChecker(WhisperModel(path, device="cpu", compute_type="int8",
+                                             cpu_threads=min(_THREADS, os.cpu_count() or 1), num_workers=WORKERS))
+        logger.info("%s on: Whisper %s from %s", what.capitalize(), size, path)
+        return checker
+    except Exception as error:  # a missing package, a failed download or a bad model file
+        logger.warning("%s off: could not load Whisper from %s (%s)", what.capitalize(), path, error)
+        return None
+
 
 def get() -> Optional[SpeechChecker]:
     """The process's checker, loaded on first use; None when off or unavailable."""
@@ -78,20 +108,34 @@ def get() -> Optional[SpeechChecker]:
         return _checker
     _loaded = True
     path = os.environ.get(MODEL_ENV, "").strip()
-    if not path:
-        return None
-    try:
-        from faster_whisper import WhisperModel
-        if not os.path.isfile(os.path.join(path, "model.bin")):
-            from faster_whisper.utils import download_model
-            logger.info("Downloading the speech-check model (Whisper %s, about 480 MB) to %s", MODEL_SIZE, path)
-            download_model(MODEL_SIZE, output_dir=path)
-        _checker = SpeechChecker(WhisperModel(path, device="cpu", compute_type="int8",
-                                              cpu_threads=min(_THREADS, os.cpu_count() or 1), num_workers=WORKERS))
-        logger.info("Speech check on: Whisper %s from %s", MODEL_SIZE, path)
-    except Exception as error:  # a missing package, a failed download or a bad model file
-        logger.warning("Speech check off: could not load Whisper from %s (%s)", path, error)
+    if path:
+        _checker = _load(path, MODEL_SIZE, 480, "speech check")
     return _checker
+
+
+def get_quick() -> Optional[SpeechChecker]:
+    """The quick first-hearing checker, loaded on first use; None when the speech check is off, the
+    quick hearing is switched off, or the model can't be loaded (then small hears everything)."""
+    global _quick, _quick_loaded
+    if _quick_loaded:
+        return _quick
+    _quick_loaded = True
+    main = os.environ.get(MODEL_ENV, "").strip()
+    path = os.environ.get(QUICK_MODEL_ENV, "").strip()
+    if not main or path.lower() in ("off", "0", "false", "no"):
+        return None
+    path = path or os.path.join(os.path.dirname(os.path.normpath(main)), f"faster-whisper-{QUICK_MODEL_SIZE}")
+    _quick = _load(path, QUICK_MODEL_SIZE, 75, "quick speech check")
+    return _quick
+
+
+def quick_pass(expected: str, heard: Optional[Heard]) -> bool:
+    """Whether the quick hearing settles a take: a close enough transcript, or text no transcript can
+    judge (match() is None whichever model heard it). A failed hearing settles nothing."""
+    if heard is None:
+        return False
+    score = match(expected, heard.text)
+    return score is None or score >= QUICK_PASS_SCORE
 
 
 _ONES = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "

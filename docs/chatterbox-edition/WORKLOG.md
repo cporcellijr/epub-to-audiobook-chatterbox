@@ -3656,3 +3656,102 @@ took 12 s for 2.2 s of audio.
 - **Tests:** three Breeze UI tests now expect plain lines, including a book queued with delivery on.
   The app suite passes, 959 tests with 1 skipped.
 - **Deploy:** waits for an idle queue, since restarting the app mid-book loses the chapter in progress.
+
+## 55. A quick first hearing: Whisper tiny.en, with small only for the takes it doubts (2026-10-05)
+
+### 55.1 Why
+
+After §53 the speech check set the pace of short and medium batches.
+- **Waiting:** generation waited on the checks for 47-62 s a chapter.
+- **CPU:** the checks' 18 Whisper threads slowed Breeze's single-core decode loop by 10-25%.
+
+Whisper encodes a padded 30-second window per take, so a short take costs small almost as much as a
+long one. A smaller model hears faster.
+
+### 55.2 The test (`experiments/breeze-speed/two_stage.py`, `two_stage_thresholds.py`)
+
+- **Real takes:** the 472 saved from §53's bench, from both decoders.
+- **Bad takes, made three ways:**
+  - each take scored against the next line's text in its batch (wrong words, 472);
+  - every third take cut to its first 60% (missing words, 158);
+  - every third take with another take's audio appended (a runaway tail, 158).
+- **Models:** Whisper small (the check), base.en and tiny.en, each heard as Breeze's batch checks
+  hear: 6 workers x 3 threads, beam 1, no word times.
+
+| Model | 32 short | 32 medium | 32 long |
+|---|---|---|---|
+| small | 11.2 s | 13.3 s | 25.3 s |
+| base.en | 4.2 s | 5.5 s | 10.1 s |
+| tiny.en | 2.1 s | 3.1 s | 5.3 s |
+
+In the two-stage check, a take passes if the quick model scores it at least the quick pass mark;
+otherwise small decides. The cost is the real takes sent on to small; the risk is the bad takes
+passed that small alone would reject.
+
+| tiny.en mark | Real takes sent on | Wrong words passed | Cut passed | Tail passed |
+|---|---|---|---|---|
+| 0.70 | 12/472 | 0/472 | 5/19 | 1/142 |
+| 0.80 | 17/472 | 0/472 | 1/19 | 0/142 |
+| **0.85** | **24/472** | **0/472** | **0/19** | **0/142** |
+| 0.95 | 41/472 | 0/472 | 0/19 | 0/142 |
+
+(The second number in each risk column is how many of those takes small itself rejects.)
+
+- **base.en:** passed one runaway tail at every mark up to 1.0, and is twice as slow as tiny.
+- **A weak model is lenient on missing words:** at the app's own 0.70 mark, tiny and base passed 5-6
+  cut takes that small rejects. They fill in the missing words more readily. Hence the stricter
+  quick mark.
+
+### 55.3 Found on the way: the check barely notices a missing ending
+
+Whisper small at 0.70 passed 139 of the 158 takes cut to 60%. A take that loses its last 40% scores
+about 0.75, so it passes. That is unchanged here: catching it would take a length test (a
+too-short take for its text) or a stricter mark, and either means more retries. Worth measuring on
+real cut-off takes before changing anything.
+
+### 55.4 What changed
+
+- **Quick model:** `speech_check.get_quick()` loads Whisper tiny.en (75 MB, downloaded on first use)
+  from `SPEECH_CHECK_QUICK_MODEL`, by default the folder `faster-whisper-tiny.en` beside the main
+  model. `off` hears everything with small, and it is also off when the speech check is.
+- **Pass rule:** `quick_pass` settles a take at `QUICK_PASS_SCORE` (0.85), or when `match()` can't
+  judge the text (digits, no letters). That would happen whichever model heard it.
+- **Breeze's batch checks:** tiny hears every take, then small hears the ones tiny didn't settle. A
+  failed quick hearing counts as doubted. Every rejection is small's. The log line reads
+  `checked 32 takes in 3.1s (2 heard again by Whisper small)`.
+- **The clip map's `match`:** the quick model's score for takes it settled (0.85 or more), small's
+  for the rest.
+- **Unchanged:** voice clip transcripts and voice design still use small with beam search.
+
+### 55.5 Tests and deploy
+
+- **Tests:** the app suite passes, 965 tests with 1 skipped. The 6 new ones cover:
+  - where the quick model is loaded from, and that it downloads itself;
+  - the off switch;
+  - the pass rule;
+  - that settled takes never reach small;
+  - that only doubted takes are heard again, and small decides them;
+  - that a take both hearings reject is sent again.
+- **Deploy:** the app was rebuilt with the queue paused, carrying §54 too. The container's files match
+  the working tree. The live container loads tiny.en from `/app/models/faster-whisper-tiny.en` in
+  0.4 s.
+- **Live (Stranded's last three chapters, 20:07-20:15):**
+
+| Chapter | Audio | Time | Speed | Heard again by small |
+|---|---|---|---|---|
+| TEN | 22.5 min | 2.5 min | 8.94x | 37/411 |
+| ELEVEN | 26.4 min | 3.0 min | 8.89x | 48/503 |
+| TWELVE | 19.9 min | 2.4 min | 8.31x | 34/395 |
+
+  The same book's first chapters ran at 3.3-3.7x (§53.1), and A Tale of Two Nannies at 5.0x on the
+  fast decoder with the old check (§53.8).
+  - **Checks:** 0.10 s per take (0.38-0.43 s with small alone, 0.51-0.62 s before §53). Generation
+    waited on them 0 s per chapter, against 47-62 s, and the GPU generated 82-86% of the time.
+  - **Heard again by small:** about 9%. A cast book has more short dialogue fragments than the test
+    set had.
+  - **Quality:** each chapter's retries (1.2%, 2.9%, 1.8% of units) and takes kept after failing (0, 3,
+    0) sit inside the range of the same book's eight earlier chapters (1.6-4.5%, 0-5). The recorded
+    mean match is 0.980-0.984 against 0.983-0.992, since a settled take records tiny's score.
+- **Next:** with generation the limit again, bigger batches for short and medium lines are the next
+  lever (64 medium lines run at 20x against 12.7x for 32, §53.4), then a per-take length cap for
+  runaway takes.
