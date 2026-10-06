@@ -3,6 +3,7 @@ import base64
 import io
 import threading
 import time
+import types
 import weakref
 
 import numpy as np
@@ -402,6 +403,51 @@ def test_reference_cache_encodes_a_clip_once_until_it_changes(tmp_path):
     cache.clear()
     assert cache("tok", str(clip)) == "codes 3"
     assert encoded == [str(clip)] * 3
+
+
+class FakeTorch:
+    """torch.cuda for cap_gpu_memory: a 12 GiB card, recording the fraction set."""
+
+    def __init__(self, available=True):
+        self.fractions = []
+        cuda = self
+
+        class Cuda:
+            @staticmethod
+            def is_available():
+                return available
+
+            @staticmethod
+            def current_device():
+                return 0
+
+            @staticmethod
+            def get_device_properties(device):
+                return types.SimpleNamespace(total_memory=12 * 2**30)
+
+            @staticmethod
+            def set_per_process_memory_fraction(fraction):
+                cuda.fractions.append(fraction)
+        self.cuda = Cuda
+
+
+
+@pytest.mark.parametrize("env, expected", [(None, [10.5 / 12]), ("9", [9 / 12]), ("20", [1.0]), ("0", [])])
+def test_gpu_memory_cap(monkeypatch, env, expected):
+    if env is None:
+        monkeypatch.delenv("BREEZE_GPU_MEMORY_GB", raising=False)
+    else:
+        monkeypatch.setenv("BREEZE_GPU_MEMORY_GB", env)
+    torch = FakeTorch()
+    server.cap_gpu_memory(torch)
+    assert torch.fractions == pytest.approx(expected)
+
+
+def test_no_gpu_memory_cap_without_cuda(monkeypatch):
+    monkeypatch.delenv("BREEZE_GPU_MEMORY_GB", raising=False)
+    torch = FakeTorch(available=False)
+    server.cap_gpu_memory(torch)
+    assert torch.fractions == []
 
 
 class FakeDepthModel:

@@ -62,11 +62,22 @@ chunk runs until its longest item finishes.
 
 ## Slowdown guard
 
-A chunk of at least 3/4 of `BREEZE_MAX_BATCH` rows, 24 at most, counts as full. When the median speed of the last 4
-full chunks falls under `BREEZE_SLOW_RTF` (1.5x real time), the server unloads and loads the model
-before its next request, logging `slowed down` and the GPU memory before and after. If speed stays
-low, it logs `still slow` and doesn't reload again for 30 minutes. One book on 2026-10-01 ran at a
-median 1.2x for five hours; healthy books never hit the threshold (WORKLOG §48).
+A chunk of at least 3/4 of `BREEZE_MAX_BATCH` rows (24 at most) counts as full. When the median
+speed of the last 4 full chunks falls under `BREEZE_SLOW_RTF` (4x real time), the server unloads
+and loads the model before its next request. It logs `slowed down` and the GPU memory before and
+after. If speed stays low, it logs `still slow` and doesn't reload again for 30 minutes.
+
+- **2026-10-01:** one book ran at a median 1.2x for five hours (WORKLOG §48).
+- **2026-10-05:** one spilled into system RAM and sat at 1.5-2.1x. With the fast depth decoder,
+  healthy books never went under 6.8x (WORKLOG §57).
+
+## GPU memory cap
+
+PyTorch may reserve at most `BREEZE_GPU_MEMORY_GB` (10.5) of the card. Under WSL, a process that grows
+past what Windows lets it keep on the card is not refused. Part of it moves to system RAM, and
+every batch after that runs 5-10x slower. On 2026-10-05 a reserve of 10.8 GB ran at full speed,
+while 11.18 GB spilled 0.53 GB and ran at 1-3x for the rest of the book (WORKLOG §57). Under the cap,
+a chunk that needs more gets PyTorch's own out-of-memory error and is split, like any other.
 
 ## Environment
 
@@ -74,9 +85,10 @@ median 1.2x for five hours; healthy books never hit the threshold (WORKLOG §48)
 | --- | --- |
 | `BREEZE_MODEL_DIR` | `/models/breeze-tts-2` |
 | `BREEZE_VOICES_DIR` | `/voices` |
-| `BREEZE_MAX_BATCH` | `64` (the app sends 64 units of up to 80 characters, else 32; WORKLOG §56) |
+| `BREEZE_MAX_BATCH` | `32` (64 for short units was tried and dropped, WORKLOG §56-57) |
 | `BREEZE_REPO_ID` | `BreezeBlue/Breeze-TTS-2` |
-| `BREEZE_SLOW_RTF` | `1.5` (0 turns the slowdown guard off) |
+| `BREEZE_SLOW_RTF` | `4` (0 turns the slowdown guard off) |
+| `BREEZE_GPU_MEMORY_GB` | `10.5` (0 for no cap) |
 | `BREEZE_FAST_DEPTH` | on (`0` keeps the stock depth decoder) |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True`, set by compose from `BREEZE_CUDA_ALLOC_CONF` (empty turns it off) |
 

@@ -1,5 +1,5 @@
-"""The Breeze path of the OpenAI provider: a chapter's units go to the server in batches of 32 (64 when
-short) with their voice and its transcript (longest text first, directed units apart from plain ones), the checks
+"""The Breeze path of the OpenAI provider: a chapter's units go to the server in batches of 32 with
+their voice and its transcript (longest text first, directed units apart from plain ones), the checks
 of one batch run in a worker thread while the next batch generates, units that fail are sent again
 together with a new seed (the best take is kept), server errors count as failed attempts, and tone
 matching and the clip map work as for Chatterbox. The server is a fake; nothing here talks to a real
@@ -22,9 +22,7 @@ from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import speech_check, tone_match
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK
 from audiobook_generator.tts_providers import openai_tts_provider
-from audiobook_generator.tts_providers.openai_tts_provider import (BREEZE_BATCH_SIZE, BREEZE_SHORT_BATCH_CHARS,
-                                                                    BREEZE_SHORT_BATCH_SIZE, OpenAITTSProvider,
-                                                                    _breeze_batches)
+from audiobook_generator.tts_providers.openai_tts_provider import BREEZE_BATCH_SIZE, OpenAITTSProvider, _breeze_batches
 
 RATE = 24000
 PROVIDER = "audiobook_generator.tts_providers.openai_tts_provider"
@@ -119,12 +117,11 @@ class _Run:
 
 class TestBreezeBatches(unittest.TestCase):
 
-    def test_short_units_go_out_64_at_a_time_in_order(self):
-        self.assertEqual((BREEZE_BATCH_SIZE, BREEZE_SHORT_BATCH_SIZE), (32, 64))
-        self.assertLessEqual(len(_unit_text(0)), BREEZE_SHORT_BATCH_CHARS)
+    def test_units_go_out_in_batches_of_32_in_order(self):
+        self.assertEqual(BREEZE_BATCH_SIZE, 32)
         run = _Run(self, _text(70))
         self.assertIsNone(run.error)
-        self.assertEqual([len(items) for items, _ in run.server.calls], [64, 6])
+        self.assertEqual([len(items) for items, _ in run.server.calls], [32, 32, 6])
         sent = [_chunk(item) for items, _ in run.server.calls for item in items]
         self.assertEqual(sent, list(range(1, 71)))
         # The chapter is assembled in unit order: take n lasts 1000 + n ms.
@@ -192,8 +189,7 @@ class TestBreezeBatchOrder(unittest.TestCase):
 
     def test_a_chapter_of_mixed_lengths_goes_out_longest_first_and_is_assembled_in_unit_order(self):
         extras = [(n * 7) % 11 for n in range(40)]
-        with patch.object(openai_tts_provider, "BREEZE_SHORT_BATCH_SIZE", 32):  # the order, not the size
-            run = _Run(self, " ".join(_sentence(n, extras[n]) for n in range(40)))
+        run = _Run(self, " ".join(_sentence(n, extras[n]) for n in range(40)))
         self.assertIsNone(run.error)
         self.assertEqual([len(items) for items, _ in run.server.calls], [32, 8])
         lengths = [len(item["text"]) for items, _ in run.server.calls for item in items]
@@ -249,20 +245,12 @@ class TestBreezeBatchesFunction(unittest.TestCase):
         self.assertEqual(_breeze_batches([3, 0, 4, 1, 2], items), [[3, 0, 4, 1, 2]])
         self.assertEqual(_breeze_batches(list(range(5)), items), [list(range(5))])
 
-    def test_each_group_is_cut_into_requests_of_32_or_64_by_its_longest_text(self):
-        # lengths 100 down to 31: a request starting above 80 characters takes 32 units, below 64
+    def test_each_group_is_cut_into_requests_of_32(self):
         items = self._items(*[(100 - n, False) for n in range(70)], *[(50, True)] * 33)
         batches = _breeze_batches(list(range(103)), items)
-        self.assertEqual([len(b) for b in batches], [32, 38, 33])
+        self.assertEqual([len(b) for b in batches], [32, 32, 6, 32, 1])
         self.assertEqual(batches[0], list(range(32)))
-        self.assertEqual(batches[1], list(range(32, 70)))
-        self.assertEqual(batches[2], list(range(70, 103)))
-
-    def test_long_units_stay_32_at_a_time(self):
-        items = self._items(*[(BREEZE_SHORT_BATCH_CHARS + 1, False)] * 70)
-        self.assertEqual([len(b) for b in _breeze_batches(list(range(70)), items)], [32, 32, 6])
-        items = self._items(*[(BREEZE_SHORT_BATCH_CHARS, False)] * 70)
-        self.assertEqual([len(b) for b in _breeze_batches(list(range(70)), items)], [64, 6])
+        self.assertEqual(batches[3] + batches[4], list(range(70, 103)))
 
     def test_only_the_pending_units_are_batched(self):
         items = self._items((5, False), (9, False), (7, True), (6, False), (8, True))
@@ -361,8 +349,7 @@ class TestBreezeRetries(unittest.TestCase):
     def test_failed_units_of_a_big_chapter_are_resent_together(self):
         def behave(item, round):
             return AudioSegment.silent(3500, frame_rate=RATE) if _chunk(item) in (1, 40) and round == 1 else None
-        with patch.object(openai_tts_provider, "BREEZE_SHORT_BATCH_SIZE", 32):  # two requests, then the retry
-            run = _Run(self, _text(40), FakeBreeze(behave))
+        run = _Run(self, _text(40), FakeBreeze(behave))
         self.assertIsNone(run.error)
         self.assertEqual([[_chunk(i) for i in items] for items, _ in run.server.calls],
                          [list(range(1, 33)), list(range(33, 41)), [1, 40]])
@@ -432,8 +419,7 @@ class TestBreezeChecksInAThread(unittest.TestCase):
                 if not gate_opened:  # the very first take waits for batch two's request
                     gate_opened.append(second_batch_started.wait(timeout=10))
                 return speech_check.Heard(_unit_text(len(audio) - 1001), [])
-        with patch.object(openai_tts_provider, "BREEZE_SHORT_BATCH_SIZE", 32):  # two requests
-            run = _Run(self, _text(40), Server(), checker=Checker())
+        run = _Run(self, _text(40), Server(), checker=Checker())
         self.assertIsNone(run.error)
         self.assertEqual(gate_opened, [True])
         self.assertEqual(len(checked_in), 40)
@@ -453,8 +439,7 @@ class TestBreezeChecksInAThread(unittest.TestCase):
             def transcribe(self, audio, words=True, beam_size=5):
                 checked.append(1)
                 return speech_check.Heard(_unit_text(len(audio) - 1001), [])
-        with patch.object(openai_tts_provider, "BREEZE_SHORT_BATCH_SIZE", 32):  # three requests
-            run = _Run(self, _text(96), Server(), checker=Checker())
+        run = _Run(self, _text(96), Server(), checker=Checker())
         self.assertIsNone(run.error)
         self.assertEqual(len(ahead), 3)
         self.assertGreaterEqual(ahead[2], 32)  # batch 1 is fully checked before batch 3 is requested

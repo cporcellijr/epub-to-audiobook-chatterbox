@@ -32,12 +32,17 @@ INSTRUCTION_CFG = 4.0  # voice design and direction need guidance; plain cloning
 MAX_TOKENS_CAP = 1500
 CHARS_PER_SECOND = 15  # typical speech; used only to bound runaway generations
 LENGTH_SLACK = 3.0  # allow 3x the expected length, plus 3 s
-SLOW_REAL_TIME = 1.5  # BREEZE_SLOW_RTF; 0 turns the slowdown guard off
+SLOW_REAL_TIME = 4.0  # BREEZE_SLOW_RTF; 0 turns the slowdown guard off
 SLOW_WINDOW = 4  # full batches
 SLOW_RELOAD_COOLDOWN_SECONDS = 1800
-# The app sends up to 64 short units or 32 longer ones per request (WORKLOG §56); BREEZE_MAX_BATCH.
-DEFAULT_MAX_BATCH = 64
+DEFAULT_MAX_BATCH = 32  # BREEZE_MAX_BATCH; 64 was tried and dropped (WORKLOG §56-57)
 FULL_CHUNK = 24  # rows from which a chunk counts as full for the slowdown guard
+# BREEZE_GPU_MEMORY_GB, 0 for no cap: the most PyTorch may reserve. Under WSL a process that grows past
+# what Windows lets it keep on the card (about 11 GB of the 12 GB RTX 4070) isn't refused; part of it
+# moves to system RAM and every batch runs 5-10x slower. On 2026-10-05 a reserve of 10.8 GB ran at full
+# speed and 11.18 GB spilled 0.53 GB and ran at 1-3x real time for the rest of the book (WORKLOG §57).
+# Under the cap a chunk that needs more gets PyTorch's own out-of-memory error, and is split.
+DEFAULT_GPU_MEMORY_GB = 10.5
 
 
 class OutOfMemory(Exception):
@@ -66,6 +71,16 @@ def is_allocator_fault(exc: BaseException) -> bool:
 def restart_process() -> None:
     """Let uvicorn shut down; compose's restart policy (unless-stopped) starts a fresh process."""
     os.kill(os.getpid(), signal.SIGTERM)
+
+
+def cap_gpu_memory(torch) -> None:
+    """Keep PyTorch's reserve under BREEZE_GPU_MEMORY_GB (DEFAULT_GPU_MEMORY_GB) on this device."""
+    gb = float(os.environ.get("BREEZE_GPU_MEMORY_GB") or DEFAULT_GPU_MEMORY_GB)
+    if gb <= 0 or not torch.cuda.is_available():
+        return
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    torch.cuda.set_per_process_memory_fraction(min(1.0, gb * 2**30 / total))
+    log.info("GPU memory cap: %.1f of %.1f GB", min(gb, total / 2**30), total / 2**30)
 
 
 def empty_cuda_cache() -> None:
@@ -106,9 +121,10 @@ class SlowdownGuard:
     """Asks for a model reload when full batches have slowed far below their normal speed.
 
     On 2026-10-01 one book's full batches fell from ~3x real time to a median of 1.2x and stayed
-    there for five hours; the next book, after an unload and load, ran at normal speed again. Over
-    488 healthy full batches the median of 4 in a row never fell under 1.5x; the slow book got
-    there 20 minutes in. If the cause is outside Breeze and a reload doesn't help, the next reload
+    there for five hours; the next book, after an unload and load, ran at normal speed again. Since
+    the fast depth decoder (WORKLOG §53) healthy full batches run near 13x: over 135 of them the
+    median of 4 in a row never fell under 6.8x, while a book spilling into system RAM sat at
+    1.5-2.1x (WORKLOG §57), hence 4x. If the cause is outside Breeze and a reload doesn't help, the next reload
     waits out a cooldown, so a slow GPU doesn't also lose a reload every few batches."""
 
     def __init__(self, threshold: float, full_batch: int, window: int = SLOW_WINDOW,
@@ -208,6 +224,8 @@ class BreezeSynthesizer:
             log.info("downloading %s to %s", self.repo_id, self.model_dir)
             snapshot_download(self.repo_id, local_dir=str(self.model_dir))
         from breeze_infer.runtime import load_runtime, resolve_device, update_generation_config_for_breeze
+        import torch
+        cap_gpu_memory(torch)
         started = time.perf_counter()
         tokenizer, model, audio_tokenizer = load_runtime(
             self.model_dir, device=resolve_device(), attn_implementation="eager")  # a Path; a str fails

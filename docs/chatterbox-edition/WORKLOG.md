@@ -3825,3 +3825,54 @@ in the day).
   - At 32 units with a 2x cap, about 11.4 GB, still at the edge.
 
   Next: smaller requests for the longest units, and a per-take length cap.
+
+## 57. A full book on the new code: a fault, then a spill into system RAM; cap the GPU memory (2026-10-05)
+
+### 57.1 What happened
+
+The owner reran A Tale of Two Nannies from scratch: cast analysis 20:58-21:09, then the book from
+21:10. Breeze had restarted itself at the cast's unload, clearing an earlier allocator fault (§52), as
+designed.
+- **Chapters 1-7:** 2.2-2.5 min each, as fast as §55-56.
+- **21:25, chapter 8:** a request of 64 short units overflowed the card (`device not ready`) and was
+  split 32 + 32. So 64-unit requests do fault; §56's live run of three chapters was too short to see it.
+- **From then on:** full chunks ran at 1-3x real time instead of 8-16x. Chapters 9-12 took 6-15 min
+  each instead of about 2.5. The rolling median of 4 full chunks sat at 1.5-2.1x; in 135 healthy
+  chunks it never went under 6.8x. PyTorch's reserve stayed at 11.18 GB; before the fault it was
+  10.5-10.8 GB.
+- **Windows' counters (`\GPU Process Memory(*)`) during the slump:** the WSL VM held 11.31 GB of the
+  card plus **0.53 GB of shared (system) memory**, with the card at 11.55 of 12 GB. Part of Breeze had
+  been moved into system RAM, and every access to it crossed PCIe.
+- **The desktop is not the cause:** the counters showed `dwm` at 2.25 GB and spacedesk (a tablet used
+  as an extra display) at 0.65 GB. But with Breeze restarted and unloaded, `nvidia-smi` showed
+  245 MiB in use for the whole card; those per-process figures count shared surfaces twice. What
+  matters is Breeze's own size. Under WSL a process doesn't get refused past roughly 11 GB of the
+  card: it gets spilled, which is far worse than a fault.
+- **The slowdown guard never fired:** its threshold was still 1.5x, set in §48 when 3x was normal.
+
+### 57.2 Changes
+
+- **No more 64-unit requests:** back to 32 (`BREEZE_BATCH_SIZE`; server `DEFAULT_MAX_BATCH` and
+  compose 32). §56's gain was within noise, and the 64s added about 0.5 GB to the peak and caused
+  this fault. Graphs are captured up to 32 rows again. The queue estimate (7.5x) stays.
+- **GPU memory cap:** `BREEZE_GPU_MEMORY_GB` (10.5, 0 for none, passed by compose) calls PyTorch's
+  `set_per_process_memory_fraction` before the model loads. 10.5 GB is under the 10.8 GB reserve that
+  ran at full speed today and well under the 11.18 GB that spilled. A chunk that needs more now gets
+  PyTorch's own out-of-memory error and is split by the existing path, with no driver fault and no
+  spill. The batch of a chapter's 32 longest units peaks near 10.4 GB, so it may split now and then.
+- **Slowdown guard at 4x (`SLOW_REAL_TIME`):** between the healthy minimum (6.8x) and the slump
+  (1.5-2.1x). A spill like this one now reloads the model before the next request, which frees and
+  re-places its memory.
+
+### 57.3 Tests and deploy
+
+- **Tests:** the app suite passes, 965 tests with 1 skipped; the batching tests are back to §55's.
+  43 Breeze server tests pass, 5 of them new for the cap (default, value, over the card, off, no CUDA).
+- **Breeze restarted first:** at the owner's go-ahead it was restarted mid-book through
+  `/api/unload`, the §52 restart, since it carried the fault. That also showed the card at 245 MiB.
+- **Deploy:** both containers were then rebuilt mid-book, as the owner asked. The book resumed on its
+  own ("resumes after restart"), skipped chapters 1-12 and redid chapter 13. Breeze logged
+  `GPU memory cap: 10.5 of 12.0 GB` and graphs for 1-32 rows.
+- **Live:** chapter 13 took 3.0 min, model load included, against 6-15 min for chapters 9-12. Its 16
+  full chunks averaged 10.3x real time, and the reserve peaked at 10.09 GB, under the cap. No chunk
+  hit the cap and nothing faulted.

@@ -72,7 +72,9 @@ services:
       - HF_HUB_ENABLE_HF_TRANSFER=1
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - BREEZE_MAX_BATCH=${BREEZE_MAX_BATCH:-64}
+      - BREEZE_MAX_BATCH=${BREEZE_MAX_BATCH:-32}
+      # PyTorch's most GPU memory in GB; past ~11 GB WSL spills into system RAM (breeze/README.md). 0: no cap.
+      - BREEZE_GPU_MEMORY_GB=${BREEZE_GPU_MEMORY_GB:-10.5}
       # Less fragmented GPU memory, so the cache stays near what the model uses instead of spilling
       # into shared system memory under WSL (WORKLOG §51). BREEZE_CUDA_ALLOC_CONF= (empty) turns it off.
       - PYTORCH_CUDA_ALLOC_CONF=${BREEZE_CUDA_ALLOC_CONF-expandable_segments:True}
