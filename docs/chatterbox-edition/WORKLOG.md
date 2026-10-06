@@ -3876,3 +3876,15 @@ designed.
 - **Live:** chapter 13 took 3.0 min, model load included, against 6-15 min for chapters 9-12. Its 16
   full chunks averaged 10.3x real time, and the reserve peaked at 10.09 GB, under the cap. No chunk
   hit the cap and nothing faulted.
+
+## 58. Whisper's per-take log lines at DEBUG (2026-10-06)
+
+faster-whisper logs `Processing audio with duration ...` at INFO for every take it hears: hundreds of
+lines a chapter since §55, which buried the app's own lines. It is the library's logger
+(`faster_whisper`), so `speech_check` adds a filter to it rather than changing the call.
+- **The filter:** it turns the logger's INFO records into DEBUG ones and drops them unless the root
+  logger, set from the job's log level by `setup_logging`, logs DEBUG. Warnings and errors pass
+  unchanged.
+- **Tests:** a new test checks both log levels; the app suite passes, 966 tests with 1 skipped.
+- **Deploy:** waits for an idle queue (Bewitched! is running), since restarting the app mid-book loses
+  the chapter in progress.

@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import tempfile
@@ -46,6 +47,24 @@ class TestMatch(unittest.TestCase):
         self.assertEqual(match("“Mm-hmm.”", "Hmm"), 1.0)  # Whisper's spelling of a clear take
         self.assertLess(match("“Mm-hmm.”", "Do not tell!"), PASS_SCORE)
         self.assertEqual(match("“Kiss me!”", ""), 0)
+
+
+class TestWhisperLog(unittest.TestCase):
+    def test_whispers_per_take_info_lines_go_out_as_debug(self):
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        whisper_log, root = logging.getLogger("faster_whisper"), logging.getLogger()
+        whisper_log.addHandler(handler)
+        self.addCleanup(whisper_log.removeHandler, handler)
+        self.addCleanup(root.setLevel, root.level)
+        root.setLevel(logging.INFO)
+        whisper_log.info("Processing audio with duration %s", "00:07.040")
+        whisper_log.warning("something Whisper means")
+        self.assertEqual([r.levelname for r in records], ["WARNING"])
+        root.setLevel(logging.DEBUG)  # a job queued with log level DEBUG
+        whisper_log.info("Processing audio with duration %s", "00:07.040")
+        self.assertEqual([r.levelname for r in records], ["WARNING", "DEBUG"])
 
 
 class TestQuickPass(unittest.TestCase):

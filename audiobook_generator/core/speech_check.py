@@ -24,6 +24,20 @@ from pydub import AudioSegment
 
 logger = logging.getLogger(__name__)
 
+
+class _WhisperInfoAsDebug(logging.Filter):
+    """faster-whisper logs "Processing audio with duration ..." at INFO for every take it hears, hundreds
+    a chapter; its INFO lines go out as DEBUG, shown only when the app logs at DEBUG."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno != logging.INFO:
+            return True
+        record.levelno, record.levelname = logging.DEBUG, "DEBUG"
+        return logging.getLogger().isEnabledFor(logging.DEBUG)
+
+
+logging.getLogger("faster_whisper").addFilter(_WhisperInfoAsDebug())
+
 MODEL_ENV = "SPEECH_CHECK_MODEL"
 MODEL_SIZE = "small"
 PASS_SCORE = 0.70
