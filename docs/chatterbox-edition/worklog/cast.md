@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62.
 
 ## Where things stand (2026-10-07)
 
@@ -31,7 +31,9 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
 - **What is left is mostly the model's own reading:** long untagged exchanges, and an addressed name
   taken for the speaker ("..., Vic?") (§44.4, §45.2). Most of these errors are the same in every run
   (§61.1). Prompt changes move the rest by about 15 lines in 900 (§45.3), so judge a prompt change
-  over three or more live runs per variant. Teaching the model itself is the next lever (§61.5).
+  over three or more live runs per variant. Teaching the model itself is the next lever: a first
+  trial on a 7B (§62) beat the 14B on the masked set and cut Six Wakes' errors by two-thirds, but
+  stopped naming first-person tellers. The next round's data must cover new characters and the "I".
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -42,6 +44,8 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - a narrator split under two names that both get "I said" votes (§49.4);
   - an editor merge doesn't survive a re-analysis (§30);
   - casts analysed before a narrator fix keep their old narrators until re-analysed (§49.4).
+  - on Apex Prey 3 a chapter-local description ("girl with needle phobia") can swallow the narrator's
+    and another character's lines, depending on small reply differences (§62.3).
 
 ## 13. Multi-voice narration (2026-09-28)
 
@@ -1691,7 +1695,9 @@ for a measured change.
   - Replaying its saved replies on the old code asks a different question at that point (call
     73), so the change took effect there.
 - 980 app tests pass in the container (1 skipped: the private answer-key check).
-- Not deployed yet.
+- Deployed 2026-10-07 with the queue idle (`docker compose up -d --build epub-to-audiobook`). The
+  container's four cast modules match the commit, the UI answers 200, the log shows no errors, and the
+  running module has `_follow_merges`.
 
 ## 61. A masked-tag benchmark and four local models (2026-10-07)
 
@@ -1779,3 +1785,77 @@ Notes with sources are in `finetune_research.md` in the same folder.
 - **Other option.** A fine-tuned encoder (ModernBERT) scored 94.5% on PDNC against 89.8% for
   Llama-3-8B zero-shot, about 1,000 times faster. It chooses among candidate mentions, so it would
   need more pipeline work.
+
+## 62. Teaching the model: a first fine-tuning trial (2026-10-07)
+
+The owner asked to try teaching the local model (§61.5). This is a first trial: what a small amount of
+the library's own data does, measured on the masked-tag set and the three answer-key books.
+
+### 62.1 What was trained
+
+- **Data.** 360 library books were tried, all outside the masked-tag set, the 40 books sampled for
+  it and the four test books; 282 gave examples. In 748 chapters, clean named tags were removed as in
+  §61.2. Each window asks only those lines, in the exact prompt the app sends (the production
+  `build_windows` and `_messages`), and the reply is the JSON the model should give.
+  - 1,944 training examples (5,513 lines) and 83 validation examples from held-out books.
+  - 106 examples over 4,096 tokens were dropped.
+  - PDNC was not used: its licence is unclear (§61.5).
+- **Base model.** Qwen2.5-14B didn't fit for training on the 12 GB card. Qwen2.5 keeps its 152k-token
+  input embedding and output layer unquantized (1.45 GiB each). With the input embedding moved to
+  system RAM the model loaded at 8.1 GiB, but the training loss then found no GPU memory under a
+  10.5 GB cap. The Windows desktop holds about 1.4 GB, and under WSL a process past roughly 11 GB is
+  spilled into system RAM (§57). So the trial trained Qwen2.5-7B-Instruct.
+- **Training.** QLoRA with Unsloth 2026.10.1 in its Docker image: rank 16 on every attention and MLP
+  projection, loss on the reply only, one epoch (230 steps of 8 examples), learning rate 1e-4. It
+  took 66 minutes, with a GPU peak of 6.9 GiB; the loss fell from 0.33 to about 0.06.
+- **Serving for the test.** llama.cpp's server ran Ollama's own GGUF files, with the adapter converted
+  to a GGUF LoRA (Ollama 0.35.1 no longer loads adapters). The same server without the adapter is the
+  control. On it, qwen2.5:14b scores 378 masked lines, against 376 through Ollama (§61.3).
+
+### 62.2 Results
+
+Book scores are wrong lines + unresolved lines.
+
+| Model (llama.cpp server) | Masked lines right (of 600) | Minutes for the set | Apex Prey 3 | Six Wakes | You Like It Darker |
+|---|---|---|---|---|---|
+| qwen2.5:14b (current) | 378 | 24.6 | 31 + 5 | **2** | **85 + 0** |
+| qwen2.5:7b | 323 | 13.2 | 68 + 2 | 46 + 1 | 284 + 64 |
+| qwen2.5:7b, taught | **399** | **9.0** | 86 + 10 | 17 | 257 + 53 |
+
+- **Teaching works for what it was taught.** The taught 7B gained 76 masked lines and passed the
+  14B, with no unusable replies (the untaught 7B had 33). It carried over to real third-person
+  dialogue: Six Wakes' errors fell from 46 to 17.
+- **It unlearned what it wasn't shown.** Every training reply had an empty `characters` list, since
+  all speakers were already in the prompt's known list. The taught model stopped declaring new
+  characters and the "I" alias, so it never named a first-person teller: every Apex Prey 3 chapter's
+  narrator stayed "narrator", and 37 of Polly's lines went to Stuart. You Like It Darker failed the
+  same way.
+- **qwen2.5:14b stays.** The taught 7B is not usable as it is.
+
+### 62.3 Apex Prey 3 is fragile on identity
+
+The 14B control's 31 wrong lines on Apex Prey 3 are mostly one merge: 26 of Polly's and Gemma's
+lines went to "girl with needle phobia". gemma4:12b failed the same way (§61.3). The same code and
+model scored 6 + 4 through Ollama earlier the same day, so a small difference in the model's replies
+decides whether a chapter-local description swallows the narrator. Not investigated yet. It is the
+next code problem on this book, and it makes single Apex Prey 3 runs a poor guide.
+
+### 62.4 The next round (not started)
+
+- **Training data must cover everything the app asks of the model:**
+  - windows where some speakers aren't in the known list yet and must be declared, with gender and
+    aliases;
+  - first-person chapters whose "I" gets named (alias "I");
+  - review prompts (§28);
+  - for the identity, tone and profile prompts, a share of the 14B's own replies, so the taught
+    model keeps those skills.
+- **Training a 14B needs more GPU memory than this card has.** A well-taught 7-8B is attractive
+  anyway: it ran 2.7 times faster than the 14B.
+- **Files.** `data/diagnostics/finetune_2026-10-07/` holds `train_data.py`, `train.py`,
+  `convert_lora.sh`, the examples (book text, outside git), the adapter (`lora/`,
+  `cast-lora-f16.gguf`) and three training checkpoints. The test runs are in
+  `masked_tags_2026-10-07/runs_ft/`.
+- **Kept for a second round** (about 61 GB): the `unsloth/unsloth` image (32.8 GB), the model-cache
+  volume `cast-ft-hf` (15.5 GB), the llama.cpp server image (7 GB) and `qwen2.5:7b` in Ollama
+  (4.7 GB).
+- **The queue** was paused for the GPU work and resumed afterwards.
