@@ -12,8 +12,8 @@ from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import chatterbox_control, engine_gpu
 from audiobook_generator.core import cast_review
-from audiobook_generator.core.cast_llm import ChatClient, Chat, Roster, attribute_chapter, llm_api_key, llm_base_url, \
-    llm_model
+from audiobook_generator.core.cast_llm import CAST_GUIDANCE_VERSION, ChatClient, Chat, Roster, attribute_chapter, \
+    llm_api_key, llm_base_url, llm_model
 from audiobook_generator.core.cast_profiles import ChapterText, describe_book, profile_cast, turn_taking
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK, chapter_segments
 from audiobook_generator.utils.log_handler import setup_logging
@@ -104,6 +104,7 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
         previous = None  # another engine's voices can't be used
     cast = cast_store.new_cast(key, settings["input_file"], parser.get_book_title(), parser.get_book_author(),
                                engine, settings.get("voice"), selection)
+    cast["guidance_version"] = CAST_GUIDANCE_VERSION
     cast_store.save_cast(path, cast)
     roster = Roster()
     stats = cast["stats"]

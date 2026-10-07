@@ -256,11 +256,11 @@ def keeps_speaker(narration: str, speaker: str) -> bool:
     return True
 
 
-def tagged_speakers(paragraphs: List[List[Segment]]) -> Dict[int, str]:
+def tagged_speakers(paragraphs: List[List[Segment]], include_continued: bool = False) -> Dict[int, str]:
     """{line id: name} for every dialogue line whose speaker a speech tag names, plus the untagged
     quotations that continue a named line's speech in a paragraph naming no one else.
-    Lines that continue a quotation from the previous paragraph are left out (the attribution gives
-    them the previous line's speaker)."""
+    Lines that continue a quotation from the previous paragraph are left out unless include_continued
+    requests their explicit tags too, allowing casting to override damaged quotation punctuation."""
     found: Dict[int, str] = {}
     for segments in paragraphs:
         named: Dict[int, str] = {}
@@ -270,12 +270,15 @@ def tagged_speakers(paragraphs: List[List[Segment]]) -> Dict[int, str]:
             if piece.kind == NARRATION:
                 between.append(piece.text)
                 continue
-            if piece.continues:
+            if piece.continues and not include_continued:
                 speaker, between = None, []
                 continue
             before = segments[i - 1].text if i > 0 and segments[i - 1].kind == NARRATION else ""
             after = segments[i + 1].text if i + 1 < len(segments) and segments[i + 1].kind == NARRATION else ""
             after_name, before_name = _tag_after(after), _tag_before(before)
+            if piece.continues and not (after_name or before_name):
+                speaker, between = None, []
+                continue
             if after_name and before_name and after_name.lower() != before_name.lower():
                 speaker = None  # contradictory tags: the model decides
             elif (after_name or before_name) in STANDALONE:

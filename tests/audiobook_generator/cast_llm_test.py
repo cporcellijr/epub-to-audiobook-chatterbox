@@ -934,3 +934,127 @@ class TestQuotedTermsInAChapter(unittest.TestCase):
         self.assertEqual((lines[1], lines[4]), (None, None))
         self.assertEqual((lines[5], lines[6]), ("tom", "tom"))
         self.assertEqual((stats["quoted_terms"], stats["unknown_lines"]), (2, 0))
+
+
+class TestSourceReviewedIdentities(unittest.TestCase):
+    """Regressions from the October 6 source review, with short neutral passages."""
+
+    def roster(self):
+        return Roster({
+            "hee haw": {"name": "Hee Haw", "gender": "male", "age": "adult", "aliases": ["Colin"], "lines": 10},
+            "hee haw 2": {"name": "Hee Haw", "gender": "female", "age": "child", "aliases": ["Alice"], "lines": 1},
+        })
+
+    def test_shared_names_have_distinct_tokens_and_ambiguous_tags_are_asked(self):
+        text = (f'"Enough," she said. "Leave."{M}'
+                f'"No," he said.{M}"Now," Hee Haw barked.')
+        chat = ScriptedChat(_reply({1: "@hee haw 2", 2: "@hee haw 2", 3: "@hee haw", 4: "@hee haw 2"}))
+        roster = self.roster()
+        lines, _ = attribute_chapter(chapter_segments(text), roster, chat, {})
+        self.assertEqual(lines, {1: "hee haw 2", 2: "hee haw 2", 3: "hee haw", 4: "hee haw 2"})
+        self.assertIn("Alice = Hee Haw (female; aliases: Alice)", chat.prompts[0][1]["content"])
+        self.assertIn("[#4]", chat.prompts[0][1]["content"])
+        self.assertEqual(len(roster.characters), 2)
+
+    def test_bare_shared_names_use_a_pronoun_without_inventing_a_character(self):
+        text = f'"Enough," she said.{M}"No," he said.'
+        roster = self.roster()
+        lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(_reply({1: "Hee Haw", 2: "Hee Haw"})), {})
+        self.assertEqual(lines, {1: "hee haw 2", 2: "hee haw"})
+        self.assertEqual(len(roster.characters), 2)
+        self.assertIsNone(roster.speaker_key("Hee Haw"))
+
+    def test_unknown_identity_tokens_do_not_become_characters(self):
+        roster = self.roster()
+        with patch.object(cast_llm_module, "REVIEW_FLAGGED_LINES", False):
+            lines, _ = attribute_chapter(chapter_segments('"Hello."'), roster,
+                                         ScriptedChat(_reply({1: "@invented"})), {})
+        self.assertEqual(lines, {1: None})
+        self.assertEqual(len(roster.characters), 2)
+
+    def test_bad_identity_metadata_does_not_abort_a_cast_or_replace_known_gender(self):
+        roster = self.roster()
+        reply = _reply({1: "@hee haw 2"}, [{"name": "@hee haw", "gender": "female"},
+                                         {"name": "@invented", "gender": "male"}])
+        lines, _ = attribute_chapter(chapter_segments('"Enough," she said.'), roster, ScriptedChat(reply), {})
+        self.assertEqual(lines, {1: "hee haw 2"})
+        self.assertEqual(roster.characters["hee haw"]["gender"], "male")
+        self.assertEqual(len(roster.characters), 2)
+
+    def test_ambiguous_shared_name_metadata_does_not_invent_a_third_person(self):
+        roster = self.roster()
+        reply = _reply({1: "Hee Haw"}, [{"name": "Hee Haw", "gender": "unknown"}])
+        with patch.object(cast_llm_module, "REVIEW_FLAGGED_LINES", False):
+            lines, _ = attribute_chapter(chapter_segments('"Enough."'), roster, ScriptedChat(reply), {})
+        self.assertEqual(lines, {1: None})
+        self.assertEqual(len(roster.characters), 2)
+
+    def test_identity_tokens_preserve_titles_in_keys_and_can_fill_unknown_metadata(self):
+        roster = Roster()
+        man = roster.add("Mr. Smith", "male")
+        woman = roster.add("Mrs. Smith", "female")
+        self.assertEqual(roster.resolve(f"@{woman}"), woman)
+        self.assertNotEqual(roster.resolve(f"@{woman}"), man)
+        unknown = roster.add("Alex")
+        self.assertEqual(roster.add(f"@{unknown}", "female", "adult"), unknown)
+        self.assertEqual(roster.characters[unknown]["gender"], "female")
+        self.assertIn(f"@{woman} = Mrs. Smith (female; aliases: none)", roster.names_for_prompt())
+
+    def test_a_reply_declaring_the_shared_names_identity_keeps_its_unqualified_answers(self):
+        roster = self.roster()
+        text = f'"Enough."{M}"No," he said.'
+        reply = _reply({1: "Hee Haw", 2: "Colin"}, [{"name": "Hee Haw", "gender": "female"}])
+        lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(reply), {})
+        self.assertEqual(lines, {1: "hee haw 2", 2: "hee haw"})
+
+    def test_a_real_name_with_a_quoted_nickname_promotes_a_description(self):
+        text = '“No sir, my real name’s Shirley but everybody calls me ‘Squirrelly’,” she said.'
+        reply = _reply({1: "the girl"}, [{"name": "the girl", "gender": "female", "aliases": ["Shirley", "Squirrelly"]}])
+        roster = Roster()
+        lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(reply), {})
+        key = lines[1]
+        self.assertEqual(roster.characters[key]["name"], "Shirley")
+        self.assertNotIn("reference_scope", roster.characters[key])
+        roster.new_chapter()
+        self.assertEqual(roster.resolve("Squirrelly"), key)
+
+    def test_someone_elses_quoted_introduction_does_not_name_the_outer_speaker(self):
+        text = '“He said ‘My name is Bob,’ and then he left,” she said.'
+        roster = Roster()
+        lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(_reply({1: "the girl"})), {})
+        self.assertEqual(roster.characters[lines[1]]["name"], "the girl")
+        self.assertIsNone(roster.resolve("Bob"))
+
+    def test_a_shared_two_word_self_name_survives_into_the_next_chapter(self):
+        roster = Roster()
+        man = roster.add("Hee Haw", "male", aliases=["Colin"])
+        girl = roster.add("Alice", "female")
+        lines, _ = attribute_chapter(chapter_segments('"I am Hee Haw," she said.'), roster,
+                                     ScriptedChat(_reply({1: "Alice"})), {})
+        self.assertEqual(lines[1], girl)
+        self.assertIn("Hee Haw", roster.characters[girl]["aliases"])
+        roster.new_chapter()
+        self.assertEqual(roster.resolve("Hee Haw", "female"), girl)
+        self.assertEqual(roster.resolve("Hee Haw", "male"), man)
+        self.assertIsNone(roster.resolve("Hee Haw"))
+        chat = ScriptedChat(_reply({1: "Alice"}))
+        lines, _ = attribute_chapter(chapter_segments('"Enough," Hee Haw barked.'), roster, chat, {})
+        self.assertEqual(lines[1], girl)
+        self.assertIn("[#1]", chat.prompts[0][1]["content"])
+
+    def test_generic_descriptions_still_create_distinct_people_in_new_chapters(self):
+        roster = Roster()
+        keys = []
+        for _ in range(3):
+            lines, _ = attribute_chapter(chapter_segments('"Hello," she said.'), roster,
+                                         ScriptedChat(_reply({1: "the girl"}, [{"name": "the girl", "gender": "female"}])), {})
+            keys.append(lines[1])
+        self.assertEqual(len(set(keys)), 3)
+
+    def test_an_explicit_new_speaker_overrides_a_broken_quote(self):
+        text = (f'“Miles, what the he-“ Leon doubled over.{M}'
+                '“Are you listening?”Miles screamed at him.')
+        paragraphs = chapter_segments(text)
+        self.assertTrue(paragraphs[1][0].continues)
+        lines, _ = attribute_chapter(paragraphs, Roster(), ScriptedChat(_reply({1: "Leon"})), {})
+        self.assertEqual(lines, {1: "leon", 2: "miles"})

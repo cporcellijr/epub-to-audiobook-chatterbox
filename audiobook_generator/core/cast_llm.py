@@ -25,7 +25,7 @@ from audiobook_generator.core import cast_review
 from audiobook_generator.core.cast import AGES, GENDERS, display_name, normalize_name, title_gender, titled_name
 from audiobook_generator.core.delivery import MOOD_NORMAL, MOODS, segment_moods
 from audiobook_generator.core.dialogue import DIALOGUE, Segment, split_paragraph
-from audiobook_generator.core.speech_tags import contradicted, first_person_tagged, quoted_terms, tagged_speakers
+from audiobook_generator.core.speech_tags import contradicted, first_person_tagged, quoted_terms, tagged_speakers, tag_pronoun
 
 logger = logging.getLogger(__name__)
 
@@ -121,13 +121,30 @@ def _local_reference(name: str) -> bool:
     words = [word for word in words if word not in _REFERENCE_FILLER]
     return bool(words) and all(word in _LOCAL_REFERENCE_WORDS for word in words)
 
+CAST_GUIDANCE_VERSION = "2026-10-06.1"
+
 PROMPTS = {
     "system": (
         "You identify who speaks each line of dialogue in a passage from a novel. "
-        "Answer with a single JSON object and nothing else: no prose, no markdown fences."
+        "Answer with a single JSON object and nothing else: no prose, no markdown fences.\n"
+        "Character identity guidance:\n"
+        "- Follow the speaker, not the person addressed or merely mentioned. A victim does not speak an attacker's words.\n"
+        "- Reconnect a descriptive speaker to their explicit name or self-introduction when the scene proves it. "
+        "Article changes, supported spelling variations, and shortened titles need not create a new person. "
+        "Do not merge unrelated people or separate stories just because both say 'the girl'.\n"
+        "- Similar or identical names can belong to different people. Known entries marked @key are distinct "
+        "identities: answer with that exact @key, using its name, aliases, gender and scene context to choose. "
+        "Never turn an @key into a new character or an alias.\n"
+        "- 'I said' belongs to the current first-person teller. Establish who that is from the text, "
+        "not a nearby name or a roster guess. 'Phil was my contact' describes another person, not the teller.\n"
+        "- A speech tag between quotations identifies the whole turn. Broken quotation marks do not override "
+        "an explicit change of speaker. Recheck a rejected turn using its surrounding actions and pronouns.\n"
+        "Examples: 'My real name is Shirley; call me Squirrelly' connects those names to that speaker. "
+        "'Toni keeps looking at me,' the boy said, followed by 'Tony keeps looking at me,' his sister said: "
+        "the boy is Tony, the girl Toni; they are separate people. Quoted emphasis is not spoken dialogue."
     ),
     "window": (
-        "Known characters so far (use these exact names when the speaker is one of them):\n"
+        "Known characters so far (answer with the exact name or @key shown here):\n"
         "{roster}\n\n"
         "{narrator}"
         "Passage. Lines to attribute are marked like [#N] in front of the quotation, N being the line's id. "
@@ -139,6 +156,7 @@ PROMPTS = {
         "\"characters\": [{{\"name\": \"Full Name\", \"gender\": \"female|male|unknown\", "
         "\"age\": \"child|adult|elderly|unknown\", \"aliases\": [\"other names used for this person\"]}}]}}\n"
         "Rules:\n"
+        "- an entry '@key = Name (...)' must be answered as '@key', not the shared name;\n"
         "- give every marked id exactly one speaker, using the ids from the passage and no others;\n"
         "- a first-person tag such as \"I say\" belongs to the narrator; an \"I\" inside a quotation alone "
         "does not identify the narrator;\n"
@@ -155,7 +173,7 @@ PROMPTS = {
         "Ids to answer: {ids}"
     ),
     "review": (
-        "Known characters (use these exact names when the speaker is one of them):\n"
+        "Known characters (answer with the exact name or @key shown here):\n"
         "{roster}\n"
         "{narrator}\n"
         "Passage. An earlier pass could not settle the lines marked [#N] (N is the line's id): it left them "
@@ -555,8 +573,49 @@ class Roster:
         return key
 
     def names_for_prompt(self) -> List[str]:
-        return [c["name"] for key, c in sorted(self.characters.items(), key=lambda kv: -kv[1].get("lines", 0))
-                if key not in self._anonymous_narrators or key == self.chapter_narrator]
+        names = []
+        for key, character in sorted(self.characters.items(), key=lambda kv: -kv[1].get("lines", 0)):
+            if key in self._anonymous_narrators and key != self.chapter_narrator:
+                continue
+            name = self.prompt_name(key)
+            if name != character["name"] or any(len(self._named_keys(a)) > 1 for a in character.get("aliases", [])):
+                aliases = ", ".join(character.get("aliases", [])) or "none"
+                name += f" = {character['name']} ({self._gender(key)}; aliases: {aliases})"
+            names.append(name)
+        return names
+
+    def prompt_name(self, key: str) -> str:
+        """Disambiguate shared display names with a proven unique alias, else a stable token."""
+        name = self.characters[key]["name"]
+        duplicate = sum(k not in self._anonymous_narrators or k == self.chapter_narrator
+                        for k in self._named_keys(name)) > 1
+        if duplicate:
+            for alias in self.characters[key].get("aliases", []):
+                if (normalize_name(alias) != normalize_name(name) and usable_alias(alias)
+                        and not _local_reference(alias) and not family_word(alias) and self.resolve(alias) == key):
+                    return alias
+            return f"@{key}"
+        return name
+
+    def _named_keys(self, name: str) -> List[str]:
+        norm = normalize_name(name)
+        return [k for k, c in self.characters.items()
+                if any(normalize_name(n) == norm for n in [c["name"], *c.get("aliases", [])])]
+
+    def speaker_key(self, name: str, gender: str = "unknown", declared: Optional[Dict[str, Optional[str]]] = None) -> Optional[str]:
+        """Use explicit identity tokens; leave an ambiguous bare display name for review."""
+        if name.strip().startswith("@"):
+            return self.resolve(name, gender)
+        if _local_reference(name):
+            return self.add(name)  # a generic description is still scoped to this chapter
+        candidates = self._named_keys(name)
+        if len(candidates) > 1:
+            compatible = [k for k in candidates if "unknown" in (gender, self._gender(k)) or gender == self._gender(k)]
+            if len(compatible) == 1:
+                return compatible[0]
+            chosen = (declared or {}).get(normalize_name(name))
+            return chosen if chosen in compatible else None
+        return self.add(name)
 
     def _gender(self, key: str) -> str:
         """A character's recorded gender, else the one its name's title says."""
@@ -610,6 +669,9 @@ class Roster:
         norm = normalize_name(name)
         if not norm:
             return None
+        if name.strip().startswith("@"):
+            key = self.canonical_key(" ".join(name.strip()[1:].lower().split()))
+            return key if key in self.characters and ("unknown" in (gender, self._gender(key)) or gender == self._gender(key)) else None
         if norm in _NARRATOR_REFERENCES:
             return self.chapter_aliases.get(norm) or self.chapter_narrator
         reference = _reference_key(name)
@@ -628,6 +690,10 @@ class Roster:
                 return key
         if norm in self.chapter_aliases:  # this chapter's "Mom" before anyone else's
             return self.chapter_aliases[norm]
+        shared = self._named_keys(name)
+        if len(shared) > 1:
+            compatible = [k for k in shared if "unknown" in (gender, self._gender(k)) or gender == self._gender(k)]
+            return compatible[0] if len(compatible) == 1 else None
         if norm in self.aliases:
             key = self.aliases[norm]
             if "unknown" in (gender, self._gender(key)) or gender == self._gender(key):
@@ -649,6 +715,17 @@ class Roster:
 
     def add(self, name: str, gender: str = "unknown", age: str = "unknown", aliases: Optional[List[str]] = None) -> str:
         """Register a character (or merge into the one this name refers to); returns its key."""
+        if name.strip().startswith("@"):
+            key = self.resolve(name, gender)
+            if key is None:
+                raise AttributionError(f"unknown or incompatible character key: {name}")
+            character = self.characters[key]
+            for field, value, allowed in (("gender", gender, GENDERS), ("age", age, AGES)):
+                if value in allowed and value != "unknown" and character.get(field, "unknown") == "unknown":
+                    character[field] = value
+            for alias in aliases or []:
+                self._alias(key, alias)
+            return key
         if normalize_name(name) in _NARRATOR_REFERENCES:
             key = self.resolve(name)
             if key is None:
@@ -725,7 +802,7 @@ class Roster:
     def _alias(self, key: str, alias: str) -> None:
         key = self.canonical_key(key)
         norm = normalize_name(alias)
-        if not norm:
+        if not norm or alias.strip().startswith("@"):
             return
         reference = _reference_key(alias)
         if _local_reference(alias):
@@ -789,11 +866,38 @@ class Roster:
 
 # ---- attribution ----
 
+def _register_characters(roster: Roster, characters: List[dict]) -> Dict[str, Optional[str]]:
+    """Preserve the identity explicitly declared in this reply, including a shared name's gender."""
+    declared = {}
+    for character in characters:
+        if len(roster._named_keys(character["name"])) > 1 and roster.resolve(character["name"], character["gender"]) is None:
+            logger.warning("Cast: ignored ambiguous character metadata for %s", character["name"])
+            declared[normalize_name(character["name"])] = None
+            continue
+        if character["name"].strip().startswith("@") and roster.resolve(character["name"], character["gender"]) is None:
+            logger.warning("Cast: ignored unknown or incompatible character metadata for %s", character["name"])
+            continue
+        key = roster.add(character["name"], character["gender"], character["age"], character["aliases"])
+        name = normalize_name(character["name"])
+        declared[name] = key if name not in declared or declared[name] == key else None
+    return declared
+
+def _tag_genders(paragraphs: List[List[Segment]]) -> Dict[int, str]:
+    genders = {}
+    for paragraph in paragraphs:
+        for i, piece in enumerate(paragraph):
+            if piece.kind != DIALOGUE:
+                continue
+            before = paragraph[i-1].text if i and paragraph[i-1].kind != DIALOGUE else ""
+            after = paragraph[i+1].text if i+1 < len(paragraph) and paragraph[i+1].kind != DIALOGUE else ""
+            genders[piece.line_id] = {"he": "male", "she": "female"}.get(tag_pronoun(before, after), "unknown")
+    return genders
+
 def _narrator_prompt(roster: Roster) -> str:
     key = roster.chapter_narrator
     if not key or key not in roster.characters:
         return ""
-    name = roster.characters[key]["name"]
+    name = roster.prompt_name(key)
     aliases = sorted(alias for alias, owner in roster.chapter_aliases.items()
                      if owner == key and alias not in _NARRATOR_REFERENCES)
     suffix = f" (aliases: {', '.join(aliases)})" if aliases else ""
@@ -814,13 +918,14 @@ def _messages(window: Window, roster: Roster) -> List[dict]:
 
 
 # A speaker naming themselves: "please call me Lena", "you can call me Ann", "my name is Tom".
-_SELF_NAMED = re.compile(r"(?:^|[.!?]\s+)(?:[Aa]nd\s+)?(?:[Pp]lease,?\s+)?(?:[Yy]ou (?:can|may)\s+|[Jj]ust\s+)?"
-                         r"(?:[Cc]all me|[Mm]y name is|[Mm]y name['’]s|[Tt]he name['’]s)\s+"
-                         r"((?:(?:Mrs?|Ms|Miss|Dr)\.?\s+)?[A-Z][\w'’-]+)")
+_INTRO_NAME = r"((?:(?:Mrs?|Ms|Miss|Dr)\.?\s+)?[A-Z][\w'’-]+(?:\s+[A-Z][\w'’-]+){0,2})"
+_SELF_NAMED = re.compile(r"(?:^|[.!?,;]\s+)(?:[Aa]nd\s+)?(?:[Pp]lease,?\s+)?(?:[Yy]ou (?:can|may)\s+|[Jj]ust\s+)?"
+                         r"(?:[Cc]all me|[Mm]y (?:real )?name is|[Mm]y (?:real )?name['’]s|[Tt]he name['’]s)\s+"
+                         + _INTRO_NAME)
 
 
 _ASKS_NAME = re.compile(r"your name|who are you|what do (?:they|people|we|you|folks) call you", re.I)
-_I_AM = re.compile(r"(?:I['’]m|I am)\s+([A-Z][\w'’-]+)")
+_I_AM = re.compile(r"(?:I['’]m|I am)\s+" + _INTRO_NAME)
 _BARE_NAME = re.compile(r"[A-Z][\w'’]+")
 
 
@@ -853,9 +958,9 @@ def _same_as(paragraphs: List[List[Segment]], result: Dict[int, Optional[str]], 
                   and ("unknown" in (gender, roster._gender(k)) or gender == roster._gender(k))]
     if not candidates:
         return None
-    shown = {i: roster.characters[k]["name"] for i, k in result.items() if k in roster.characters and i < line.line_id}
+    shown = {i: roster.prompt_name(k) for i, k in result.items() if k in roster.characters and i < line.line_id}
     passage = cast_review.render(paragraphs, start, where + 1, [], shown, {})
-    names = [roster.characters[k]["name"] for k in candidates]
+    names = [roster.prompt_name(k) for k in candidates]
     messages = [{"role": "system", "content": PROMPTS["system"]},
                 {"role": "user", "content": PROMPTS["identity"].format(
                     passage=passage, line=line.text.strip("“”\" "), name=name, candidates=", ".join(names))}]
@@ -892,11 +997,13 @@ def merge_self_introductions(paragraphs: List[List[Segment]], result: Dict[int, 
             if text and text[-1] in closers:
                 text = text[:-1]
         text = text.strip()
-        # ponytail: mixed quoted introductions stay unmerged; ask the model if these matter later.
-        if any(kind == DIALOGUE for style in ("single", "double")
-               for kind, _ in split_paragraph(text, style)[0]):
+        # Names inside quoted speech within this speaker's turn belong to the quoted person.
+        plain = text
+        for style in ("single", "double"):
+            plain = " ".join(part for kind, part in split_paragraph(plain, style)[0] if kind != DIALOGUE)
+        names = [match.group(1) for match in _SELF_NAMED.finditer(plain)]
+        if not names and plain != text:
             continue
-        names = [match.group(1) for match in _SELF_NAMED.finditer(text)]
         previous = dialogue[n - 1] if n else None
         if (previous and result.get(previous.line_id) not in (None, speaker)
                 and _ASKS_NAME.search(previous.text) and _bare_name(text)):
@@ -911,11 +1018,18 @@ def merge_self_introductions(paragraphs: List[List[Segment]], result: Dict[int, 
             # their own to keep: the name they give wins, even when it is someone met earlier.
             nameless = (roster.is_scoped_narrator(speaker)
                         or roster.characters[speaker].get("reference_scope") == "chapter")
+            if nameless and other == speaker:
+                roster.name_reference(speaker, name)
+                continue
             if other is None:
                 if nameless:
                     roster.name_reference(speaker, name)  # "Rob's companion" is Dex from now on
                 else:
                     roster._alias(speaker, name)
+                    # Only a direct self-identification can prove that an occupied name is shared.
+                    if roster._named_keys(name) and normalize_name(name) not in {
+                            normalize_name(a) for a in roster.characters[speaker]["aliases"]}:
+                        roster.characters[speaker]["aliases"].append(display_name(name))
                 continue
             if nameless and other != speaker:
                 other, speaker = speaker, other
@@ -962,9 +1076,10 @@ def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str
         narrator_line = (PROMPTS["narrator_unnamed"].format(name=name) if normalize_name(name) == "i"
                          else PROMPTS["narrator"].format(name=name, aliases=""))
     names = roster.names_for_prompt()
+    genders = _tag_genders(paragraphs)
     for start, end, ids in cast_review.groups(paragraphs, list(flags)):
-        certain = {i: roster.characters[result[i]]["name"] if result.get(i) else anchors[i] for i in anchors}
-        guessed = {i: roster.characters[key]["name"] for i, key in result.items()
+        certain = {i: roster.prompt_name(result[i]) if result.get(i) else anchors[i] for i in anchors}
+        guessed = {i: roster.prompt_name(key) for i, key in result.items()
                    if key and i not in anchors and i not in ids}
         passage = cast_review.render(paragraphs, start, end, ids, certain, guessed)
         messages = [
@@ -982,12 +1097,13 @@ def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str
             stats["review_unusable"] = stats.get("review_unusable", 0) + 1
             log.warning(f"Cast{label}: review of lines {ids} unusable ({e}); first answers kept")
             continue
-        for character in characters:
-            roster.add(character["name"], character["gender"], character["age"], character["aliases"])
+        declared = _register_characters(roster, characters)
         changed = []
         for line_id in ids:
             if speakers.get(line_id):
-                key = roster.add(speakers[line_id])
+                key = roster.speaker_key(speakers[line_id], genders.get(line_id, "unknown"), declared)
+                if key is None:
+                    continue
                 broken = cast_review.hard_violation(paragraphs, line_id, key, roster.characters, narrator_key)
                 if broken:
                     stats["review_rejected"] = stats.get("review_rejected", 0) + 1
@@ -1031,7 +1147,12 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
     for field in ("windows", "invalid_json", "invalid_after_retry", "lines", "tagged_lines", "unknown_lines", "quoted_terms"):
         stats.setdefault(field, 0)
     stats.setdefault("seconds", 0.0)
-    anchors = tagged_speakers(paragraphs)
+    anchors = tagged_speakers(paragraphs, include_continued=True)
+    # An explicit speech tag takes precedence over damaged quotation punctuation.
+    paragraphs = [[s._replace(continues=False) if s.line_id in anchors else s for s in p] for p in paragraphs]
+    genders = _tag_genders(paragraphs)
+    anchors = {i: name for i, name in anchors.items()
+               if len(roster._named_keys(name)) < 2}
     narrator_name = roster.characters[roster.chapter_narrator]["name"] if roster.chapter_narrator else "I"
     contradictions = set(contradicted(paragraphs))
     for line_id in first_person_tagged(paragraphs):
@@ -1047,7 +1168,7 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
     def known_now() -> Dict[int, str]:
         """Tag names, overridden by the display name of whoever each decided line resolved to."""
         known = dict(anchors)
-        known.update({line_id: roster.characters[key]["name"] for line_id, key in result.items() if key})
+        known.update({line_id: roster.prompt_name(key) for line_id, key in result.items() if key})
         return known
 
     for number, window in enumerate(windows, 1):
@@ -1070,27 +1191,27 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
         if speakers is None:
             speakers = {line_id: None for line_id in window.ids}
             window_moods = {}
-        for character in characters:
-            roster.add(character["name"], character["gender"], character["age"], character["aliases"])
+        declared = _register_characters(roster, characters)
         for line_id, key in result.items():
             if key:
                 result[line_id] = roster.canonical_key(key)
         for line_id in window.ids:
             name = speakers.get(line_id)
-            key = roster.add(name) if name else None
+            key = roster.speaker_key(name, genders.get(line_id, "unknown"), declared) if name else None
             result[line_id] = key
         if ASK_LLM_FOR_MOODS:  # rules-only means rules only, even if a reply volunteers moods
             llm_moods.update(window_moods)
         # Tag names resolve after the model's character list, so "Mother" can land on the
         # character the model gave that alias instead of becoming a character of its own.
         for line_id in window.anchored:
-            result[line_id] = roster.add(anchors[line_id])
+            result[line_id] = roster.speaker_key(anchors[line_id], genders.get(line_id, "unknown"))
         for line_id in window.continued:
             result[line_id] = result.get(line_id - 1)
         log.info(f"Cast{label}: window {number}/{len(windows)} done, {len(roster.characters)} characters so far")
     for line_id, name in anchors.items():  # tagged lines in stretches that needed no window
         if line_id not in result:
-            result[line_id] = roster.add(name)
+            result[line_id] = roster.speaker_key(name, genders.get(line_id, "unknown"))
+    anchors = {i: name for i, name in anchors.items() if result.get(i)}
     all_lines = [s for p in paragraphs for s in p if s.kind == DIALOGUE]
     merge_self_introductions(paragraphs, result, roster, stats, log, label, chat)
     if REVIEW_FLAGGED_LINES:

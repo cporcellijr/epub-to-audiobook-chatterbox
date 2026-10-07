@@ -3889,3 +3889,90 @@ lines a chapter since §55, which buried the app's own lines. It is the library'
 - **The app's own per-unit line too:** `Clip chapter-N_..._chunk_K_of_M: chapter a-b s, seed=...` is
   now DEBUG. That is one line per unit, and the clip map (`.clips.json`) keeps the same facts.
 - **Deploy:** the owner stopped Bewitched! for it.
+
+## 59. Reviewed identity guidance for future casts (2026-10-06)
+
+The owner paused the queue and asked to wire the reviewed books' right/wrong examples into future
+casting, with attention to first-person stories, long exchanges and collections. The review retained
+54 source-verified examples from 23 books (33 right, 21 wrong), after screening 60 casts. These are
+historical outcomes across revisions, not an accuracy score for current code. The compact examples,
+chapter hashes and diagnostics stay in `data/diagnostics/cast-learning-audit-2026-10-06/`, outside Git.
+
+### 59.1 What runs on future books
+
+- **Shared guidance in `cast_llm.PROMPTS`:** first attribution, review and identity questions receive
+  the same compact lessons: follow the speaker rather than an addressee, connect a description only
+  to a proved name, keep different people with similar/shared names separate, establish the current
+  first-person teller from the source, and respect whole turns and explicit speaker changes.
+  This is curated prompt guidance; processing more books does not update Ollama's weights or
+  automatically approve its own guesses. The diagnostic Markdown is supporting evidence, not a
+  file the runtime silently reads.
+- **Shared names:** the known roster and attributed context use a proved unique proper alias when
+  possible (`Colin = Hee Haw`, `Alice = Hee Haw`), otherwise an explicit `@key`. Source pronouns or
+  the reply's unambiguous gender declaration can resolve a shared bare name; otherwise it stays
+  unresolved for review. An ambiguous named tag is asked instead of anchored to the first owner.
+  Unknown/incompatible tokens and ambiguous metadata cannot manufacture another character.
+- **Self-introductions:** literal introductions retain full names and supported nicknames even when
+  the nickname is quoted. A name quoted as someone else's introduction cannot rename the outer
+  speaker. A description promoted to a proved name survives the next chapter, and a literal shared
+  self-name is retained without overwriting its first owner's alias lookup.
+- **Broken quotes:** an explicit speech tag on a continuation overrides damaged quote punctuation
+  in attribution. The existing default of `tagged_speakers` stays available to other callers.
+- **First person and collections:** the tone prompt distinguishes a teller from `my contact` or
+  `my sister`, keeping the narrator checks of §44-49. The live collection smoke test found a
+  separate bug: story comparisons treated both chapters' `the girl` labels as shared people.
+  `_chapter_cast` now excludes anonymous and chapter-local descriptions from that comparison,
+  using the existing `_is_description` helper. Distinct stories keep their narrators and girls.
+- **Version:** new cast files record `guidance_version: 2026-10-06.1`. Existing casts are untouched.
+  Broad rechecking of every untagged exchange remains off: §45/49 measured regressions from it.
+
+### 59.2 Validation
+
+- **227 regression checks pass in the app container, no skips:** attribution, full cast analysis,
+  profiles/narrators, speech tags, review and final voice routing. The collection regression fails
+  against the old deployed code and passes with the change.
+- **Focused live tests, three runs of each variant:** use the real configured `qwen2.5:14b` through
+  production attribution, with recorded requests/replies and exact source chapter hashes. Six
+  passages score **30/43 before and 43/43 after in every run**. Proven aliases may keep their
+  canonical spelling; distinct seeded identities must retain their exact keys.
+
+  | Passage | Before | After | What is checked |
+  | --- | ---: | ---: | --- |
+  | Hee Haw | 5/16 | 16/16 | Two established identities with the same display name |
+  | Showering With Jennifer | 3/3 | 3/3 | First-person teller and another speaker |
+  | Three Little Pigs | 3/3 | 3/3 | One identity under Shirley/Squirrelly; source name promotion |
+  | Bewitched! | 15/15 | 15/15 | First-person conversation with Valerie, interrupted turns |
+  | Glass Children | 3/4 | 4/4 | Separate Tony and Toni |
+  | Depths of Desire | 1/2 | 2/2 | Explicit new speaker despite broken quotation marks |
+
+  Hee Haw's two identities and the first-person tellers are seeded from independently reviewed
+  source evidence. These scores test attribution with that evidence available, not whole-book
+  narrator discovery or accuracy across the library. Bewitched!'s supplied narrator is Bob Masters,
+  established by a different chapter, rather than its saved cast's mistaken Phil identity.
+- **Full-pipeline live smoke tests:** two temporary invented EPUBs run through `analyse_book`, tone,
+  narrator reconciliation, turn following and profiles. A shared-name introduction survives the
+  next chapter; a two-story first-person collection keeps separate narrators and separate unnamed
+  girls. Both finish with no review issues. Temporary EPUBs and cast files are removed; no audio is
+  generated and no old book is recast.
+- **Broader fixture, three live runs per variant:** the existing six invented passages (329 lines)
+  score **268, 268, 266 before; 270, 270, 270 after**, keeping the original scorer: 802/987 versus
+  810/987 across repeated runs. Lighthouse and Salt Road improve; Ferry, Winter Market and Night
+  Shift lose 1-3 correct lines per run. The scorer also penalises descriptive identities for its
+  `unknown` labels; its original scoring is retained for an honest comparison. Long untagged
+  exchanges still have errors, and these focused changes do not establish a general accuracy gain.
+
+### 59.3 Deployment and retained evidence
+
+The app image was rebuilt with the changed attribution, narrator and speech-tag files; all four
+SHA-256 hashes match the tested source. The model digest used for the comparisons is
+`7cdf5a0187d5c58cc5d369b255592f7841d1c4696d45a8c8a9489440385b22f6`.
+Live test drivers, requests/replies and scores remain in the diagnostic folder as reusable checks
+for future guidance changes. All 60 original cast fingerprints still match the review's coverage
+file. The queue remains paused.
+
+Only `epub-to-audiobook` was recreated (`docker compose up -d --no-deps epub-to-audiobook`). The
+running image is `sha256:854d095123678e315fe68a45eb894f86b0d2130df8c5ff7b382eddde98d90f5f`;
+the running module reports the guidance version and matches all four source hashes. The UI returns
+HTTP 200, the queue is still paused with no preparation in progress, and all 60 original cast
+fingerprints still match after deployment. The test LLM was unloaded through the existing GPU
+handover helper.

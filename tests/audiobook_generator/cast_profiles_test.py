@@ -612,6 +612,17 @@ class TestChapterNarrators(unittest.TestCase):
                          sorted({"elgin", "mabel", "dora", narrators[2]}))
         self.assertEqual(cast["book_tone"]["pov_key"], "oliver")
 
+    def test_generic_descriptions_do_not_connect_unrelated_stories(self):
+        cast, chapters = self._collection("The girl waited beside me. ")
+        for number in (1, 2):
+            chapters[number - 1] = _story(number, _FIRST_PERSON + M + "The girl waited beside me.", dict(self.FIRST))
+        for key in ("the girl", "the girl 2"):
+            cast["characters"][key] = {"name": "The girl", "aliases": [], "gender": "female",
+                                        "age": "unknown", "lines": 1, "reference_scope": "chapter"}
+        apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+        self.assertEqual([cast["chapters"][f"h{n}"]["narrator"] for n in (1, 2)], ["oliver", "oliver"])
+        self.assertNotEqual(cast["chapters"]["h3"]["narrator"], "oliver")
+
     def test_neighbouring_stories_that_never_name_their_i_keep_their_own_unnamed_narrators(self):
         keys = ["narrator", "narrator 2", "narrator 3"]
         cast = self._anonymous_cast(keys, (1, 2, 3))

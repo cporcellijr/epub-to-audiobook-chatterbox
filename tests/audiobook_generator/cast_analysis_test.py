@@ -85,6 +85,8 @@ class TestAnalyseBook(unittest.TestCase):
         for _, text in chapters:
             self.assertIn(hashlib.sha1(text.encode("utf-8")).hexdigest(), cast["chapters"])
         saved = cast_store.load_cast(self.settings["cast_file"])
+        from audiobook_generator.core.cast_llm import CAST_GUIDANCE_VERSION
+        self.assertEqual(saved["guidance_version"], CAST_GUIDANCE_VERSION)
         self.assertEqual(saved["chapters"], cast["chapters"])
         self.assertEqual(saved["stats"]["lines"], 5)
         self.assertEqual(len(chat.prompts), 3)  # two windows, then the book-tone request (left unanswered)

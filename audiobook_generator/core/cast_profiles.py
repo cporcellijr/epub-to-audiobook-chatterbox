@@ -392,6 +392,9 @@ TONE_PROMPTS = {
         "- use only what the excerpts show; if you recognise the book, add nothing from elsewhere;\n"
         "- pov_character: in a first-person book, the name of the character who says \"I\" (as written in the "
         "list above when they are in it); otherwise \"\";\n"
+        "- a person described as 'my contact', 'my sister', or someone I talk to is not thereby the teller. "
+        "Use a self-introduction or other direct evidence to name the teller; leave the name empty when the "
+        "excerpts do not establish it.\n"
         "- tone: 3 to 6 words on the mood of the writing;\n"
         "- pace: how quickly the prose moves; intensity: how emotionally heightened the narration is;\n"
         "- narrator_gender: in a first-person book, the gender of the character who says \"I\"; otherwise "
@@ -590,7 +593,8 @@ def _chapter_cast(chapter: ChapterText, characters: Dict[str, dict], speakers: b
         pattern = _mention_pattern(character)
         if pattern and pattern.search(text):
             present.add(key)
-    return {key for key in present if characters[key].get("name") != ANONYMOUS_NARRATOR}
+    # Chapter-local labels such as "the girl" cannot connect two stories' casts.
+    return {key for key in present if not _is_description(characters[key])}
 
 
 NARRATED_I_MAX = 4  # narration paragraphs of a chapter that may name its own "I" (see could_say_i)
