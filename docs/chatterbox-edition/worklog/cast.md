@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63.
 
 ## Where things stand (2026-10-07)
 
@@ -31,9 +31,10 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
 - **What is left is mostly the model's own reading:** long untagged exchanges, and an addressed name
   taken for the speaker ("..., Vic?") (§44.4, §45.2). Most of these errors are the same in every run
   (§61.1). Prompt changes move the rest by about 15 lines in 900 (§45.3), so judge a prompt change
-  over three or more live runs per variant. Teaching the model itself is the next lever: a first
-  trial on a 7B (§62) beat the 14B on the masked set and cut Six Wakes' errors by two-thirds, but
-  stopped naming first-person tellers. The next round's data must cover new characters and the "I".
+  over three or more live runs per variant. Teaching the model is the next lever. A 7B taught from
+  the 14B's own answers, with the masked lines corrected (§63), matched the 14B at twice the
+  speed: better on the masked set and You Like It Darker, worse on Apex Prey 3. Not yet a clear
+  enough win to switch; the 14B can't be trained on this card (§62-§63).
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -1859,3 +1860,63 @@ next code problem on this book, and it makes single Apex Prey 3 runs a poor guid
   volume `cast-ft-hf` (15.5 GB), the llama.cpp server image (7 GB) and `qwen2.5:7b` in Ollama
   (4.7 GB).
 - **The queue** was paused for the GPU work and resumed afterwards.
+
+## 63. Teaching round two: the 14B's own answers, corrected (2026-10-07)
+
+Round one (§62) taught the 7B with hand-built answers whose character lists were always empty, and it
+lost first-person narrators. Round two teaches it from the 14B's real answers.
+
+### 63.1 What changed
+
+- **14B training, tried again on a headless card.** With the monitor, keyboard and mouse unplugged,
+  Windows' shell still holds about 1.1 GiB of the card. Unsloth's loss check sees no free memory under
+  WSL, so it was overridden (`UNSLOTH_CE_LOSS_TARGET_GB=0.5`). The 14B then still ran out by 136 MiB,
+  at both 4,096 and 3,072 tokens. It needs a bigger card.
+- **The data.** The 14B ran the production analysis (Ollama, the deployed code, profiles skipped) on
+  137 masked chapters of 76 training books: 12,079 lines, 1,384 of them masked. Its own requests and
+  replies are the examples: attribution windows, reviews, and identity and tone questions.
+  - Each masked line's answer is replaced by its tag's name, in the form the prompt's known list
+    gives. A true speaker missing from the list was declared as a new character (30 times).
+  - The 14B had 750 of 1,375 masked window lines right; 643 answers were corrected.
+  - 4 replies with the wrong line ids were dropped.
+  - That left 677 training and 65 validation examples.
+- **Training.** The 7B, with §62's settings and two epochs (170 steps): 44 minutes.
+
+### 63.2 Results (llama.cpp server, one run each)
+
+Book scores are wrong lines + unresolved lines.
+
+| Model | Masked lines right (of 600) | Minutes for the set | Apex Prey 3 | Six Wakes | You Like It Darker |
+|---|---|---|---|---|---|
+| qwen2.5:14b (current) | 378 | 24.6 | **31 + 5** | **2** | 85 + 0 |
+| qwen2.5:7b, round one | **399** | 9.0 | 86 + 10 | 17 | 245 + 53 |
+| qwen2.5:7b, round two | 390 | 11.6 | 50 + 4 | 5 | **69 + 1** |
+
+- **You Like It Darker's chapter narrators are all right again**: Vic for both Rattlesnakes chapters,
+  and The Dreamers has its own teller.
+- **One split remains:** Preston Zane is two characters ("Zane", 33 lines, and "Officer P. Zane",
+  13), so two voices.
+- **Label-only names.** "zane" and "canavan" were added to the book's alias file as label-only names,
+  so the table counts right people under short names as right. The old file is kept as
+  `aliases.before-2026-10-07.json`.
+- **Apex Prey 3 keeps an unnamed narrator** in all nine chapters, so the voice stays consistent. But 19
+  of Polly's lines went to "girl 3" and "girl 4", and 5 to Gemma: the description problem of §62.3.
+
+### 63.3 What it means
+
+- **Distillation kept the skills round one lost.** Learning from the 14B's answers, with the masked
+  lines corrected, brought the 7B to the 14B's level at twice the speed: better on the masked set and
+  You Like It Darker, close on Six Wakes, and worse on Apex Prey 3.
+- **Not a clear enough win to switch:** Apex Prey 3 is worse, and every figure is a single run
+  (§45.3 asks for three).
+- **Before a switch:**
+  - more training books, especially first-person ones;
+  - three runs per book;
+  - a way to serve it. Ollama 0.35.1 needs a merged GGUF; alternatively, the app could talk to a
+    llama.cpp server, but its GPU handover (`engine_gpu.unload_llm`) speaks Ollama's API.
+- **Files.** `data/diagnostics/finetune2_2026-10-07/` holds `build_examples.py`, the 14B's runs
+  (`gen/`), the examples, `lora/` and `cast-lora-f16.gguf`. The test runs are in
+  `masked_tags_2026-10-07/runs_ft/qwen2_5_7b_cast2/`.
+- **D: drive.** It was unplugged during the trial, so every container mounting it lost the folder
+  and BookOrbit couldn't start. `docker desktop restart`, then BookOrbit's `compose up`, restored
+  them, with the queue paused throughout.

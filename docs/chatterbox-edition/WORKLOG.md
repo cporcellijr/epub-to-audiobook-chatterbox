@@ -87,3 +87,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 60 | 2026-10-07 | A review reply that names the "I" no longer fails the analysis | [cast](worklog/cast.md) |
 | 61 | 2026-10-07 | A masked-tag benchmark and four local models | [cast](worklog/cast.md) |
 | 62 | 2026-10-07 | Teaching the model: a first fine-tuning trial | [cast](worklog/cast.md) |
+| 63 | 2026-10-07 | Teaching round two: the 14B's own answers, corrected | [cast](worklog/cast.md) |
