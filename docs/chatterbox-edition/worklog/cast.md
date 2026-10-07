@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64.
 
 ## Where things stand (2026-10-07)
 
@@ -45,8 +45,8 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - a narrator split under two names that both get "I said" votes (§49.4);
   - an editor merge doesn't survive a re-analysis (§30);
   - casts analysed before a narrator fix keep their old narrators until re-analysed (§49.4).
-  - on Apex Prey 3 a chapter-local description ("girl with needle phobia") can swallow the narrator's
-    and another character's lines, depending on small reply differences (§62.3).
+  - on Apex Prey 3 the model sometimes labels the narrator by a description ("the girl"); a description
+    declared with a new name now becomes that person (§64), but the model's own label errors remain.
 
 ## 13. Multi-voice narration (2026-09-28)
 
@@ -1920,3 +1920,57 @@ Book scores are wrong lines + unresolved lines.
 - **D: drive.** It was unplugged during the trial, so every container mounting it lost the folder
   and BookOrbit couldn't start. `docker desktop restart`, then BookOrbit's `compose up`, restored
   them, with the queue paused throughout.
+
+## 64. A description declared with a new name becomes that person (2026-10-07)
+
+The open problem of §62.3: on Apex Prey 3, "the girl" sometimes swallowed other people's lines.
+
+### 64.1 What happened
+
+In the 14B's bad run (§62, 31 wrong and 5 unresolved):
+
+1. In chapter 9 the needle-phobic girl was "the girl", a chapter-local description (§42). Correct.
+2. In chapter 11 the known list still offered "the girl". The model reused the label for Gemma and
+   declared `{"name": "the girl", "aliases": ["Gemma"]}`. The roster made a new chapter-local "the
+   girl", bound the alias "Gemma" to it, but kept the name "the girl". The scorer counted all 11 of
+   Gemma's lines wrong, and her profile and voice were picked for "the girl".
+3. In chapter 12 the list showed "Gemma = the girl (female; aliases: Gemma)", and the model gave 11
+   of Polly's lines to "the girl", a third description.
+
+A self-introduction already renames a description (`name_reference`, §59). A name the model declares
+as the description's alias did not.
+
+### 64.2 Fix
+
+`Roster.add`: a description declared with an alias that is a real name (not a description, family
+word or "I"), and that nobody else owns, becomes that named person (`name_reference`) for the rest
+of the book. Another character's name stays theirs: a new "the girl" declared as an existing
+"Gemma" stays a separate description, as before, rather than handing Gemma its lines.
+
+**Tried and dropped: hiding earlier chapters' descriptions from the known list.** It removes the
+label the model reused in chapter 11, but it shortens every later chapter's list. On Ollama, chapter
+13's model reply then declared Stuart as "the narrator", and Stuart narrated chapter 13 in all three
+runs: 20 or 21 wrong and 5 unresolved, against 9 and 2 without it. The narrator checks (§40, §46) let
+it through, because the narration-only question gave the same wrong answer.
+
+### 64.3 Checks
+
+- **Two new tests:** a description declared with a new name becomes that person and is known in the
+  next chapter; one declared with someone else's name stays a separate description. 982 app tests
+  pass.
+- **When it doesn't apply, nothing changes.** In runs where the model never ties a description to a
+  name, the prompts are identical:
+  - the deployed code and the fix both score 9 wrong and 2 unresolved on Ollama and on a fresh
+    llama.cpp server;
+  - and 6 and 3 on a llama.cpp server warmed with the bad run's last earlier request.
+
+  The bad run itself could not be reproduced on demand: the server's reuse of cached prompt prefixes
+  seems to make it depend on earlier requests.
+- **When it applies.** The bad run's own answers, replayed on each code version (requests matched by
+  passage and ids, since the known list now differs):
+  - the old code reproduces it exactly, 31 + 5;
+  - with the fix, 20 + 5: "the girl" declared as Gemma is Gemma, with all 11 of her lines;
+  - Polly's 11 chapter-12 lines stay with "the girl", since a replay keeps the model's answers. Live,
+    chapter 12's list would show plain "Gemma".
+- **Apex Prey 3 runs vary a lot with the same code:** 6 + 3, 9 + 2 and 31 + 5 today. Judge it over
+  several runs.

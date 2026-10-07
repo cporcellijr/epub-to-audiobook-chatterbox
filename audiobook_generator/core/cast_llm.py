@@ -753,6 +753,13 @@ class Roster:
                 character["age"] = age
             for alias in aliases or []:
                 self._alias(key, alias)
+            # Declared as "the girl" with the alias "Gemma": she is Gemma, for the rest of the book too.
+            # Only a name nobody else has yet; another character's name stays theirs.
+            named = next((a for a in aliases or [] if not _local_reference(a) and usable_alias(a)
+                          and not family_word(a) and normalize_name(a) not in _NARRATOR_REFERENCES
+                          and self.aliases.get(normalize_name(a)) == key), None)
+            if named and character.get("reference_scope") == "chapter":
+                self.name_reference(key, named)
             return key
         key = self.resolve(name, gender)
         if gender not in GENDERS or gender == "unknown":

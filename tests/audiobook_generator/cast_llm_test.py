@@ -476,6 +476,31 @@ class TestLocalReferences(unittest.TestCase):
         self.assertEqual(roster._candidates("man"), [ray])
         self.assertEqual(roster.add("the man"), man)
 
+    # Seen live (WORKLOG §64): the model declared "the girl" with the alias "Gemma"; she stayed
+    # "the girl", and the label went on to take another girl's and the narrator's lines.
+    def test_a_description_declared_with_a_new_name_becomes_that_person(self):
+        text = f'"Hi," said Polly.{M}"Hello yourself," the girl answered.{M}"Again?"'
+        reply = _reply({2: "the girl", 3: "the girl"},
+                       [{"name": "the girl", "gender": "female", "aliases": ["Gemma"]}])
+        roster = Roster()
+        lines, _ = attribute_chapter(chapter_segments(text), roster, ScriptedChat(reply), {}, self.log)
+        gemma = lines[2]
+        self.assertEqual((lines[3], roster.characters[gemma]["name"]), (gemma, "Gemma"))
+        self.assertNotIn("reference_scope", roster.characters[gemma])
+        roster.new_chapter()
+        self.assertEqual(roster.resolve("Gemma"), gemma)
+        self.assertIn("Gemma", roster.names_for_prompt())
+
+    def test_a_description_declared_with_someone_elses_name_stays_apart(self):
+        roster = Roster()
+        gemma = roster.add("Gemma", "female")
+        roster.new_chapter()
+        girl = roster.add("the girl", "female", aliases=["Gemma"])
+        self.assertNotEqual(girl, gemma)
+        self.assertEqual((roster.characters[girl]["name"], roster.characters[girl].get("reference_scope")),
+                         ("the girl", "chapter"))
+        self.assertEqual(roster.characters[gemma]["name"], "Gemma")
+
 
 class TestLaterIntroductions(unittest.TestCase):
     """A name given in answer to "what's your name?" or "I'm X", after the speaker spoke as a description."""
