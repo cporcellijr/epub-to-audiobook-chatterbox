@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65.
 
 ## Where things stand (2026-10-07)
 
@@ -32,9 +32,9 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   taken for the speaker ("..., Vic?") (§44.4, §45.2). Most of these errors are the same in every run
   (§61.1). Prompt changes move the rest by about 15 lines in 900 (§45.3), so judge a prompt change
   over three or more live runs per variant. Teaching the model is the next lever. A 7B taught from
-  the 14B's own answers, with the masked lines corrected (§63), matched the 14B at twice the
-  speed: better on the masked set and You Like It Darker, worse on Apex Prey 3. Not yet a clear
-  enough win to switch; the 14B can't be trained on this card (§62-§63).
+  the 14B's own answers, with the masked lines corrected (§63, §65), is close to the 14B at twice
+  the speed: better on the masked set and You Like It Darker, close on Six Wakes, worse on Apex
+  Prey 3 (25 wrong against 9). Not yet a switch; the 14B can't be trained on this card (§62-§63).
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -1974,3 +1974,60 @@ it through, because the narration-only question gave the same wrong answer.
     chapter 12's list would show plain "Gemma".
 - **Apex Prey 3 runs vary a lot with the same code:** 6 + 3, 9 + 2 and 31 + 5 today. Judge it over
   several runs.
+
+## 65. Teaching round three, and a stricter rule for naming descriptions (2026-10-07)
+
+### 65.1 Round three
+
+- **More data, more first-person books.** 125 new library books were sampled, 75 of them
+  first-person-heavy and at most 2 per author, all outside every earlier set. The minimum of masked
+  lines per book was lowered so first-person books still count. 92 of them gave 159 chapters, 14,403
+  lines and 1,094 masked lines.
+- **The data.** The 14B (deployed code, with §64) answered them as in §63; it had 564 of the masked
+  window lines right, and 540 answers were corrected. Together with §63's examples that made 1,478
+  training examples.
+- **Training.** The 7B, 1.5 epochs (278 steps), 71 minutes.
+- **The test** was sturdier than before: the three answer-key books at request sizes of 16, 20 and 24
+  lines (§45.3), for the 14B (Ollama) and the taught 7B (llama.cpp with the adapter), plus the masked
+  set at 20.
+
+### 65.2 The flaw it found in §64
+
+The taught 7B declared a chapter's "I" as `{"name": "Girl", "aliases": ["I", "Miss me", "Don't be
+late Jimmy"]}`. §64 renamed the description "Miss me", so it was no longer "only described", and
+§49.3's fold (a described "I" takes the teller) no longer applied. "Miss me" narrated chapter 12, and
+Apex Prey 3 had 52 wrong at size 20 and 111 at size 24.
+
+`usable_alias` was written to reject pronouns and pet names, and it lets phrases through. §64 now
+also needs the alias to be **written like a name** (`_written_as_name`: one to three capitalised
+words, such as "Gemma", "Dr. Hale" or "Jo-Ann O'Brien"), and it never renames a description declared
+as the chapter's "I" (alias "I" or "the narrator"): the narrator choice settles who that is.
+
+### 65.3 Results, every run replayed on the stricter rule
+
+Each run's own answers were replayed on the new code, with requests matched by passage and ids
+(§64.3). Book scores are wrong lines + unresolved lines.
+
+| Model | Apex Prey 3 (16 / 20 / 24) | Six Wakes | You Like It Darker | Masked lines right (of 600) |
+|---|---|---|---|---|
+| qwen2.5:14b (current) | 10+2 / 9+2 / 9+2 | 5 / 2 / 1 | 68 / 77 / 71 | 375-378 |
+| qwen2.5:7b taught, round three | 26+3 / 26+3 / 24+3 | 7 / 1 / 4 | 87+1 / 51+1 / 58+1 | **399** |
+
+- **The stricter rule leaves every 14B run unchanged.** §64 still turns the failed run of §62 from
+  31 + 5 into 20 + 5. The taught 7B's Apex Prey 3 falls from 52, 111 and 52 to 26, 24 and 26 wrong.
+- **The taught 7B against the 14B:**
+  - better on the masked set and on You Like It Darker on average (65 against 72, with a wide spread);
+  - close on Six Wakes (4 against 2.7);
+  - worse on Apex Prey 3 (25 against 9).
+- **Its remaining Apex Prey 3 errors are the same at every size:** 8 of Polly's chapter-13 lines to a
+  description, 4 of hers to Gemma, and the opening chapter's Jimmy and Jose lines. Polly narrates
+  every chapter.
+- **It runs about twice as fast** (11.6 minutes against 24.6 for the masked set).
+- **No switch yet.** The 14B stays in the app until a taught model is at least as good on all three
+  books. Training data: `data/diagnostics/finetune3_2026-10-07/`, with round two's examples
+  included.
+
+### 65.4 Checks
+
+- 984 app tests pass. Two new tests: a phrase declared as a name doesn't rename a description, and a
+  description declared as the "I" is left to the narrator choice.

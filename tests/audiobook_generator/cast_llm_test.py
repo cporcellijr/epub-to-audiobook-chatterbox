@@ -491,6 +491,19 @@ class TestLocalReferences(unittest.TestCase):
         self.assertEqual(roster.resolve("Gemma"), gemma)
         self.assertIn("Gemma", roster.names_for_prompt())
 
+    def test_a_phrase_declared_as_a_name_does_not_rename_a_description(self):
+        # Seen live (WORKLOG §65): "Miss me" became a character, then a chapter's narrator.
+        roster = Roster()
+        girl = roster.add("Girl", "female", aliases=["Miss me", "Don't be late Jimmy"])
+        self.assertEqual((roster.characters[girl]["name"], roster.characters[girl].get("reference_scope")),
+                         ("Girl", "chapter"))
+
+    def test_a_description_declared_as_the_i_is_left_to_the_narrator_choice(self):
+        roster = Roster()
+        girl = roster.add("the girl", "female", aliases=["I", "Gemma"])
+        self.assertEqual((roster.characters[girl]["name"], roster.characters[girl].get("reference_scope")),
+                         ("the girl", "chapter"))
+
     def test_a_description_declared_with_someone_elses_name_stays_apart(self):
         roster = Roster()
         gemma = roster.add("Gemma", "female")

@@ -87,6 +87,16 @@ def usable_alias(alias: str) -> bool:
     return bool(words) and words[0] not in _POSSESSIVES and not all(w in _NOT_ALIASES for w in words)
 
 
+_NAME_WORD = re.compile(r"[A-Z][A-Za-z'’\-]*\.?$")
+
+
+def _written_as_name(alias: str) -> bool:
+    """A proper name as books write it: one to three capitalised words ("Gemma", "Dr. Hale",
+    "Jo-Ann O'Brien"), not a phrase the model mistook for one ("Miss me", "Don't be late Jimmy")."""
+    words = alias.split()
+    return 0 < len(words) <= 3 and all(_NAME_WORD.match(word) for word in words) and usable_alias(alias)
+
+
 def _relationship_owner(name: str) -> Optional[str]:
     """The person before a possessive relationship label, e.g. "Jimmy" in "Jimmy's companion"."""
     for marker in ("'s ", "’s "):
@@ -754,10 +764,12 @@ class Roster:
             for alias in aliases or []:
                 self._alias(key, alias)
             # Declared as "the girl" with the alias "Gemma": she is Gemma, for the rest of the book too.
-            # Only a name nobody else has yet; another character's name stays theirs.
-            named = next((a for a in aliases or [] if not _local_reference(a) and usable_alias(a)
-                          and not family_word(a) and normalize_name(a) not in _NARRATOR_REFERENCES
-                          and self.aliases.get(normalize_name(a)) == key), None)
+            # Only a name nobody else has yet (another character's name stays theirs), written like a
+            # name (seen live: "Miss me", "Don't be late Jimmy"), and never for the chapter's "I", whose
+            # name the narrator choice settles (cast_profiles.chapter_narrators).
+            is_i = key == self.chapter_narrator or any(normalize_name(a) in _NARRATOR_REFERENCES for a in aliases or [])
+            named = None if is_i else next((a for a in aliases or [] if _written_as_name(a) and not _local_reference(a)
+                                            and not family_word(a) and self.aliases.get(normalize_name(a)) == key), None)
             if named and character.get("reference_scope") == "chapter":
                 self.name_reference(key, named)
             return key
