@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61.
 
 ## Where things stand (2026-10-07)
 
@@ -18,15 +18,20 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - profiles and measured voice matching pick the voices (§15-§16).
 - **The model** is qwen2.5:14b through Ollama, at temperature 0. On 2026-10-01 the owner decided to
   keep the cast LLM local: hosted models' content filters would likely refuse many of the books.
-- **Accuracy on the hand-labelled test chapters** was last measured on `0cfb3db` (§49.4). The answer
-  keys are outside git; the scorer is `tests/audiobook_generator/cast_audit_eval.py` (§49.2).
-  - Six Wakes: 2 wrong of 504 lines.
-  - Apex Prey 3: 7 wrong and 1 unresolved of 269.
-  - You Like It Darker: 100 wrong of 910.
-  - §59's guidance was measured on focused passages, not on these chapters.
+  Newer models that fit the card (gemma4:12b, qwen3.5:9b, qwen3:14b) did no better, and a vote across
+  models gained little (§61).
+- **Accuracy on the hand-labelled test chapters**, last measured on 2026-10-07 on §59's code, with
+  §60's fix for the last book (§61). The answer keys are outside git; the scorer is
+  `tests/audiobook_generator/cast_audit_eval.py` (§49.2).
+  - Six Wakes: 1 wrong of 504 lines.
+  - Apex Prey 3: 6 wrong and 4 unresolved of 269.
+  - You Like It Darker: 90 wrong and 2 unresolved of 910, every chapter narrator right.
+- **A wider comparison:** the masked-tag set, 600 lines from 27 library books whose tags were
+  removed, is for comparing models and prompts (§61.2). qwen2.5:14b gets 376 right.
 - **What is left is mostly the model's own reading:** long untagged exchanges, and an addressed name
-  taken for the speaker ("..., Vic?") (§44.4, §45.2). Prompt changes move these errors around by about
-  15 lines in 900 (§45.3), so judge a prompt change over three or more live runs per variant.
+  taken for the speaker ("..., Vic?") (§44.4, §45.2). Most of these errors are the same in every run
+  (§61.1). Prompt changes move the rest by about 15 lines in 900 (§45.3), so judge a prompt change
+  over three or more live runs per variant. Teaching the model itself is the next lever (§61.5).
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -1687,3 +1692,90 @@ for a measured change.
     73), so the change took effect there.
 - 980 app tests pass in the container (1 skipped: the private answer-key check).
 - Not deployed yet.
+
+## 61. A masked-tag benchmark and four local models (2026-10-07)
+
+### 61.1 Why another model, and why another test
+
+Most of the remaining errors are stable. Comparing saved runs line by line:
+- Apex Prey 3's 8 wrong lines are the same in all 9 runs.
+- You Like It Darker has 63 lines wrong in all four comparable runs (fix3, fix3_prod, phaseA,
+  final), which score 88-108 wrong each.
+
+So prompt changes, which move errors around (§45.3), can only reach the part that moves. The rest
+needs a model that reads differently. Three hand-labelled books are too few to compare models on,
+and labelling more takes days, so the library labels itself.
+
+### 61.2 The masked-tag set
+
+- **The idea.** A line whose paragraph is only the quotation and a bare named tag (`"...," Tom
+  said.` / `Tom said, "..."`) loses its tag, and the tag's name is the answer. Each speaker's first
+  tag in a chapter stays, so every name is still met once.
+- **Books.** 40 books were sampled uniformly from the 1,171 eligible in the library scan (§44.1),
+  at most 2 per author, fixed seed, with the four test books held out. 13 had too few clean
+  third-person tags, mostly first-person books. That left 27 books, 53 chapters, 4,636 dialogue
+  lines, 600 masked lines and 1,522 tags kept.
+- **Checks when building.** Each edited chapter keeps the same line ids and the same text
+  everywhere else. No masked line is still anchored, and none became a continuation.
+- **Running.** The production `analyse_book` runs with the parser handing it the masked text.
+  Profiles are skipped, since they don't change who speaks. A masked line is right when its
+  character has the tag's name, or a fuller name whose first or last name it is.
+- **It is harder than a real book by design:** authors tag exactly the lines that need it. Use it
+  to compare models and prompts, not as an accuracy figure.
+- **Where it lives.** Everything is in `data/diagnostics/masked_tags_2026-10-07/`, outside git,
+  because `masked_set.json` holds book text. The tools there are `select_books.py`, `build.py`
+  (no model), `run_models.py` (one container, models in turn, the same queue check as `go.sh`),
+  `score.py` and `vote.py`.
+
+### 61.3 Four models on the same code
+
+Thinking was turned off (`reasoning_effort: "none"`) for the three models that think, and all ran
+at Ollama's default 4,096-token context. The largest prompt seen so far is 3,909 tokens, and none
+has been truncated. Mixture-of-experts models of 26-33B were left out: they would spill into the
+16 GB Docker VM.
+
+| Model | Masked lines right (of 600) | Minutes for the set | Apex Prey 3 wrong + unresolved | Six Wakes | You Like It Darker |
+|---|---|---|---|---|---|
+| qwen2.5:14b (current) | **376** | 24.7 | **6 + 4** | **1** | 90 + 2 |
+| gemma4:12b | 368 | **12.3** | 42 + 17 | 2 | 100 + 96 |
+| qwen3.5:9b | 340 | 14.5 | 53 + 11 | 24 | 413 + 5 |
+| qwen3:14b | 339 | 16.5 | 49 + 6 | 18 | 167 + 63 |
+
+- qwen2.5:14b's You Like It Darker run in the bake-off failed in its last chapter (§60). Its figure is
+  the live run on the fixed code.
+- **qwen2.5:14b stays.** No newer model that fits the card reads better.
+- **gemma4:12b reads third-person lines as well, in half the time, but fails first-person
+  identity.** On Apex Prey 3, 33 of Polly's and Gemma's lines went to "girl with needle phobia" and
+  17 of Polly's had no speaker. On You Like It Darker it never named the tellers. The narrator code
+  (§42-§49) was tuned on how qwen2.5 answers "I said" lines.
+- **No refusals.** Every attribution and review reply from every model was a JSON speaker map, on
+  explicit books too. "Unusable" replies covered the wrong line ids.
+- **Apex Prey 3 on §59's code: 6 wrong and 4 unresolved, against 7 and 1 on `0cfb3db`.** Counting
+  lines read in the wrong voice, that is 9 against 8: two of the unresolved are Stuart's and one is
+  Polly's, which the narrator's voice reads correctly anyway. Two label-only names ("female doctor",
+  "the news reporter") were added to the book's alias file; the old file is kept as
+  `aliases.before-2026-10-07.json`.
+
+### 61.4 Combining models doesn't pay
+
+The models get different lines wrong: 492 of the 600 are right in at least one. A vote can't find
+them, though:
+- the best three-model vote (qwen2.5 + gemma4 + qwen3.5) gets 390, 14 more than qwen2.5 alone, for
+  three times the analysis time;
+- a two-model vote can't beat qwen2.5, since ties go to it;
+- agreement is no confidence signal: lines all four models agree on are right only 81% of the time.
+
+### 61.5 Next: teaching the model (researched, not started)
+
+Notes with sources are in `finetune_research.md` in the same folder.
+- **Data.** PDNC has 28 public-domain novels and 37,131 quotations, each with speaker and
+  addressees. Its repository has no licence file: private training is low-risk, and the authors can
+  be asked. The library's own masked tags are free training data in the owner's genres, as long as
+  the benchmark books are held out.
+- **Training.** A QLoRA of a 14B model fits the 12 GB card, tightly at 4,096 tokens. Qwen3.5 can't
+  be trained this way.
+- **Into Ollama.** 0.35.1 no longer loads LoRA adapters, so the result must be a merged GGUF
+  (`FROM model.gguf`, with the base model's chat template).
+- **Other option.** A fine-tuned encoder (ModernBERT) scored 94.5% on PDNC against 89.8% for
+  Llama-3-8B zero-shot, about 1,000 times faster. It chooses among candidate mentions, so it would
+  need more pipeline work.

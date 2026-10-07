@@ -85,3 +85,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 58 | 2026-10-06 | Whisper's per-take log lines at DEBUG | [breeze](worklog/breeze.md) |
 | 59 | 2026-10-06 | Reviewed identity guidance for future casts | [cast](worklog/cast.md) |
 | 60 | 2026-10-07 | A review reply that names the "I" no longer fails the analysis | [cast](worklog/cast.md) |
+| 61 | 2026-10-07 | A masked-tag benchmark and four local models | [cast](worklog/cast.md) |
