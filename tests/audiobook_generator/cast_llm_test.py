@@ -688,6 +688,22 @@ class TestReview(unittest.TestCase):
         attribute_chapter(chapter_segments('"Hello," Ada smiled.'), Roster(), chat, stats, self.log)
         self.assertEqual((len(chat.prompts), stats.get("review_requests", 0)), (1, 0))
 
+    def test_a_review_reply_naming_the_i_moves_the_narrators_lines_before_the_next_group(self):
+        # Seen live (WORKLOG §60): the first review group's reply named the unnamed "I", which merged
+        # the chapter's narrator key away while the "I said" lines still held it; the next group
+        # looked the old key up and the whole analysis failed.
+        text = M.join(['"Morning," I said.', '"Hello there."', "The rain went on.", "Nothing moved.",
+                       "The clock ticked.", "Somebody coughed.", '"Who is it?"', '"Me," I said.'])
+        chat = ScriptedChat(_reply({2: "unknown", 3: "unknown"}),
+                            _reply({2: "William"}, [{"name": "William", "gender": "male", "aliases": ["I"]}]),
+                            _reply({3: "Ann"}, [{"name": "Ann", "gender": "female"}]))
+        roster, stats = Roster(), {}
+        lines, _ = attribute_chapter(chapter_segments(text), roster, chat, stats, self.log)
+        self.assertEqual(lines, {1: "william", 2: "william", 3: "ann", 4: "william"})
+        self.assertEqual(stats["review_requests"], 2)
+        self.assertIn('[William] "Me,"', chat.prompts[2][1]["content"])
+        self.assertEqual(roster.characters["william"]["lines"], 3)
+
 
 class TestReviewIsAccountable(unittest.TestCase):
     """A review answer the line's own text rules out never replaces the first answer."""

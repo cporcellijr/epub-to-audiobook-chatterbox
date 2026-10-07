@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60.
 
 ## Where things stand (2026-10-07)
 
@@ -1632,3 +1632,58 @@ the running module reports the guidance version and matches all four source hash
 HTTP 200, the queue is still paused with no preparation in progress, and all 60 original cast
 fingerprints still match after deployment. The test LLM was unloaded through the existing GPU
 handover helper.
+
+## 60. A review reply that names the "I" no longer fails the analysis (2026-10-07)
+
+### 60.1 What failed
+
+A private run of You Like It Darker's test chapters (12, 15-17) on the deployed code (`dbdf0d5`,
+§59) with qwen2.5:14b failed in its last chapter with `KeyError: 'narrator 3'`. The same failure
+would end a real cast job for that book.
+
+1. The Dreamers' "I said" lines are anchors to the chapter's unnamed narrator, key `narrator 3`.
+2. The review pass (§28) asks its flagged lines in groups. The first group's reply listed
+   `{"name": "William Davis", "aliases": ["I"]}`: the model had named the teller.
+3. That alias merges the unnamed narrator into William Davis (§42's rule that "I" is one person per
+   chapter). `Roster.merge` retires the old key, but the chapter's decided lines still held it.
+4. The next group looked `narrator 3` up to show the anchored lines as `[Name]`, and failed.
+
+The lookup is older than §59 (it read `roster.characters[key]["name"]` before). The window loop
+already moved decided lines to the merged key after each reply; the review pass and the line count
+after it never did. Two more places held a retired key the same way: the line count
+(`count_line`), and the review's "an 'I'-tagged line belongs to the narrator" check, which would
+have rejected a correct answer naming the newly named teller.
+
+### 60.2 Fix
+
+`_follow_merges` (`core/cast_llm.py`) moves every decided line to the key its character now has:
+- after each window's reply (the old inline loop, unchanged in effect);
+- before the review flags lines, and at the start of each review group;
+- before the chapter's lines are counted.
+
+The review's "I"-tag check now looks the narrator key up where it uses it, so a teller named
+earlier in the same reply counts as the narrator.
+
+Not changed: the known-character list and the narrator line shown to the review are still built
+once per chapter's review, so a later group still lists "The Narrator" after a reply named them.
+Rebuilding them per group would change the questions every multi-group review asks, so it is left
+for a measured change.
+
+### 60.3 Checks
+
+- New test `test_a_review_reply_naming_the_i_moves_the_narrators_lines_before_the_next_group`:
+  an unnamed "I" chapter with two unknown lines far enough apart for two review groups, the first
+  reply naming the "I". On the old code it fails with `KeyError: 'narrator'`; on the new code
+  the narrator's three lines are William's, the second group shows `[William] "Me,"`, and William
+  counts 3 lines.
+- The failed run, replayed on the new code (`replay_cast.py`, saved replies only), passes the point
+  of failure and stops at the next review request, which the failed run never got to send.
+- A live run of the same chapters on the new code, with qwen2.5:14b and the same settings, finished
+  (`runs/fix60_2026-10-07`): 90 wrong and 2 unresolved of 910, with 0 of 4 chapter narrators wrong
+  (the last saved run, `final`, had 100 and 0).
+  - Ollama's replies aren't exactly repeatable, so this run left the failed one's path at call 9.
+  - It met its own merge in chapter 17's review: a reply listed "The Narrator" with alias "I".
+  - Replaying its saved replies on the old code asks a different question at that point (call
+    73), so the change took effect there.
+- 980 app tests pass in the container (1 skipped: the private answer-key check).
+- Not deployed yet.

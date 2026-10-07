@@ -882,6 +882,13 @@ def _register_characters(roster: Roster, characters: List[dict]) -> Dict[str, Op
         declared[name] = key if name not in declared or declared[name] == key else None
     return declared
 
+def _follow_merges(result: Dict[int, Optional[str]], roster: Roster) -> None:
+    """Point decided lines at the character their key now belongs to: a merge (a reply naming the
+    chapter's "I", a self-introduction) retires the old key while lines still hold it."""
+    for line_id, key in result.items():
+        if key:
+            result[line_id] = roster.canonical_key(key)
+
 def _tag_genders(paragraphs: List[List[Segment]]) -> Dict[int, str]:
     genders = {}
     for paragraph in paragraphs:
@@ -1064,6 +1071,7 @@ def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str
     Lines in skip (quoted terms) are never asked. result is updated in place."""
     if narrator:
         roster.set_chapter_narrator(narrator, narrator_aliases)
+    _follow_merges(result, roster)
     flags = cast_review.flag_lines(paragraphs, result, anchors, roster.characters,
                                    narrator=roster.chapter_narrator)
     flags = {i: reasons for i, reasons in flags.items() if i not in skip}
@@ -1078,6 +1086,7 @@ def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str
     names = roster.names_for_prompt()
     genders = _tag_genders(paragraphs)
     for start, end, ids in cast_review.groups(paragraphs, list(flags)):
+        _follow_merges(result, roster)  # an earlier group's reply may have named the "I"
         certain = {i: roster.prompt_name(result[i]) if result.get(i) else anchors[i] for i in anchors}
         guessed = {i: roster.prompt_name(key) for i, key in result.items()
                    if key and i not in anchors and i not in ids}
@@ -1104,7 +1113,8 @@ def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str
                 key = roster.speaker_key(speakers[line_id], genders.get(line_id, "unknown"), declared)
                 if key is None:
                     continue
-                broken = cast_review.hard_violation(paragraphs, line_id, key, roster.characters, narrator_key)
+                broken = cast_review.hard_violation(paragraphs, line_id, key, roster.characters,
+                                                   roster.canonical_key(narrator_key) if narrator_key else None)
                 if broken:
                     stats["review_rejected"] = stats.get("review_rejected", 0) + 1
                     log.info(f"Cast{label}: review answer {roster.characters[key]['name']} for line {line_id} "
@@ -1192,9 +1202,7 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
             speakers = {line_id: None for line_id in window.ids}
             window_moods = {}
         declared = _register_characters(roster, characters)
-        for line_id, key in result.items():
-            if key:
-                result[line_id] = roster.canonical_key(key)
+        _follow_merges(result, roster)
         for line_id in window.ids:
             name = speakers.get(line_id)
             key = roster.speaker_key(name, genders.get(line_id, "unknown"), declared) if name else None
@@ -1220,6 +1228,7 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
         for line in all_lines:  # a continued line follows its (possibly corrected) first part
             if line.continues and line.line_id - 1 in result:
                 result[line.line_id] = result[line.line_id - 1]
+    _follow_merges(result, roster)
     # Lines the windows never covered (none expected) and continued lines' counts
     moods: Dict[int, str] = {}
     for line in all_lines:
