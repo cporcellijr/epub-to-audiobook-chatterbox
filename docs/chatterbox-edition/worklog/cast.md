@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66.
 
 ## Where things stand (2026-10-07)
 
@@ -33,8 +33,8 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   (§61.1). Prompt changes move the rest by about 15 lines in 900 (§45.3), so judge a prompt change
   over three or more live runs per variant. Teaching the model is the next lever. A 7B taught from
   the 14B's own answers, with the masked lines corrected (§63, §65), is close to the 14B at twice
-  the speed: better on the masked set and You Like It Darker, close on Six Wakes, worse on Apex
-  Prey 3 (25 wrong against 9). Not yet a switch; the 14B can't be trained on this card (§62-§63).
+  the speed on some books but invents identities on others (§65-§66: Six Wakes' "Joanna de la Cruz").
+  A fixed rule judged two more rounds and kept the 14B; the 14B can't be trained on this card (§62-§63).
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -2031,3 +2031,76 @@ Each run's own answers were replayed on the new code, with requests matched by p
 
 - 984 app tests pass. Two new tests: a phrase declared as a name doesn't rename a description, and a
   description declared as the "I" is left to the narrator choice.
+
+## 66. Teaching rounds four and five, and the rule for switching (2026-10-07/08)
+
+The owner asked for another round and left the decision for the night: switch the app to the taught
+model if it is as good as or better than the 14B; if not, train once more.
+
+### 66.1 The rule, fixed before the results
+
+Averaged over request sizes 16, 20 and 24 (Ollama, the deployed code; `finetune4_2026-10-07/decide.py`):
+
+1. Masked-tag set: at least 378 right, the 14B's best.
+2. The three answer-key books together: wrong + unresolved lines no more than the 14B's (86.0 a run).
+3. No book worse than the 14B by more than 3 lines or 25%, whichever is larger: Apex Prey 3 ≤ 14.3,
+   Six Wakes ≤ 5.7, You Like It Darker ≤ 90.
+4. Every chapter narrator of You Like It Darker right.
+
+The candidate is judged in the form the app would run: the adapter merged into the full-precision
+weights (`merge_lora.py`, one shard at a time), converted to GGUF, compressed to 8-bit (`Q8_0`) and
+registered in Ollama (`to_ollama.sh`).
+- **Why 8-bit.** A 4-bit merge of round three scored You Like It Darker 68 + 22, against 51 + 1 with
+  the adapter on llama.cpp. 4-bit rounding seems to lose part of the small trained changes.
+- **Size.** 8-bit is 8.1 GB, less than the 14B's 9 GB; like the 14B, Ollama unloads it before Breeze
+  loads.
+
+### 66.2 Round four: the narrator's own lines
+
+- **The new ingredient: "I said" tags masked too.** A clean `"...," I said.` loses its tag, and the
+  answer is "I", which the roster already reads as the chapter's narrator. Each chapter's first
+  "I said" is kept.
+- **Books.** 110 unused first-person books, of which 69 gave 120 chapters with 1,105 masked lines
+  (480 of them the narrator's).
+- **Examples.** The 14B, as before, got 381 narrator lines right and needed 125 corrected to "I".
+  777 new examples, so 2,198 with rounds two and three; one epoch.
+- **Result:** masked set **416**, the best yet. But Apex Prey 3 25.0, Six Wakes 14.3 and You Like It
+  Darker 89.3: **fail.**
+  - Six Wakes' errors are mostly an invented identity: a "Joanna de la Cruz" beside "Dr. Joanna
+    Glass", two voices for one person.
+  - You Like It Darker split Preston Zane into "Deputy Zane" again.
+  - The masked score keeps rising while real books don't: one epoch over more data copied the 14B's
+    habits less closely than round three's 1.5 epochs did.
+
+### 66.3 Round five
+
+- **The change: two epochs, no new data.** The same 2,198 examples as round four (550 steps, 140
+  minutes). Round three, at 1.5 epochs, had held up best on real books.
+- **Result:** masked set 416. Apex Prey 3 **16.0** (better than round four), You Like It Darker
+  **71.7** (the 14B: 72.0). But Six Wakes **50.3: fail.**
+  - 44 of Six Wakes' 50 wrong lines are again Dr. Joanna Glass's, given to an invented "Joanna de la
+    Cruz": her first name and Captain Katrina de la Cruz's surname.
+  - The same cast lists "Squirrelly" as an alias of Maria Arena. That name is the example in §59's
+    prompt guidance, not the book.
+  - The taught 7B blends and borrows names where the 14B doesn't.
+
+| Model (Ollama, mean of sizes 16/20/24; wrong + unresolved) | Masked set | Apex Prey 3 | Six Wakes | You Like It Darker |
+|---|---|---|---|---|
+| qwen2.5:14b (current) | 375-378 | 11.3 | 2.7 | 72.0 |
+| round four, 8-bit | 416 | 25.0 | 14.3 | 89.3 |
+| round five, 8-bit | 416 | 16.0 | 50.3 | 71.7 |
+
+### 66.4 Outcome
+
+- **The rule kept the 14B both times.** The app is unchanged (`LLM_MODEL=qwen2.5:14b`). The queue,
+  paused for the night's GPU work, was resumed.
+- **Kept for the owner to decide:**
+  - Ollama models `qwen2.5-cast4:7b` and `qwen2.5-cast5:7b` (8.1 GB each) and `qwen2.5:7b`;
+  - the training images (Unsloth 32.8 GB, llama.cpp 11.2 GB);
+  - the model cache volume `cast-ft-hf` (30.8 GB);
+  - the round folders `finetune*_2026-10-0*` (about 1 GB each, with book text, outside git).
+- **What a next attempt would need:**
+  - something against invented identities, in the data or in code (a "new" character whose name
+    joins one person's first name to another's surname);
+  - keeping §59's example names out of what the model can copy;
+  - or a bigger base model, trained on a bigger card.

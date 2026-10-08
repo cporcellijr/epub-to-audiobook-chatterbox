@@ -90,3 +90,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 63 | 2026-10-07 | Teaching round two: the 14B's own answers, corrected | [cast](worklog/cast.md) |
 | 64 | 2026-10-07 | A description declared with a new name becomes that person | [cast](worklog/cast.md) |
 | 65 | 2026-10-07 | Teaching round three, and a stricter rule for naming descriptions | [cast](worklog/cast.md) |
+| 66 | 2026-10-08 | Teaching rounds four and five, and the rule for switching | [cast](worklog/cast.md) |
