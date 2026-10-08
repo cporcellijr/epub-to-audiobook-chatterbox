@@ -132,6 +132,8 @@ def _local_reference(name: str) -> bool:
     return bool(words) and all(word in _LOCAL_REFERENCE_WORDS for word in words)
 
 CAST_GUIDANCE_VERSION = "2026-10-06.1"
+# Names the guidance below uses as examples; a model can copy them into a cast (WORKLOG §67).
+PROMPT_EXAMPLE_NAMES = frozenset({"shirley", "squirrelly", "toni", "tony", "phil"})
 
 PROMPTS = {
     "system": (
@@ -528,6 +530,8 @@ class Roster:
         self.chapter_narrator: Optional[str] = None
         self._anonymous_narrators = set()
         self._replaced: Dict[str, str] = {}
+        self._text: List[str] = []  # the book's text read so far (read()), lowercased, to tell invented names
+        self._mentioned_cache: Dict[str, bool] = {}
         for key, character in (characters or {}).items():
             self.characters[key] = dict(character)
             if not _local_reference(character["name"]):
@@ -544,6 +548,45 @@ class Roster:
         self.chapter_aliases = {}
         self.local_aliases = {}
         self.chapter_narrator = None
+
+    def read(self, paragraphs: List[List[Segment]]) -> None:
+        """Remember a chapter's text, so a name the model gives can be checked against the book."""
+        self._text.append(" ".join(" ".join(s.text for s in p) for p in paragraphs).lower())
+        self._mentioned_cache = {}
+
+    def _mentioned(self, name: str) -> bool:
+        """Whether the book read so far writes this name (titles aside); True when nothing was read."""
+        norm = normalize_name(name)
+        if not self._text or not norm:
+            return True
+        if norm not in self._mentioned_cache:
+            pattern = re.compile(r"(?<![\w'’])" + r"\s+".join(map(re.escape, norm.split())) + r"(?![\w])")
+            self._mentioned_cache[norm] = any(pattern.search(text) for text in self._text)
+        return self._mentioned_cache[norm]
+
+    def _spliced(self, name: str, gender: str) -> Optional[str]:
+        """The character a full name really means when the model spliced one person's first name onto
+        another's surname and the book never writes it (seen live: "Joanna de la Cruz" for Dr. Joanna
+        Glass, beside Captain Katrina de la Cruz): the one compatible owner of that first name, else None.
+        A name the book does write is a real person (a sister who shares the captain's surname)."""
+        words = normalize_name(name).split()
+        if len(words) < 2:
+            return None
+        for cut in range(1, len(words)):
+            first, surname = words[:cut], words[cut:]
+            owners, others = [], []
+            for key, character in self.characters.items():
+                key_words = normalize_name(character["name"]).split()
+                if not key_words or _local_reference(character["name"]) or _relationship_owner(character["name"]):
+                    continue
+                if key_words[:cut] == first and key_words[cut:] != surname:
+                    if "unknown" in (gender, self._gender(key)) or gender == self._gender(key):
+                        owners.append(key)
+                elif len(key_words) > len(surname) and key_words[-len(surname):] == surname:
+                    others.append(key)
+            if len(owners) == 1 and others and not self._mentioned(name):
+                return owners[0]
+        return None
 
     def new_scene(self) -> None:
         """Forget descriptive labels when the source explicitly starts a new scene/person."""
@@ -776,6 +819,14 @@ class Roster:
         key = self.resolve(name, gender)
         if gender not in GENDERS or gender == "unknown":
             gender = title_gender(name)
+        spliced = self._spliced(name, gender)
+        if spliced is not None and key in (None, spliced):
+            # An invented full name: the line is its first name's owner's, and neither becomes a new
+            # character nor renames them.
+            logger.info(f"Cast: {name!r} is not in the book; read as {self.characters[spliced]['name']!r}")
+            for alias in aliases or []:
+                self._alias(spliced, alias)
+            return spliced
         if key is None:
             key = self._new_key(name)
             self.characters[key] = {"name": display_name(name), "aliases": [], "gender": "unknown",
@@ -830,6 +881,8 @@ class Roster:
             return
         if self.aliases.get(norm) not in (None, key):
             return  # an alias already owned by another character stays theirs
+        if norm in PROMPT_EXAMPLE_NAMES and not self._mentioned(alias):
+            return  # copied from the guidance's own examples (seen live: "Squirrelly"), not from the book
         owner = _relationship_owner(self.characters[key]["name"])
         if owner and norm == normalize_name(owner):
             return  # a relationship label's owner is a different character
@@ -1170,6 +1223,7 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
     core.speech_tags.quoted_terms) is no speech: never asked, no speaker, not an unknown line.
     """
     roster.new_chapter()  # family and narrator references belong only to this chapter
+    roster.read(paragraphs)
     roster.set_chapter_narrator(narrator, narrator_aliases)
     result: Dict[int, Optional[str]] = {}
     llm_moods: Dict[int, str] = {}

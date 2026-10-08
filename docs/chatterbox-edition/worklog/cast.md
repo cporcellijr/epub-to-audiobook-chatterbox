@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67.
 
 ## Where things stand (2026-10-07)
 
@@ -33,8 +33,9 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   (§61.1). Prompt changes move the rest by about 15 lines in 900 (§45.3), so judge a prompt change
   over three or more live runs per variant. Teaching the model is the next lever. A 7B taught from
   the 14B's own answers, with the masked lines corrected (§63, §65), is close to the 14B at twice
-  the speed on some books but invents identities on others (§65-§66: Six Wakes' "Joanna de la Cruz").
-  A fixed rule judged two more rounds and kept the 14B; the 14B can't be trained on this card (§62-§63).
+  the speed on some books; a guard now stops it inventing identities from one person's first name
+  and another's surname (§67). By a fixed rule the 14B still stays: the taught 7B is worse on
+  Apex Prey 3 (16 against 11). The 14B can't be trained on this card (§62-§63).
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -2104,3 +2105,45 @@ registered in Ollama (`to_ollama.sh`).
     joins one person's first name to another's surname);
   - keeping §59's example names out of what the model can copy;
   - or a bigger base model, trained on a bigger card.
+
+## 67. A guard against invented and borrowed names (2026-10-08)
+
+§66's taught 7B lost Six Wakes to a name it made up. Dr. Joanna Glass's lines went to "Joanna de la
+Cruz", her first name with Captain Katrina de la Cruz's surname, as a second character with a second
+voice. The owner asked for a code guard. It protects the 14B as well.
+
+### 67.1 The guard
+
+The roster now reads each chapter's text (`Roster.read`, from `attribute_chapter`) and can tell
+whether the book writes a name (`_mentioned`, titles aside).
+
+- **A spliced name** (`_spliced`) is one character's first name followed by another character's
+  surname. When exactly one gender-compatible character owns that first name and the book read so far
+  never writes the full name, the line is that owner's. The invented name neither becomes a character
+  nor renames the owner: a first-name-only "Joanna" stays "Joanna" instead of growing into "Joanna de
+  la Cruz".
+- **When the book writes the name,** it is a real person: a sister who shares the captain's surname
+  stays her own character.
+- **With no text read,** names are taken as given, as before (tests, callers outside a chapter).
+- **A borrowed alias.** The same cast listed "Squirrelly" for Maria Arena: the example name in §59's
+  prompt guidance. An alias among the guidance's own example names (`PROMPT_EXAMPLE_NAMES`: Shirley,
+  Squirrelly, Toni, Tony, Phil) is dropped unless the book writes it. A test checks that each listed
+  name really is in the prompts.
+
+### 67.2 Checks
+
+Every saved answer-key run of §64-§66 was replayed on the guarded code with its own answers (requests
+matched by passage and ids). Means over request sizes 16/20/24, wrong + unresolved lines:
+
+| Model | Apex Prey 3 | Six Wakes | You Like It Darker |
+|---|---|---|---|
+| qwen2.5:14b (current) | 11.3, unchanged | 2.7, unchanged | 72.0, unchanged |
+| taught 7B, round four | 25.0, unchanged | 14.3 → **4.7** | 89.3, unchanged |
+| taught 7B, round five | 16.0, unchanged | 50.3 → **6.3** | 71.7, unchanged |
+
+- The guard never fired on the 14B's nine runs.
+- On the taught models it removes the invented identity and nothing else.
+- Round five under §66's switch rule, with the guard: books 94.0 against 86.0, Apex Prey 3 16.0
+  against a bar of 14.3, Six Wakes 6.3 against 5.7. Still a fail; the app stays on qwen2.5:14b.
+- Six new tests: a spliced name the book never writes, one it does, a first name not renamed, no text
+  read, a borrowed alias dropped and kept, and the example names being the prompt's. 990 app tests pass.

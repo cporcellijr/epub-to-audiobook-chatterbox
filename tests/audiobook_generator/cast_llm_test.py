@@ -515,6 +515,59 @@ class TestLocalReferences(unittest.TestCase):
         self.assertEqual(roster.characters[gemma]["name"], "Gemma")
 
 
+class TestInventedNames(unittest.TestCase):
+    """Names the model makes up rather than reads (WORKLOG §67)."""
+
+    TEXT = M.join(['"Status?" asked Dr. Joanna Glass.', '"Holding," Captain Katrina de la Cruz said.'])
+
+    def _roster(self, text=TEXT):
+        roster = Roster()
+        roster.read(chapter_segments(text))
+        joanna = roster.add("Dr. Joanna Glass", "female")
+        katrina = roster.add("Katrina de la Cruz", "female")
+        return roster, joanna, katrina
+
+    def test_a_spliced_name_the_book_never_writes_is_the_first_names_owner(self):
+        # Seen live: the doctor's lines under "Joanna de la Cruz", a second voice for one person.
+        roster, joanna, katrina = self._roster()
+        self.assertEqual(roster.add("Joanna de la Cruz", "female"), joanna)
+        self.assertEqual(roster.speaker_key("Joanna de la Cruz"), joanna)
+        self.assertEqual((set(roster.characters), roster.characters[joanna]["name"]),
+                         ({joanna, katrina}, "Dr. Joanna Glass"))
+
+    def test_a_spliced_name_the_book_writes_is_a_new_person(self):
+        roster, joanna, katrina = self._roster(self.TEXT + f'{M}"Joanna de la Cruz, my sister," Katrina said.')
+        self.assertNotIn(roster.add("Joanna de la Cruz", "female"), (joanna, katrina))
+
+    def test_an_invented_full_name_does_not_rename_a_first_name(self):
+        roster = Roster()
+        roster.read(chapter_segments('"Here," Joanna said.' + M + '"Good," said Katrina de la Cruz.'))
+        joanna = roster.add("Joanna", "female")
+        roster.add("Katrina de la Cruz", "female")
+        self.assertEqual(roster.add("Joanna de la Cruz", "female"), joanna)
+        self.assertEqual(roster.characters[joanna]["name"], "Joanna")
+
+    def test_without_the_books_text_names_are_taken_as_given(self):
+        roster = Roster()
+        joanna = roster.add("Dr. Joanna Glass", "female")
+        roster.add("Katrina de la Cruz", "female")
+        self.assertNotEqual(roster.add("Joanna de la Cruz", "female"), joanna)
+
+    def test_a_guidance_example_alias_the_book_never_writes_is_dropped(self):
+        roster = Roster()
+        roster.read(chapter_segments('"Soup," said Maria.'))
+        maria = roster.add("Maria Arena", "female", aliases=["Squirrelly"])
+        self.assertEqual(roster.characters[maria]["aliases"], [])
+        roster.read(chapter_segments('"Squirrelly, come here," Maria\'s mother called.'))
+        roster.add("Maria Arena", "female", aliases=["Squirrelly"])
+        self.assertEqual(roster.characters[maria]["aliases"], ["Squirrelly"])
+
+    def test_the_guarded_example_names_are_the_guidances_own(self):
+        guidance = " ".join(PROMPTS.values()).lower()
+        for name in cast_llm_module.PROMPT_EXAMPLE_NAMES:
+            self.assertIn(name, guidance)
+
+
 class TestLaterIntroductions(unittest.TestCase):
     """A name given in answer to "what's your name?" or "I'm X", after the speaker spoke as a description."""
 
