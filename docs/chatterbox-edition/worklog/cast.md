@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68.
 
 ## Where things stand (2026-10-07)
 
@@ -34,8 +34,9 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   over three or more live runs per variant. Teaching the model is the next lever. A 7B taught from
   the 14B's own answers, with the masked lines corrected (§63, §65), is close to the 14B at twice
   the speed on some books; a guard now stops it inventing identities from one person's first name
-  and another's surname (§67). By a fixed rule the 14B still stays: the taught 7B is worse on
-  Apex Prey 3 (16 against 11). The 14B can't be trained on this card (§62-§63).
+  and another's surname (§67). Given the true cast it chooses speakers better than the 14B (1,188
+  against 1,127 of 1,237 lines, §68); it loses on identity labels and unanswered lines, so by a
+  fixed rule the 14B stays. Training targets now keep only proven identity claims (§68).
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -2147,3 +2148,100 @@ matched by passage and ids). Means over request sizes 16/20/24, wrong + unresolv
   against a bar of 14.3, Six Wakes 6.3 against 5.7. Still a fail; the app stays on qwen2.5:14b.
 - Six new tests: a spliced name the book never writes, one it does, a first name not renamed, no text
   read, a borrowed alias dropped and kept, and the example names being the prompt's. 990 app tests pass.
+
+## 68. Choosing speakers versus finding identities; identity-checked training targets (2026-10-08)
+
+A review of §62-§67 found the teaching stalled on identity, not on choosing speakers, and asked for
+three things before any further training: evaluate the identity guards live, clean the training
+targets of identity claims nobody proved, and test speaker choice with a verified cast held fixed.
+
+### 68.1 Speaker choice with the cast held fixed
+
+`data/diagnostics/fixed_roster_2026-10-08/fixed_roster.py` runs the app's own first-pass windows and
+prompt (no review, no code rules) on the three answer-key books, at 20 lines a request, in two modes:
+
+- **fixed:** the known-character list is the answer key's whole cast from the start, and the header
+  says every speaker is one of them or "unknown";
+- **discovery:** the list grows from the model's own answers, as in the app.
+
+Both modes are given each chapter's true narrator, so the cast list is the only difference. An answer
+counts as a listed person by exact name, alias, or a first or last name of theirs. Naming variants
+seen in the first runs ("Akihiro Sato" and "Ninth" for Hiro, "Detective Natalie Lo") are mapped for
+every model alike. Every line's answer is saved (`details_*.jsonl`), and a second run of each
+configuration reproduced its totals exactly.
+
+| Lines right of 1,237 asked | fixed cast | discovery |
+|---|---|---|
+| qwen2.5:14b | 1,127 (88 wrong person, 22 unknown) | 1,132 (96 wrong person, 9 outside) |
+| qwen2.5:7b taught, round five | **1,188** (49 wrong person) | 1,120 (68 wrong person, 49 outside) |
+| qwen2.5:7b untaught | 723 (225 wrong person, 287 unknown) | - |
+
+- **Given the true cast, the taught 7B chooses better than the 14B:** 61 more lines right, and 44%
+  fewer wrong-person answers.
+- **The 14B gains nothing from the fixed cast;** the taught 7B gains 68 lines. Its losses are in
+  finding identities, not choosing among them.
+- **The "outside" answers are identity labels for real people, not wrong choices:** "the young woman"
+  for Gemma (14B, 8 lines), and "Super Gramp" for Andy Pelley (taught 7B, 41 lines) and Vic (8).
+
+### 68.2 The guards, live
+
+The 14B and the taught 7B (8-bit merge in Ollama) ran the three books at request sizes 16, 20 and 24
+on the deployed code, with §64-§65 and §67. Means of wrong + unresolved lines:
+
+| | Apex Prey 3 | Six Wakes | You Like It Darker |
+|---|---|---|---|
+| qwen2.5:14b | 11.3 (as before) | 2.7 (as before) | 72.0 (as before) |
+| taught 7B, round five | 16.0 | **6.7** (was 50.3) | 71.7 |
+
+- **The guard works live.** It removes the invented "Joanna de la Cruz" (the replay predicted 6.3),
+  and never fires on the 14B.
+- **By §66's rule the taught 7B still fails:** books 94.3 against 86.0, Apex Prey 3 16.0 against
+  14.3, Six Wakes 6.7 against 5.7. The app stays on qwen2.5:14b.
+- **Split by cause, live:**
+  - wrong real person: 63.4 (7B) against 74.3 (14B);
+  - invented or mislabelled identity: 17.3 against 9.7;
+  - no speaker: 13.7, all on You Like It Darker, against 2.0.
+
+### 68.3 Training targets: only proven identity claims
+
+The teacher's replies taught more than speaker choice.
+- **Borrowed names.** 31 answers across rounds two to four declare "Squirrelly" or "Shirley", the
+  examples in §59's guidance, which no passage or known list contains.
+- **Unproven narrators.** Round four's narrator correction accepted whoever the teacher declared as
+  "I" in the same reply.
+- **"Written" isn't proof.** A first cleaner kept a claim whenever the prompt wrote the name. Tests
+  showed it kept Alice aliased to Bob (two people in the passage), an "I" alias the passage only
+  mentions, and an invented name the teacher had used as an answer.
+
+`data/diagnostics/finetune_clean_2026-10-08/identity_checks.py` (10 tests, the three counterexamples
+among them, all rejected; the first cleaner accepted all three) keeps only:
+- a declaration whose name the prompt writes, or that a removed tag vouches for. An unsupported name
+  used as an answer drops the whole example;
+- an alias that is a first, last or titled form of the declared name, or that the passage
+  self-introduces ("call me", "my name is", "I'm"), and that is no other listed or declared person's
+  name;
+- an "I" alias that the prompt's narrator line states, or that the passage self-introduces;
+- a masked narrator line counted right only as "I"/"the narrator" or the narrator line's person.
+
+Rounds two to four rebuilt with it (`build_clean.py <round folder>`):
+
+| | Round 2 | Round 3 | Round 4 |
+|---|---|---|---|
+| Aliases kept / dropped | 130 / 339 | 125 / 345 | 96 / 229 |
+| "I" aliases kept / dropped | 42 / 8 | 124 / 24 | 275 / 31 |
+| Declarations dropped | 26 | 21 | 24 |
+| Examples dropped for an invented answer | 23 | 15 | 24 |
+
+Nothing has been trained on them.
+
+### 68.4 Where this leaves teaching
+
+- **Choosing speakers is learnable,** and the taught 7B already does it better than the 14B.
+- **What stops it is identity:** naming a real person by a label nobody connects to their name,
+  inventing one, and leaving lines unanswered.
+- **Before any further round:**
+  - train on the identity-checked targets;
+  - measure fixed-cast and discovery on held-out chapters, as here;
+  - judge the result live with §66's rule.
+- **If identity still plateaus,** the next comparison is the specialist approach of selecting speaker
+  mentions in shared context (ModernBookNLP, §61.5), tested on these books.
