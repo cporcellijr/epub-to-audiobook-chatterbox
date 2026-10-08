@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69.
 
 ## Where things stand (2026-10-07)
 
@@ -36,7 +36,9 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   the speed on some books; a guard now stops it inventing identities from one person's first name
   and another's surname (§67). Given the true cast it chooses speakers better than the 14B (1,188
   against 1,127 of 1,237 lines, §68); it loses on identity labels and unanswered lines, so by a
-  fixed rule the 14B stays. Training targets now keep only proven identity claims (§68).
+  fixed rule the 14B stays. A round on identity-checked targets (§69) chose even better
+  (1,202 of 1,237) but stopped linking descriptions and nicknames to named people, and more than
+  doubled the full pipeline's errors (202 against 86). Teaching has stopped there; the 14B stays.
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -2245,3 +2247,133 @@ Nothing has been trained on them.
   - judge the result live with §66's rule.
 - **If identity still plateaus,** the next comparison is the specialist approach of selecting speaker
   mentions in shared context (ModernBookNLP, §61.5), tested on these books.
+
+## 69. Introductions as identity proof, and a controlled teaching round (2026-10-08)
+
+A review of §68 found one gap left in the identity checks. An introduction anywhere in the passage
+counted as proof, so the cleaner accepted three wrong cases:
+- Shirley's "call me Squirrelly" gave Maria that alias;
+- Bob introducing himself made him the "I" even where the narrator line names Alice;
+- "My name is Anna" vouched for "Ann".
+
+The review also asked for one controlled round: the original 7B, round five's settings, the cleaned
+targets, so that the cleaning is the only change.
+
+### 69.1 An introduction proves a name only for the speaker a tag names
+
+`identity_checks.py` now accepts a self-introduction ("call me X", "my name is X", "I'm X") only:
+- **in a quotation a speech tag gives to that person.** The tag may still be in the text, or may be
+  one the masking removed; `build_clean.py` collects these quotations per book. A `[Name]` in a window
+  prompt isn't enough, because it may be the teacher's own earlier answer;
+- **with the same name:** the alias must be the introduced name or its first words. "Anna" proves
+  neither "Ann" nor "Anna Smith";
+- **never for the "I":** only the prompt's narrator line binds "I" to a person.
+
+Six tests cover these: the three cases from the review, an earlier answer shown as `[Name]`, a
+`[#N]` line nobody vouches for, and a tagged introduction that must still count. There are 16 tests
+in all.
+
+Effect on rounds two to four, training and validation files together:
+- 11 ordinary aliases rested on an introduction alone. 10 are now dropped. One is kept: "Sharpy" for
+  Dustin Pearson, whose line "I'm Sharpy" a speech tag in the text gives to Dustin.
+- 4 "I" aliases rested on an introduction; all are dropped.
+- The example counts don't change (2,143 training, 192 validation).
+
+### 69.2 A label on the wrong person is a wrong choice
+
+In §68.1's discovery runs, the taught 7B answered "Super Gramp" 49 times. Those answers were counted
+as "outside" and described as identity labels. The label marks Andy Pelley (41 of its lines), so its
+8 uses on Vic's lines are wrong-person choices, not naming variants.
+
+`fixed_roster_2026-10-08/rescore_labels.py` reads each outside label as the person it marks most
+often. Its other uses count as wrong-person choices.
+
+| Discovery, 1,237 lines | right | right person, wrong label | wrong person |
+|---|---|---|---|
+| qwen2.5:14b | 1,132 | 9 ("the young woman" = Gemma, 8; "Receptionist", 1) | 96 |
+| taught 7B, round five | 1,120 | 41 ("Super Gramp" = Andy Pelley) | 76 (68 before) |
+
+The fixed-cast results don't change: neither model gave an outside answer there.
+
+### 69.3 Round six: only the targets change
+
+Round six was trained from the original 7B with round five's settings: 2 epochs, LoRA rank 16,
+learning rate 1e-4, 4,096 tokens, the same seed and validation books. It used rounds two to four's
+identity-checked targets (`finetune6_2026-10-08`).
+- The prompts are round five's own, minus 55 examples dropped for an invented answer.
+- 541 of the 2,134 shared targets differ.
+
+### 69.4 Gates before the switch rule
+
+The review found two ways the automated evaluation could switch on a broken run.
+- **Hidden failures.** Stages were piped through `tail`, so a failed merge or run was followed by
+  the next stage. `run_eval.sh` and `to_ollama.sh` now run under `set -euo pipefail` and keep each
+  stage's full log. Inside a container, each step is checked before the next. A book that
+  `run_models.py` logs as failed also stops the run, because that script exits 0 anyway.
+- **Incomplete casts.** The scorer counts wrong and unresolved lines, not missing ones: one right
+  line against Apex Prey 3's 269 scored zero errors. `decide.py` now gives no decision (exit 1)
+  unless every run is complete:
+  - every book run is "done" with every key line;
+  - every expected chapter narrator is checked, for both models at every size;
+  - every masked line is scored.
+
+  A truncated copy of round five's runs was refused, with each gap named; round five's real runs
+  pass and give the same verdict as §68.
+
+### 69.5 Results
+
+Training took 136 minutes. The merged model, `qwen2.5-cast6:7b` (8-bit), went through every stage, and
+every run was complete.
+
+First pass only (the harness of §68.1), lines right of 1,237:
+
+| | fixed cast | discovery |
+|---|---|---|
+| qwen2.5:14b | 1,127 | 1,132 (+9 right person, wrong label) |
+| taught 7B, round five | 1,188 | 1,120 (+41 right person, wrong label) |
+| taught 7B, round six | **1,202** | **1,180** (no outside labels) |
+
+The full pipeline on the deployed code: wrong + unresolved lines, mean over request sizes 16/20/24.
+
+| | Apex Prey 3 | Six Wakes | You Like It Darker | total |
+|---|---|---|---|---|
+| qwen2.5:14b | 11.3 | 2.7 | 72.0 | 86.0 |
+| round five | 16.0 | 6.7 | 71.7 | 94.3 |
+| round six | 38.7 | 3.7 | 160.0 | 202.3 |
+
+The masked set scored 407 (round five 416). By §66's rule the app keeps qwen2.5:14b: the book
+total, Apex Prey 3 and You Like It Darker all fail.
+
+### 69.6 Better choices, broken identities
+
+The first pass got better; the full pipeline got much worse. The errors at request size 20 show why:
+- **Apex Prey 3:**
+  - Polly's lines go to "girl 3" (10) and "girl 4" (9), Gemma's to "girl 2" (8);
+  - these are descriptions declared as new people and never linked to the named characters.
+- **You Like It Darker:**
+  - 35 of Andy Pelley's lines go to "Super Gramp" and 24 to Vic;
+  - 56 lines get no speaker (round five 1, the 14B none).
+
+The cleaner kept an alias only when the prompt proved it. That drops wrong links, but it also drops
+right ones, where the story, not the prompt, connects a description or nickname to a named person.
+Trained on targets with few links left, round six most likely stopped making links. Removing
+unproven links doesn't teach correct ones.
+
+The first-pass harness showed none of this. It gives the true narrator and asks only for speakers.
+Where in the app's later stages "Super Gramp" arises was not traced.
+
+### 69.7 Outcome
+
+- **The app stays on qwen2.5:14b.** Teaching stops here unless the owner reopens it.
+- **What six rounds established:**
+  - Given the cast, a taught 7B chooses speakers better than the 14B, at twice the speed.
+  - Keeping one person under one identity across names, descriptions and nicknames is what it
+    doesn't learn from the 14B's replies:
+    - taken as they are, the replies taught it to invent names (round five);
+    - cleaned by deletion, they taught it not to link (round six).
+- **If this is revisited:**
+  - teach links from verified positive examples (the answer keys' own name, description and
+    nickname links), not by deleting the teacher's;
+  - or test the specialist approach of §61.5.
+- **Models:** `qwen2.5-cast4:7b`, `-cast5:7b` and `-cast6:7b` stay in Ollama (8.1 GB each) until the
+  owner removes them.

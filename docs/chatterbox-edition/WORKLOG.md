@@ -93,3 +93,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 66 | 2026-10-08 | Teaching rounds four and five, and the rule for switching | [cast](worklog/cast.md) |
 | 67 | 2026-10-08 | A guard against invented and borrowed names | [cast](worklog/cast.md) |
 | 68 | 2026-10-08 | Choosing speakers versus finding identities; identity-checked training targets | [cast](worklog/cast.md) |
+| 69 | 2026-10-08 | Introductions as identity proof, and a controlled teaching round | [cast](worklog/cast.md) |
