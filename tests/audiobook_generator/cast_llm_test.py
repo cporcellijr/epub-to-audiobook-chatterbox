@@ -567,6 +567,28 @@ class TestInventedNames(unittest.TestCase):
         for name in cast_llm_module.PROMPT_EXAMPLE_NAMES:
             self.assertIn(name, guidance)
 
+    def test_an_alias_with_another_characters_surname_is_not_declared(self):
+        # Seen live: "Deputy Pelley" and "Mr. Pelley" declared for Officer Canavan beside Andy Pelley;
+        # every "Deputy Pelley" line then went to Canavan.
+        roster = Roster()
+        andy = roster.add("Andy Pelley", "male")
+        canavan = roster.add("Officer Canavan", "male", aliases=["Deputy Pelley", "Mr. Pelley", "Canavan"])
+        self.assertEqual(roster.characters[canavan]["aliases"], ["Canavan"])
+        self.assertEqual(roster.add("Andy Pelley", "male", aliases=["Deputy Pelley"]), andy)
+        self.assertEqual(roster.speaker_key("Deputy Pelley"), andy)
+
+    def test_a_married_name_and_the_other_genders_title_are_still_aliases(self):
+        roster = Roster()
+        roster.add("Andy Pelley", "male")
+        donna = roster.add("Donna", "female", aliases=["Mrs. Pelley"])  # no surname of her own to contradict
+        ellen = roster.add("Ellen Smith", "female", aliases=["Mrs. Pelley"])  # "Mrs." is not Andy
+        self.assertEqual(roster.characters[donna]["aliases"], ["Mrs. Pelley"])
+        self.assertNotIn("Mrs. Pelley", roster.characters[ellen]["aliases"])  # already Donna's: stays hers
+        roster = Roster()
+        roster.add("Andy Pelley", "male")
+        ellen = roster.add("Ellen Smith", "female", aliases=["Mrs. Pelley"])
+        self.assertEqual(roster.characters[ellen]["aliases"], ["Mrs. Pelley"])
+
 
 class TestLaterIntroductions(unittest.TestCase):
     """A name given in answer to "what's your name?" or "I'm X", after the speaker spoke as a description."""

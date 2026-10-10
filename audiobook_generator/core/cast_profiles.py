@@ -624,11 +624,20 @@ def could_say_i(chapter: ChapterText, key: Optional[str], characters: Dict[str, 
     return character.get("name") == ANONYMOUS_NARRATOR or _named_in_narration(chapter, character) <= NARRATED_I_MAX
 
 
+STORY_LINK_MIN_LINES = 3  # lines someone its text never names must speak in a chapter to tie it to a story
+
+
 def _same_story(chapter: ChapterText, narrator: str, theirs: List[ChapterText], characters: Dict[str, dict]) -> bool:
     """Whether a chapter is part of the story `narrator` tells in `theirs`: besides the narrator, it
     shares someone with those chapters (seen live: a collection's next story, sharing nobody with
-    the last one, had been handed the last story's narrator). No one else to compare: yes."""
-    mine = _chapter_cast(chapter, characters) - {narrator}
+    the last one, had been handed the last story's narrator). Someone the chapter's text never names
+    counts only with STORY_LINK_MIN_LINES lines there (seen live: the next story's unnamed detective
+    answered twice as the last story's cop joined the stories, and its "I" stayed the last narrator).
+    No one else to compare: yes."""
+    from collections import Counter
+    named, spoken = _chapter_cast(chapter, characters, speakers=False), Counter(chapter.lines.values())
+    mine = {key for key in _chapter_cast(chapter, characters)
+            if key in named or spoken[key] >= STORY_LINK_MIN_LINES} - {narrator}
     others = set().union(*(_chapter_cast(c, characters) for c in theirs if c is not chapter)) - {narrator}
     return not mine or not others or bool(mine & others)
 

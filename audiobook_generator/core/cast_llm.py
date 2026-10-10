@@ -767,6 +767,32 @@ class Roster:
         exact = [k for k in candidates if (normalize_name(self.characters[k]["name"]).split() or [k])[0] == first]
         return exact[0] if len(exact) == 1 else None
 
+    def _declared_aliases(self, key: str, aliases: Optional[List[str]]) -> List[str]:
+        """The aliases a reply declares for `key`, less those with another character's surname when
+        `key` has a different one (seen live: "Deputy Pelley" and "Mr. Pelley" declared for Officer
+        Canavan beside Andy Pelley, and every "Deputy Pelley" line went to Canavan). A one-word name
+        may take any surname (a married name); a title of the other gender is someone else."""
+        def surname(k: str) -> Optional[str]:  # descriptions and unnamed narrators have none
+            name = self.characters[k]["name"]
+            words = normalize_name(name).split()
+            if len(words) < 2 or k in self._anonymous_narrators or _local_reference(name) or _relationship_owner(name):
+                return None
+            return words[-1]
+
+        own, kept = surname(key), []
+        for alias in aliases or []:
+            words, gender = normalize_name(alias).split(), title_gender(alias)
+            owners = [] if (own is None or not words or words[-1] == own or _local_reference(alias)
+                            or normalize_name(alias) in _NARRATOR_REFERENCES) else [
+                k for k in self.characters if k != key and surname(k) == words[-1]
+                and ("unknown" in (gender, self._gender(k)) or gender == self._gender(k))]
+            if owners:
+                logger.info(f"Cast: alias {alias!r} is {self.characters[owners[0]]['name']}'s surname; "
+                            f"not given to {self.characters[key]['name']}")
+            else:
+                kept.append(alias)
+        return kept
+
     def add(self, name: str, gender: str = "unknown", age: str = "unknown", aliases: Optional[List[str]] = None) -> str:
         """Register a character (or merge into the one this name refers to); returns its key."""
         if name.strip().startswith("@"):
@@ -777,7 +803,7 @@ class Roster:
             for field, value, allowed in (("gender", gender, GENDERS), ("age", age, AGES)):
                 if value in allowed and value != "unknown" and character.get(field, "unknown") == "unknown":
                     character[field] = value
-            for alias in aliases or []:
+            for alias in self._declared_aliases(key, aliases):
                 self._alias(key, alias)
             return key
         if normalize_name(name) in _NARRATOR_REFERENCES:
@@ -825,7 +851,7 @@ class Roster:
             # An invented full name: the line is its first name's owner's, and neither becomes a new
             # character nor renames them.
             logger.info(f"Cast: {name!r} is not in the book; read as {self.characters[spliced]['name']!r}")
-            for alias in aliases or []:
+            for alias in self._declared_aliases(spliced, aliases):
                 self._alias(spliced, alias)
             return spliced
         if key is None:
@@ -840,7 +866,7 @@ class Roster:
             self._alias(key, previous)
         else:
             self._alias(key, shown)
-        for alias in aliases or []:
+        for alias in self._declared_aliases(key, aliases):
             self._alias(key, alias)
         if gender in GENDERS and gender != "unknown" and character["gender"] == "unknown":
             character["gender"] = gender

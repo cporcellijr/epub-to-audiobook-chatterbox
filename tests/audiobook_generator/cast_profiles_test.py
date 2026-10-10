@@ -580,22 +580,23 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertNotIn("The Narrator", chat.prompts[0][1]["content"])
         self.assertIsNone(tone["pov_key"])
 
-    def _other_story(self, mention=""):
-        """A first-person story whose "I said" lines the model gave to Oliver, with people of its own."""
+    def _other_story(self, mention="", strays=0):
+        """A first-person story whose "I said" lines the model gave to Oliver, with people of its own;
+        its last `strays` untagged lines went to Bettie, of the last story, whom it never names."""
         text = (f"I walked into the lab at dawn and the machines hummed. {mention}" * 20 + M
                 + f'"Sit down," Elgin said.{M}"Why?" I asked.{M}"Because," Elgin said.{M}'
-                + f'"Coffee?" Mabel asked.{M}"Later," I said.{M}"Fine," said Dora.')
+                + f'"Coffee?" Mabel asked.{M}"Later," I said.{M}"Fine," said Dora.' + f'{M}"Is that so?"' * strays)
         chapter = _story(3, text, {})
         ids = [seg.line_id for p in chapter.paragraphs for seg in p if seg.kind == "dialogue"]
-        chapter.lines.update(dict(zip(ids, ["elgin", "oliver", "elgin", "mabel", "oliver", "dora"])))
+        chapter.lines.update(dict(zip(ids, ["elgin", "oliver", "elgin", "mabel", "oliver", "dora"] + ["bettie"] * strays)))
         return chapter
 
-    def _collection(self, mention=""):
+    def _collection(self, mention="", strays=0):
         cast = self._cast(1, 2, 3)
         for key in ("elgin", "mabel", "dora"):
             cast["characters"][key] = {"name": key.title(), "aliases": [], "gender": "unknown", "lines": 1}
         chapters = [_story(1, _FIRST_PERSON, dict(self.FIRST)), _story(2, _FIRST_PERSON, dict(self.FIRST)),
-                    self._other_story(mention)]
+                    self._other_story(mention, strays)]
         for chapter in chapters:
             cast["chapters"][f"h{chapter.number}"]["lines"] = {str(k): v for k, v in chapter.lines.items()}
         return cast, chapters
@@ -611,6 +612,14 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertEqual(sorted({v for v in cast["chapters"]["h3"]["lines"].values()}),
                          sorted({"elgin", "mabel", "dora", narrators[2]}))
         self.assertEqual(cast["book_tone"]["pov_key"], "oliver")
+
+    def test_a_few_lines_given_to_someone_the_next_story_never_names_do_not_join_it_to_the_last(self):
+        # Seen live: the next story's unnamed detective answered twice as the last story's cop joined
+        # the stories, and the last story's narrator kept the next one's 74 "I" lines.
+        for strays, joined in ((2, False), (3, True)):
+            cast, chapters = self._collection(strays=strays)
+            apply_chapter_narrators(cast, chapters, chapter_narrators(cast, chapters, None))
+            self.assertEqual(cast["chapters"]["h3"]["narrator"] == "oliver", joined, strays)
 
     def test_generic_descriptions_do_not_connect_unrelated_stories(self):
         cast, chapters = self._collection("The girl waited beside me. ")

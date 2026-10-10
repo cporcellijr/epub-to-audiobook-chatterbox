@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72.
 
 ## Where things stand (2026-10-07)
 
@@ -38,7 +38,9 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   against 1,127 of 1,237 lines, §68); it loses on identity labels and unanswered lines, so by a
   fixed rule the 14B stays. A round on identity-checked targets (§69) chose even better
   (1,202 of 1,237) but stopped linking descriptions and nicknames to named people, and more than
-  doubled the full pipeline's errors (202 against 86). Teaching has stopped there; the 14B stays.
+  doubled the full pipeline's errors (202 against 86). Teaching has stopped there; the 14B stays. The 14B
+  itself can now be taught on this card (§70), but its adapter at full strength did far worse
+  (books 152 against 86, §72); guards now stop one borrowed name spreading to a whole person or story.
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -2544,3 +2546,82 @@ Final results are in the checkpoint trial's `comparison-report.md`, `status.json
 The checkpoint follow-up is PAUSED, and the runner and all owned export/evaluation/scoring
 containers have exited. The app remains configured for `qwen2.5:14b`. At the owner's request,
 Codex stops here so Claude can try the next experiment; no further test or code change started.
+
+## 72. The adapter served unmerged, and two guards against one wrong name spreading (2026-10-10)
+
+Picks up from §71: the next experiment was the final 14B adapter applied separately from the base
+model, with a fresh control. The owner then asked for a pipeline change against what that run showed.
+Private material is in `data/diagnostics/finetune14_lora_2026-10-10/` (the served-adapter test) and
+`data/diagnostics/pipeline_guard_2026-10-10/` (replays and the live check).
+
+### 72.1 The adapter served unmerged
+
+- **Setup** (`run_lora_eval.py`): llama.cpp `server-cuda-b11515` on Ollama's own qwen2.5:14b Q4_K_M
+  blob, with the adapter converted to an f16 GGUF LoRA. It has two arms, each on a fresh server: the
+  adapter at scale 0 (the control) and at scale 1. Both use the same flags, under one exclusive
+  `training` GPU reservation.
+- **Pitfalls the runner checks for:** `--lora-init-without-apply` still lists the adapter at scale 1.0
+  on this build, so the runner uses `--lora-scaled file:0|1` and asserts the listed scale. It also
+  asserts ChatML rendering through `/apply-template` and free VRAM (10.4-10.5 of 12.3 GB used).
+- **The control matched Ollama's 14B exactly:** Apex/Six Wakes/YLID 12/5/68, 11/2/77 and 11/1/71
+  at sizes 16/20/24, and 377 masked.
+- **The adapter at full strength did far worse.** Books scored 152.3 against 86.0, all of the extra
+  errors in YLID (137.7 against 72.0, with one wrong chapter narrator at sizes 20 and 24). It did
+  better on the masked set (392 against 377) and on Six Wakes (1.7 against 2.7). The rule kept the 14B.
+- **What the merge did:** §70's merged Q4_K_M model scored 92 because the 4-bit merge had weakened
+  the adapter. The export did hide part of the training, but what it hid was harm, not gain.
+
+### 72.2 Why one answer cost 40-80 lines
+
+The adapter's window answers are nearly the same as the control's. The damage comes from one or two
+identity decisions that the pipeline then applies to a whole person or chapter:
+
+- **Size 16:** a reply declared "Deputy Pelley", "Mr. Pelley" and "Semi-retired Deputy Pelley" as
+  aliases of Officer Canavan, with Andy Pelley already in the cast. Every Pelley line tagged that
+  way followed Canavan.
+- **Sizes 20/24:** in the next story (chapter 17), the model answered the unnamed detective's 2 lines
+  as "Officer Canavan", the previous story's cop. `_same_story` counts anyone the model gave a line as
+  shared cast. So chapter 17 joined chapters 15-16, the story break (§49) never fired, and Vic Trenton
+  kept William Davis's 74-76 "I" lines.
+- Across all 15 saved YLID runs, every false link was the same: Canavan, with 2 lines in chapter 17.
+- The taught model also declares more aliases than the 14B: 464 against 406 over the same 300 requests.
+
+### 72.3 The guards
+
+- **Story links** (`cast_profiles._same_story`): someone the chapter's text never names ties the
+  chapter to a story only by speaking at least `STORY_LINK_MIN_LINES` (3) lines there. People the text
+  names count as before. `addressed_tellers` already ignored whom the model gave lines to; this applies
+  the same lesson to the break check, softened so that a novel's regular who goes unnamed in a chapter
+  ("my wife", many lines) still holds the story together.
+- **Alias surnames** (`Roster._declared_aliases`, used by `add` for aliases a reply declares): an alias
+  whose surname is another named character's is refused when the target has a different surname of
+  its own. Self-introductions and merges are untouched.
+  - A one-word name may still take any surname (a married name).
+  - A title of the other gender is someone else ("Mrs. Pelley" beside Andy).
+  - Descriptions, unnamed narrators and narrator references ("the narrator") are exempt. A first
+    version refused "the narrator" as The Narrator's "surname"; the replays caught it.
+- Adding "deputy" to `_TITLES` was not done: surname matching deliberately skips titled names (§71).
+
+### 72.4 Checks
+
+- **Replays.** All 45 saved key-book runs were replayed on the guarded code with their own answers:
+  control, adapter, the merged Q4_K_M model, checkpoint 200 and Ollama's 14B, at sizes 16/20/24.
+  - The 14B, control, merged and checkpoint-200 runs are unchanged, every one. In them the alias
+    guard refused only "Officer Canavan" declared for Officer P. Zane, which the ownership check
+    already refused.
+  - Adapter YLID: size 20 went from 148 to 72 and size 24 from 138 to 64, with every chapter
+    narrator right and every request matched.
+- **Masked set.** Both arms' runs were replayed: 377 and 392, unchanged, no line different, every
+  request matched.
+- **Live, size 16** (the alias guard changes later prompts, so a replay can't judge it): YLID went
+  from 127 to 123, Apex 13 and Six Wakes 1 unchanged. Andy Pelley now keeps "Deputy Pelley", but the
+  taught model still answers 43 of his lines as Officer Canavan directly. That is a choice error no
+  identity guard reaches.
+- **The adapter with both guards:** YLID 123/72/64, books about 101 against 86. It still fails; the
+  app stays on qwen2.5:14b.
+- **For the 14B these guards change nothing measured today.** They stop a class of failure the taught
+  models showed: one borrowed name spreading to a whole person or story.
+- **Tests:** three new ones (an alias with another's surname refused; a married name and the other
+  gender's title kept; two stray lines don't join stories but three do). The first and third fail on
+  the old code. 1,009 app tests pass.
+- **Not deployed;** the change is in the working tree.
