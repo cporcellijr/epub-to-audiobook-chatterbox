@@ -3,6 +3,7 @@ from pathlib import Path
 
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core.audiobook_generator import AudiobookGenerator
+from audiobook_generator.core import gpu_reservation
 from audiobook_generator.tts_providers.base_tts_provider import (
     get_supported_tts_providers,
 )
@@ -231,7 +232,9 @@ def main(config=None, log_file=None):
 
     setup_logging(config.log, str(effective_log_file))
 
-    return AudiobookGenerator(config).run()
+    engine = config.model_name if config.tts == "openai" and not config.preview else None
+    with gpu_reservation.session(engine):
+        return AudiobookGenerator(config).run()
 
 
 if __name__ == "__main__":

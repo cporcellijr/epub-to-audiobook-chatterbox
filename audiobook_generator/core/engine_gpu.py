@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 import requests
 
-from audiobook_generator.core import breeze_client, cast_llm, chatterbox_control
+from audiobook_generator.core import breeze_client, cast_llm, chatterbox_control, gpu_reservation
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,8 @@ def _start(engine: str, target: Callable[[], object]) -> None:
 
 def ready_for_book(engine: str) -> bool:
     """May a book for this engine start now? Never blocks for long; see the module docstring."""
+    if gpu_reservation.configured():
+        return True  # The job holds a shared reservation before loading or speaking (main.py).
     if engine == "kokoro":
         return True
     if engine == "breeze":

@@ -47,7 +47,7 @@ from pydub import AudioSegment
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import breeze_client, delivery, voice_design, voice_measure, voice_transcripts
+from audiobook_generator.core import breeze_client, delivery, voice_design, voice_measure, voice_transcripts, gpu_reservation
 from audiobook_generator.core.cast_llm import llm_configured
 from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.core.chatterbox_control import chatterbox_url
@@ -262,6 +262,7 @@ def sweep_voice_previews() -> None:
         _delete_if_exists(path)
 
 
+@gpu_reservation.session("chatterbox")
 def preview_voice(voice: str, phrase: str, exaggeration: float, cfg_weight: float,
                   temperature: float, speed: float) -> str:
     """Speak the phrase with the slider values (not saved) and return the audio file path."""
@@ -295,6 +296,7 @@ def preview_voice(voice: str, phrase: str, exaggeration: float, cfg_weight: floa
     return path
 
 
+@gpu_reservation.session("chatterbox")
 def preview_delivery_range(voice: str, phrase: str, exaggeration: float, cfg_weight: float,
                            temperature: float, speed: float) -> str:
     """Voice lab: the phrase spoken soft, then normal, then excited, around the current sliders

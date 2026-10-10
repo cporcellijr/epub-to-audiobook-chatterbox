@@ -2377,3 +2377,170 @@ Where in the app's later stages "Super Gramp" arises was not traced.
   - or test the specialist approach of §61.5.
 - **Models:** `qwen2.5-cast4:7b`, `-cast5:7b` and `-cast6:7b` stay in Ollama (8.1 GB each) until the
   owner removes them.
+
+## 70. Reopening 14B training (2026-10-09, in progress)
+
+The owner authorized an overnight attempt to train the 14B itself. The original
+`qwen2.5:14b` remains configured while the candidate is trained and judged.
+
+- **Evidence:** §63.1's retry failed on a 136 MiB allocation even at 3,072 tokens. The
+  installed image now reports Unsloth 2026.10.3. New trials are in
+  `data/diagnostics/finetune14_2026-10-09/`, outside git, with `status.json` and complete stage logs.
+- **Data:** round five's 2,198 corrected training examples and 199 validation examples are copied
+  unchanged, retaining teacher identity links. Training and validation books are disjoint;
+  the 14B's tokenizer drops one training example over 4,096 tokens. This isolates the bigger base
+  model rather than repeating round six's deletion of links. Unverified teacher links remain a risk.
+- **First trials:** batch 1, accumulation 8, rank 16, BF16, 4-bit base, CPU input embedding,
+  Unsloth checkpointing, expandable allocator segments, and a 10.3 GiB process cap. Loss budgets
+  of 0.25 and 0.125 GiB both fail on an 86 MiB MLP activation before the loss. Rank 8 without MLP
+  tiling fails on a 136 MiB dequantization buffer. All tests use the 16 longest retained examples,
+  for two optimizer steps, before any full training.
+- **Next trial:** use the installed `patch_tiled_mlp` helper after attaching LoRA, with a
+  0.125 GiB activation target on all 48 MLPs. Try rank 16, then rank 8 if needed. If a smoke test
+  passes, train one epoch and export a new `qwen2.5-cast14:14b` model as Q4_K_M, matching the
+  original 14B's serving precision. Do not transfer a 7B adapter.
+- **GPU ownership:** add a `training` reservation to the native coordinator and shared client.
+  Other engines wait. Normal release refuses while the owned `cast-train14` container is active;
+  expired reservations stop it before handing over the GPU. Coordinator and client regression
+  checks pass (16 local helper tests and 10 client tests), plus the runner's failure-gate checks.
+- **Evaluation prepared:** reuse the request recorder, full pipeline, and §66's complete-run gates,
+  with fresh original/candidate book runs at sizes 16/20/24 and the candidate's masked set.
+  Results use separate `runs_14b_20261009_*` folders. One outer reservation per evaluation batch
+  is reused by nested requests, so waiting engines cannot interrupt the batch.
+
+No candidate has completed training or passed evaluation yet. Final outcome will be appended here.
+
+The first optimizer step succeeded with rank 8 plus tiling. The longest contexts take roughly two
+minutes per optimizer step. The first full 14B trial is one epoch (rather than round five's two),
+to limit forgetting in the stronger base and leave time for overnight evaluation. Loss must be
+finite before saving the full-run adapter.
+
+The second optimizer step at rank 8 plus tiling failed on a 136 MiB dequantization buffer:
+10.12 GiB allocated plus 52.72 MiB reserved but unused left the requested allocation just beyond
+the 10.3 GiB cap. A 10.4 GiB retry is in progress, with a hardware-VRAM check before loading
+(at least the cap plus 48 MiB free); the idle reading was 10,930 MiB free. A thread follow-up
+checks the pipeline every 30 minutes overnight and will record the final result.
+
+**22:43 — smoke passed and full training started.** The two optimizer steps on the 16 longest
+retained examples completed with finite loss 0.085358 and peak reserved VRAM 10.36 GiB, using
+rank 8, 0.125 GiB loss/MLP budgets, CPU input embedding, and the 10.4 GiB process cap. The full
+run has 2,197 examples and 275 optimizer steps for one epoch; its first two steps completed
+without OOM. Early throughput projects about five hours of training, subject to context lengths.
+The saved traces and existing request recorder are reused; no live teacher runs alongside training.
+
+At the user's request, 18 other running containers were stopped for the night, leaving only
+`cast-train14`, `ollama`, and `breeze` running. The original IDs are recorded in
+`data/diagnostics/finetune14_2026-10-09/containers-to-restore.json`; a separate thread follow-up
+will restart those same containers at 07:00 America/New_York on October 10. The native GPU
+coordinator remains running. Training and candidate quality are still unverified until the full
+run and fresh evaluations finish; the original `qwen2.5:14b` remains configured.
+
+**October 10, 04:02 — full training completed.** All 275 optimizer steps finished in 318 minutes
+with finite mean training loss 0.0483210672 and peak reserved VRAM 10.38 GiB. The final adapter
+and checkpoint 275 were saved. Settings remained rank 8, one epoch, 4,096-token maximum,
+0.125 GiB loss/MLP budgets, CPU input embedding, and a 10.4 GiB process cap. The training
+container exited and released its coordinator reservation. CPU export automatically started;
+at 04:07 it was downloading the pinned canonical full-precision Qwen2.5-14B base. Disk space
+is sufficient (approximately 245 GiB free on C: and 733 GiB inside the Docker filesystem).
+Serving export and fresh quality comparisons are pending; the original model remains configured.
+
+**05:05 — export completed; fresh comparisons started.** All 336 adapter weights merged into
+the pinned canonical 14B base, GGUF conversion and Q4_K_M quantization completed, and Ollama
+registered `qwen2.5-cast14:14b` as a 14.8B Qwen2 model at Q4_K_M (8,566 MiB quantized weights).
+The first window-size-16 batch is running under one `ollama` reservation. Its original-model
+Apex 3 baseline finished with 19 calls and no unusable windows; remaining books, candidate
+runs, other window sizes, and the masked set are pending. No switch has been made.
+
+**06:41 — final result: KEEP THE ORIGINAL 14B.** Fresh base/candidate runs at sizes 16/20/24
+all completed and passed coverage checks. The candidate scored 382/600 on the masked set
+(required >=378), but mean combined book errors were 92.0 versus the original's 86.0, failing
+the overall gate. Per-book candidate errors were Apex 3 [14,14,15] (mean 14.3; base [12,11,11]),
+Six Wakes [4,5,4] (mean 4.3; base [5,2,1]), and You Like It Darker [69,75,76] (mean 73.3;
+base [68,77,71]). Individual book tolerances passed, as did all You Like It Darker chapter
+narrators (zero wrong at every size). No configured-model switch was made.
+
+The masked batch initially failed its execution gate because one EPUB had moved to
+`Boris Bacic/The Town The World Forgot (The Town That Shouldn't Exist Book 1) (2024).epub`.
+Both selected chapter titles matched the fixture; only that missing book was rerun using the
+unchanged masked text and labels, preserving completed casts. The decision was run in the app
+container because the host helper environment lacks the scorer's pydub dependency; the private
+pipeline now uses that same installed container environment for scoring. All 27 masked books
+and all 600 masked lines were complete before the acceptance decision.
+
+Final artifacts are `status.json`, `logs/decision.log`, and `morning-report.md` in the trial folder;
+the trained adapter, checkpoints, and Q4_K_M candidate `qwen2.5-cast14:14b` are preserved.
+The trial's training follow-up is disabled, the coordinator is idle, and the separate 07:00
+container-restoration follow-up remains active. The 14B memory problem was overcome locally
+at 10.38 GiB peak reserved memory; this one-epoch rank-8 adapter did not improve overall accuracy.
+
+**07:00 — services restored.** All 18 containers from the overnight manifest were restarted
+using the same saved IDs. After startup, all were running and all six configured health checks
+were healthy. No containers outside the manifest were started or recreated. The result is saved
+in `containers-restored.json` beside the trial manifest; the restoration follow-up is disabled.
+
+## 71. Inspect the regression and test an earlier 14B checkpoint (2026-10-10)
+
+The owner authorized the next step. Checkpoint 200 is the earliest retained checkpoint
+(the others are 250 and 275); test it before retraining. The private trial lives under
+`data/diagnostics/finetune14_ck200_2026-10-10/`. It copies the saved adapter, reuses the existing
+CPU merge/export and complete-run gates, exports as Q4_K_M, and runs fresh original/candidate
+comparisons at window sizes 16/20/24 plus the candidate's masked set. Results and model name
+`qwen2.5-cast14-ck200:14b` are separate from the completed trial. The original stays configured.
+Application services remain running, and GPU evaluation continues to use the coordinator.
+
+The audit of all nine original/final book runs found 77 original mistakes fixed and 95 new
+mistakes, for 18 extra errors across the three sizes (mean book total 92 versus 86). No new
+mistake is an unresolved line. Twelve are the psychologist labelled Doctor, even though its
+separate character retains `the psychologist` and `the chirpy dude` aliases: a wrong label,
+not evidence that those two characters were merged. The largest new confusion is Andy Pelley
+assigned to Vic Trenton (22 occurrences). Nine new-error rows have an ambiguous reference-review
+status. Keep the existing acceptance rule; these distinctions inform the diagnosis, not a
+post-result change to the metric. Coverage and partition-count assertions passed; detailed
+changed-line records are in `finetune14_2026-10-09/error-comparison.json`.
+
+The copied private masked fixture corrects the moved EPUB's path; all masked text and labels
+are unchanged. Training/validation book-name lists (218/19) contain none of the three evaluation
+book titles. At 07:58 the checkpoint-200 CPU export started; final quality results are pending.
+
+The contained Strata draft timed out after its 600-second request limit; no generated changes
+were applied. The coordinator recovered the reservation and the GPU returned to idle memory
+usage. The audit uses the existing scorer with coverage and count invariants; the reused
+pipeline's two failure-gate checks and syntax checks passed. A 30-minute thread follow-up
+monitors this checkpoint trial through its terminal result.
+
+**09:42 — checkpoint-200 book comparison complete; masked set running.** All 18 fresh
+original/candidate book casts pass coverage and narrator-check completeness. Candidate errors
+are Apex [16,16,16], Six Wakes [2,6,7], and YLID [131,129,94]: mean combined errors 139,
+versus the original's unchanged 86 and the final checkpoint's 92. Across the three sizes,
+checkpoint 200 fixes 87 original errors and introduces 246 (417 total versus 258); partition
+assertions pass. All YLID chapter narrators are correct. The combined-book gate already fails,
+but the pipeline is finishing the masked set for a complete recorded result.
+
+The saved YLID runs at sizes 16/20 split Deputy Pelley from Andy Pelley, with 41 wrong lines
+assigned to the unaliased deputy per size; size 24 records Deputy Pelley as Andy's alias.
+A read-only-source, CPU-only Roster check confirms that adding occupational titles to
+`cast._TITLES` alone does not fix this: the surname fallback explicitly excludes titled
+names (`cast_llm.py:758`). No production change was applied. A separate final-adapter test
+on llama.cpp is a useful proposed export control, supported by the older 7B four-bit-merge
+regression in section 66.1, but its 14B effect remains untested. The earlier 378/376 server
+scores were close rather than identical, so any new trial needs its own fresh control.
+
+**09:57 — checkpoint-200 final result: KEEP THE ORIGINAL 14B.** All 27 masked books and
+600 lines completed; the score is 383/600 (bar 378). Complete-run coverage passes for
+all book casts, masked chapters/lines, and expected chapter narrators. Mean combined book
+errors 139 versus fresh original 86 fail the overall gate. Apex mean 16 exceeds its 14.3
+tolerance, Six Wakes mean 5 passes its 5.7 tolerance, and YLID mean 118 exceeds its 90
+tolerance. YLID narrators are correct at every size. The final adapter's 382 masked lines
+and 92 mean book errors are better overall than checkpoint 200, but neither trained version
+beats the original under the unchanged acceptance rule.
+
+This was checkpoint 200 of the original 275-step, rank-8/alpha-16, one-epoch run, with
+LR 1e-4, response-only QLoRA loss, batch 1/accumulation 8, maximum 4096 tokens, CPU input
+embedding, and 0.125 GiB MLP/loss budgets. The full training run's recorded peak reserved
+VRAM was 10.38 GiB under its 10.4 GiB process cap; this comparison performed no training.
+
+Final results are in the checkpoint trial's `comparison-report.md`, `status.json`, and
+`logs/decision.log`. Saved adapters, candidate models, and completed casts are preserved.
+The checkpoint follow-up is PAUSED, and the runner and all owned export/evaluation/scoring
+containers have exited. The app remains configured for `qwen2.5:14b`. At the owner's request,
+Codex stops here so Claude can try the next experiment; no further test or code change started.

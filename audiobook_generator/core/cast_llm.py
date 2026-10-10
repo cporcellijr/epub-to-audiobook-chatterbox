@@ -21,7 +21,7 @@ import re
 import time
 from typing import Callable, Collection, Dict, List, NamedTuple, Optional, Tuple
 
-from audiobook_generator.core import cast_review
+from audiobook_generator.core import cast_review, gpu_reservation
 from audiobook_generator.core.cast import AGES, GENDERS, display_name, normalize_name, title_gender, titled_name
 from audiobook_generator.core.delivery import MOOD_NORMAL, MOODS, segment_moods
 from audiobook_generator.core.dialogue import DIALOGUE, Segment, split_paragraph
@@ -264,6 +264,7 @@ class ChatClient:
         self.model = model
         self.json_mode = True
 
+    @gpu_reservation.session("ollama")
     def __call__(self, messages: List[dict]) -> str:
         from openai import BadRequestError
         kwargs = dict(model=self.model, messages=messages, temperature=LLM_TEMPERATURE)

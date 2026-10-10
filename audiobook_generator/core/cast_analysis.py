@@ -10,7 +10,7 @@ from typing import Callable, List, Optional
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import chatterbox_control, engine_gpu
+from audiobook_generator.core import chatterbox_control, engine_gpu, gpu_reservation
 from audiobook_generator.core import cast_review
 from audiobook_generator.core.cast_llm import CAST_GUIDANCE_VERSION, ChatClient, Chat, Roster, attribute_chapter, \
     llm_api_key, llm_base_url, llm_model
@@ -173,12 +173,15 @@ def run_cast_analysis(settings: dict, log_file: str, unload_allowed: Callable[[]
     unloaded = False
     succeeded = False
     try:
-        if unload_allowed():
-            unloaded = unload()
-            unload_breeze()
-        else:
-            logger.info("Cast: LLM_UNLOAD_CHATTERBOX is off; Chatterbox stays loaded during the analysis")
-        analyse(settings)
+        with gpu_reservation.session("ollama"):
+            if gpu_reservation.configured():
+                logger.info("Cast: shared GPU reservation acquired for %s", settings.get("engine", "breeze"))
+            elif unload_allowed():
+                unloaded = unload()
+                unload_breeze()
+            else:
+                logger.info("Cast: LLM_UNLOAD_CHATTERBOX is off; Chatterbox stays loaded during the analysis")
+            analyse(settings)
         succeeded = True
     except Exception as e:
         logger.exception(f"Cast analysis failed: {e}")

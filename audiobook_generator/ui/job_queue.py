@@ -134,8 +134,11 @@ class JobQueue:
     def breeze_session(self):
         """Reserve the GPU without blocking queue controls; Breeze's server serializes requests."""
         from audiobook_generator.core.engine_gpu import prepare_breeze
+        from audiobook_generator.core import gpu_reservation
         with self._lock:
             for job in self._data["jobs"]:
+                if gpu_reservation.configured():
+                    break  # The shared coordinator waits for other engines, including native coding.
                 if job["status"] != RUNNING:
                     continue
                 if job_kind(job) == CAST:
@@ -144,8 +147,10 @@ class JobQueue:
                     raise RuntimeError("A Chatterbox book has the GPU. Try again once it has finished.")
             self._breeze_requests += 1
         try:
-            prepare_breeze()
-            yield
+            with gpu_reservation.session("breeze"):
+                if not gpu_reservation.configured():
+                    prepare_breeze()
+                yield
         finally:
             with self._lock:
                 self._breeze_requests -= 1
