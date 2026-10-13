@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75.
 
 ## Where things stand (2026-10-13)
 
@@ -2787,3 +2787,53 @@ roster rightly refuses as names.
 - **Cross-story narrators** (stories 12 and 18 sharing 11's and 17's narrator) are fine by §73.4.
 
 Nothing in the app changed here.
+
+## 75. An anthology's author bylines are hidden from the model (2026-10-13)
+
+§74.3: every Steamy Screams story opens with its title and its author's name, and in story 21 the model
+gave the unnamed "I" the byline's name ("Jenny Corvette", 5-6 lines every run). The owner: the author
+must never become a character.
+
+### 75.1 The rule
+
+`cast_analysis.hide_bylines`, before attribution: the second or third paragraph of a chapter, without
+dialogue, holding only a personal name (optionally after "By"), is blanked for the model when none of the
+name's words (initials aside) appears anywhere else in the selected chapters, in any case, and the same
+name heads no other chapter. Line ids are untouched; the audiobook still reads the byline. A blanked
+byline also no longer counts as a name "written in the book" for the roster.
+
+### 75.2 Checked on the whole library before shipping
+
+`data/diagnostics/byline_scan_2026-10-13/scan.py` ran the rule over every book's pre-ticked chapters
+(1,550 books, no model).
+
+- **First version** (surname only, case-sensitive): 2,289 paragraphs in 456 books, mostly chapter
+  subtitles in capitals ("OF APPLES AND TREES"), and one point-of-view heading, "JULIAN SINCLAIR", whose
+  text writes "Julian". Not shipped.
+- **Shipped version** (any word of the name, any case; no title words such as the/of/and): 126
+  paragraphs in 67 books. All are harmless to hide: bylines in four anthologies, credits ("By Matt
+  Shaw"), authors' own names, epigraph attributions (Jules Verne, Emily Dickinson: the model could have
+  taken these for characters too), and chapter subtitles without dialogue ("Rude Awakening"). No
+  character heading: a real point-of-view name appears in its chapter, which keeps it.
+- **The original three key books:** nothing hidden in their benchmark chapters, so their results cannot
+  change. Steamy Screams: 18 of 21 bylines hidden; "Tonia Brown", "Natalie L. Sin" and "JD Stone" are
+  kept because "brown", "sin" and "stone" occur in the stories.
+
+### 75.3 Live, Steamy Screams
+
+Deployed code (c3ffc8b) against it plus the rule, sizes 16/20/24, summed:
+
+| | Deployed | + bylines hidden |
+|---|---|---|
+| Teller errors (lost + others as teller) | 86 | 42 |
+| Off-voice lines within a story | 294 | 231 |
+| Merged within a story (pairs) | 13 | 21 |
+| Scorer wrong / unresolved | 387 / 58 | 350 / 42 |
+
+No character is named after an author in any run. Teller errors halved; story 11's Vivienne keeps her
+narration at sizes 16 and 24. The extra merge pairs are mostly one small collapse counted many times
+(story 14's support group, 6 lines, joining Michelle) and story 19's two unnamed leads under one name,
+which the deployed arm does too at size 24.
+
+Tests: an anthology's bylines hidden with line ids kept; a name heading several chapters kept; a heading
+the story mentions kept, in any case ("JULIAN SINCLAIR"); a title never read as a name. 1,019 tests pass.

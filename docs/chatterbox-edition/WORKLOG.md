@@ -99,3 +99,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 72 | 2026-10-10 | The adapter served unmerged, and guards against one wrong name spreading | [cast](worklog/cast.md) |
 | 73 | 2026-10-13 | Harness proposals reviewed: a fresh review header, a context guard, judging casts per story, tentative labels | [cast](worklog/cast.md) |
 | 74 | 2026-10-13 | A fourth answer key: the Steamy Screams anthology | [cast](worklog/cast.md) |
+| 75 | 2026-10-13 | An anthology's author bylines are hidden from the model | [cast](worklog/cast.md) |

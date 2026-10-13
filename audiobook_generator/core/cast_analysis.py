@@ -3,9 +3,11 @@ the main characters' profiles (core.cast_profiles), save the cast. Runs from the
 process (run_cast_analysis), never alongside a book.
 """
 import logging
+import re
 import sys
 import time
-from typing import Callable, List, Optional
+from collections import Counter
+from typing import Callable, Dict, List, Optional
 
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
@@ -15,10 +17,45 @@ from audiobook_generator.core import cast_review
 from audiobook_generator.core.cast_llm import CAST_GUIDANCE_VERSION, ChatClient, Chat, Roster, attribute_chapter, \
     llm_api_key, llm_base_url, llm_model
 from audiobook_generator.core.cast_profiles import ChapterText, describe_book, profile_cast, turn_taking
-from audiobook_generator.core.dialogue import PARAGRAPH_MARK, chapter_segments
+from audiobook_generator.core.dialogue import NARRATION, PARAGRAPH_MARK, Segment, chapter_segments
 from audiobook_generator.utils.log_handler import setup_logging
 
 logger = logging.getLogger(__name__)
+
+# A personal name and nothing else, optionally after "By": "Jenny Corvette", "Gregory L. Norris", "KV Taylor".
+_BYLINE = re.compile(r"(?:[Bb][Yy]\s+)?((?:[A-Z][\w'’-]*\.?\s+){1,3}[A-Z][\w'’-]+)")
+# Words of chapter titles ("OF APPLES AND TREES", "Among Us") that no personal name contains.
+_TITLE_WORDS = frozenset("the of and a an in on to at for with from into out up over under is it as "
+                         "my your his her its our their us we me you".split())
+
+
+def hide_bylines(chapters: Dict[int, List[List[Segment]]], log: logging.Logger = logger) -> Dict[int, List[List[Segment]]]:
+    """Blank each story's author byline for the attribution (WORKLOG §75): an anthology story opens with
+    its title and its author's name, and the model gave the byline's name to the story's unnamed "I".
+    A byline is the second or third paragraph, without dialogue, holding only a personal name (no title
+    words) none of whose words the selected chapters use anywhere else, in any case. A name heading that
+    recurs (a POV novel's chapters, or one author's two stories) or that the text mentions ("JULIAN
+    SINCLAIR" over a chapter about Julian) is kept. The audiobook still reads the byline; only the model
+    loses it. Measured over the whole library before shipping (§75)."""
+    candidates = {}
+    for number, paragraphs in chapters.items():
+        for index in (1, 2):
+            if index < len(paragraphs) and paragraphs[index] and all(s.kind == NARRATION for s in paragraphs[index]):
+                match = _BYLINE.fullmatch(" ".join(s.text for s in paragraphs[index]).strip())
+                if match and not any(w.lower().strip(".") in _TITLE_WORDS for w in match.group(1).split()):
+                    candidates[(number, index)] = match.group(1)
+    rest = " ".join(s.text for number, paragraphs in chapters.items() for index, paragraph in enumerate(paragraphs)
+                    if (number, index) not in candidates for s in paragraph)
+    headings = Counter(name.lower() for name in candidates.values())  # one name heading many chapters: POV
+    hidden = dict(chapters)
+    for (number, index), name in candidates.items():
+        words = [w for w in name.split() if len(w.strip(".")) >= 3]  # initials ("L.", "KV") prove nothing
+        if headings[name.lower()] == 1 and not any(re.search(rf"\b{re.escape(w)}\b", rest, re.IGNORECASE)
+                                                   for w in words):
+            hidden[number] = list(hidden[number])
+            hidden[number][index] = [s._replace(text="") for s in hidden[number][index]]
+            log.info(f"Cast: chapter {number}: {name!r} read as the author's byline; not shown to the model")
+    return hidden
 
 
 def parsing_config(settings: dict) -> GeneralConfig:
@@ -111,9 +148,10 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
     analysed = []  # the chapters' text and attributions, for the profiles
     started = time.monotonic()
     try:
+        segmented = hide_bylines({number: chapter_segments(chapters[number - 1][1]) for number in selection}, log)
         for done, number in enumerate(selection, 1):
             title, text = chapters[number - 1]
-            paragraphs = chapter_segments(text)
+            paragraphs = segmented[number]
             line_count = sum(1 for p in paragraphs for s in p if s.kind == "dialogue")
             log.info(f"Cast: chapter {number} ({title}): {line_count} dialogue lines in {len(paragraphs)} paragraphs")
             lines, moods = attribute_chapter(paragraphs, roster, chat, stats, log, label=f" ch{number}")

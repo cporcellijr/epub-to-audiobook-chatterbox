@@ -11,7 +11,8 @@ from ebooklib import epub
 
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import chatterbox_control
-from audiobook_generator.core.cast_analysis import analyse_book, drop_empty_placeholders, run_cast_analysis
+from audiobook_generator.core.cast_analysis import analyse_book, drop_empty_placeholders, hide_bylines, run_cast_analysis
+from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
 
 CHAPTERS = [
     ("One", ['Ada Marsh put the lamp down. "You left the gate open," she said.',
@@ -249,6 +250,41 @@ class TestDropEmptyPlaceholders(unittest.TestCase):
         }}
         drop_empty_placeholders(cast)
         self.assertEqual(sorted(cast["characters"]), ["ada", "guy", "narrator 2", "narrator 3"])
+
+
+class TestHideBylines(unittest.TestCase):
+    """An anthology story's author byline is hidden from the model; name headings that recur stay (§75)."""
+
+    @staticmethod
+    def _text(paragraphs):
+        return [" ".join(s.text for s in p) for p in paragraphs]
+
+    def test_an_anthology_byline_is_hidden_and_the_story_kept(self):
+        chapters = {5: chapter_segments(f'Among Us{M}Jenny Corvette{M}"Hello," I said.{M}Ben nodded.'),
+                    6: chapter_segments(f'Dead Deanna{M}By Gregory L. Norris{M}"Hi," said Deanna.')}
+        hidden = hide_bylines(chapters)
+        self.assertEqual(self._text(hidden[5]), ["Among Us", "", '"Hello," I said.', "Ben nodded."])
+        self.assertEqual(self._text(hidden[6])[1], "")
+        self.assertEqual([[s.line_id for s in p] for p in hidden[5]], [[s.line_id for s in p] for p in chapters[5]])
+        self.assertEqual(self._text(chapters[5])[1], "Jenny Corvette")  # the input is left alone
+
+    def test_a_name_heading_on_several_chapters_is_a_point_of_view_not_a_byline(self):
+        chapters = {1: chapter_segments(f'Chapter One{M}Marcus Fenix{M}"Move," I said.'),
+                    2: chapter_segments(f'Chapter Two{M}Marcus Fenix{M}"Again," I said.')}
+        self.assertEqual(hide_bylines(chapters), chapters)
+
+    def test_a_heading_the_story_mentions_is_kept(self):
+        chapters = {1: chapter_segments(f'Chapter One{M}Ray Bradley{M}"Late again, Bradley," she said.')}
+        self.assertEqual(hide_bylines(chapters), chapters)
+
+    def test_a_capitalised_heading_is_matched_in_any_case(self):
+        # seen in the library scan: a POV chapter headed "JULIAN SINCLAIR", the text writing "Julian"
+        chapters = {1: chapter_segments(f'DAY THIRTEEN{M}JULIAN SINCLAIR{M}"Run," Julian said.')}
+        self.assertEqual(hide_bylines(chapters), chapters)
+
+    def test_a_title_is_never_read_as_a_name(self):
+        chapters = {1: chapter_segments(f'Chapter Nine{M}OF APPLES AND TREES{M}"No," she said.')}
+        self.assertEqual(hide_bylines(chapters), chapters)
 
 
 class TestRunCastAnalysisOrder(unittest.TestCase):
