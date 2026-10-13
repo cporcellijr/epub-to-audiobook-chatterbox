@@ -129,6 +129,15 @@ class TestNotNames(unittest.TestCase):
         self.assertEqual(tags('"Fine," she said.'), {})
         self.assertEqual(tags('"It is a formality," said the doctor.'), {})
 
+    def test_a_pronoun_contraction_is_the_pronoun_not_a_name(self):
+        # seen in a novel's flashbacks: '"...," I'd said.' became a character called "I'd" (§76)
+        self.assertEqual(tags('"Blue raspberry," I’d said.'), {})
+        self.assertEqual(tags('"Freaks me out," she’d told me.'), {})
+        self.assertEqual(tags('"Fine," he\'d said, "fine."'), {})
+        self.assertEqual(first_person_tagged(chapter_segments('"Blue raspberry," I’d said, sucking a straw. '
+                                                              '"A superior flavor."')), [1, 2])
+        self.assertTrue(has_speech_tag("", " she’d told me."))
+
     def test_possessives_and_bare_titles_are_not_names(self):
         self.assertEqual(tags('"Come here," said Tom\'s mother.'), {})
         self.assertEqual(tags('"Come here," said Old.'), {})

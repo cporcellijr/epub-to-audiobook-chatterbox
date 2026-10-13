@@ -100,3 +100,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 73 | 2026-10-13 | Harness proposals reviewed: a fresh review header, a context guard, judging casts per story, tentative labels | [cast](worklog/cast.md) |
 | 74 | 2026-10-13 | A fourth answer key: the Steamy Screams anthology | [cast](worklog/cast.md) |
 | 75 | 2026-10-13 | An anthology's author bylines are hidden from the model | [cast](worklog/cast.md) |
+| 76 | 2026-10-13 | A whole novel as the main test; tentative labels reverted; "I'd" is the narrator | [cast](worklog/cast.md) |

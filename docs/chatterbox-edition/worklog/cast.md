@@ -2,15 +2,15 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76.
 
 ## Where things stand (2026-10-13)
 
 - **The pipeline** (`audiobook_generator/core/`):
   - quotations are split per chapter (`dialogue.py`, §13);
   - a line a speech tag names is an anchor and is never asked (`speech_tags.py`, §27, §30);
-  - the other lines go to the local LLM, 20 at a time, with the speakers known so far shown, earlier
-    answers marked as guesses (`cast_llm.py`, §13, §73);
+  - the other lines go to the local LLM, 20 at a time, with the speakers known so far shown
+    (`cast_llm.py`, §13; marking earlier answers as guesses was tried and reverted, §73, §76);
   - lines the text contradicts are asked once more (`cast_review.py`, §28);
   - identity rules merge one person's names and keep different people apart (§29-§31, §42-§43, §59);
   - a narrator is chosen per chapter and per story (§18, §22, §40, §44, §46-§47, §49);
@@ -27,6 +27,9 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - Apex Prey 3: 6 wrong and 4 unresolved of 269.
   - You Like It Darker: 90 wrong and 2 unresolved of 910, every chapter narrator right.
   - A fourth key (§74): Steamy Screams, 21 stories, 773 lines, eight first-person tellers.
+  - The main key since §76: Such Sharp Teeth, a whole first-person novel, 3,304 lines. On it one identity
+    cascade per run (twins confused, a person split, a label taking the "I") swings 100-270 lines, so
+    the same code ranges 211-364 wrong lines between request sizes.
 - **A wider comparison:** the masked-tag set, 600 lines from 27 library books whose tags were
   removed, is for comparing models and prompts (§61.2). qwen2.5:14b gets 376 right.
 - **How a cast is judged** (owner, 2026-10-13, §73.4): consistency within each story. A character keeps
@@ -2837,3 +2840,70 @@ which the deployed arm does too at size 24.
 
 Tests: an anthology's bylines hidden with line ids kept; a name heading several chapters kept; a heading
 the story mentions kept, in any case ("JULIAN SINCLAIR"); a title never read as a name. 1,019 tests pass.
+
+## 76. A whole novel as the main test; tentative labels reverted; "I'd" is the narrator (2026-10-13)
+
+The owner: 99% of the books are single novels, so the collections (§74-75) are hard extra cases, not the
+use case. Six Wakes is nearly saturated (1-5 wrong) and Apex Prey 3 small (269 lines), and both are
+chapter selections, so no key tested one voice per character, and one narrator, across a whole book.
+Private material: `data/diagnostics/sharp_teeth_2026-10-13/`.
+
+### 76.1 The key: Such Sharp Teeth, the whole novel
+
+- Rachel Harrison's first-person novel, chapters 4-18 (19 is a letter without dialogue): 3,336 lines.
+  Eight batches of consecutive chapters, two independent Sonnet labellers each (`check_labels.py`
+  accepts a compact `{"N": "speaker"}` form for long batches).
+- **Names are reconciled by hand only.** The first merge joined names through the labellers' aliases
+  and a first/last-name rule, and put the whole Morris family (Scarlett, Mom) into the narrator through
+  "Morris", "sister" and "my mother". `merge_novel.py` now joins only hand-checked groups
+  (`labels/adjudicated.json`).
+- 99.1% agreement; 30 disputes read in context and adjudicated (one labeller ran one quote out of step
+  for five lines of chapter 10). The key: 3,304 lines, 32 not speech, 29 speakers; the narrator, Aurora
+  "Rory" Morris, speaks 1,501.
+
+### 76.2 Tentative labels on the novel, and the revert
+
+Base 72e827f (before §73.5) against 8b8bfb2 (tentative labels + §75), sizes 16/20/24:
+
+| Size | Base: wrong / off-voice / narrator lines lost | Tentative |
+|---|---|---|
+| 16 | 364 / 346 / 234 | 185 / 164 / 72 |
+| 20 | 211 / 194 / 104 | 386 / 369 / 127 |
+| 24 | 229 / 216 / 108 | 492 / 488 / 276 |
+| Sum | 804 / 756 / 446 | 1,063 / 1,021 / 475 |
+
+Every big swing is one identity cascade, a single decision spreading to 100-270 lines:
+
+- base, size 16: the twins. 149 of Rory's lines went to Scarlett in long two-sister exchanges;
+- tentative, size 20: "The Wolf". In chapter 17 (the transformation) a reply declared `The Wolf` with
+  the alias "I"; `_alias` merged the chapter's unnamed narrator into it, so chapters 17-18 were told by
+  "The Wolf" (156 lines), a narrator change inside one novel, the owner's worst case. `addressed_tellers`
+  had Rory for 14 chapters (addressed 52 times) but leaves out a chapter whose "I said" lines went to
+  another named person;
+- tentative, size 24: the twins again (143), and the mother split in two: a new "The Narrator's Mother"
+  took 111 of Mom's lines.
+
+The same code ranges 211-364 wrong lines between sizes, more than any prompt change moves. The tentative
+labels helped the collections and the original keys (§73.5, §74.2), but on the owner's kind of book they
+hit a big cascade in two of three runs (base in one) and produced the only narrator change. **The owner
+chose to revert them.** The first-pass prompt is back to §72's; `CAST_GUIDANCE_VERSION` 2026-10-13.2
+marks casts made after the revert. Kept: stripping a copied "?" from answers, since the review has always
+shown guesses as `[Name?]`.
+
+### 76.3 "I'd said" is the narrator
+
+In the novel's flashbacks, '"...," I'd said.' read as a tag naming "I'd": three such tags made a character
+"I'd", the model reused it from the known list, and it took 14-20 of Rory's lines in every run. A
+pronoun's contraction (I'd, she'd, he'd, ...) is now never a name (`speech_tags._not_name`), counts as
+the pronoun in pronoun and first-person tags, and doesn't break a first-person run of quotations. Checked
+on the five key books' benchmark chapters before any model run: Such Sharp Teeth 15 tag changes (six
+"I'd" anchors gone, nine narrator tags added, all nine the narrator's in the key), Steamy Screams one
+narrator tag added, the other three none.
+
+### 76.4 What this says about further tuning
+
+On a whole novel, results are decided by a few identity cascades per run, not by the prompt. Prompt
+changes can't be judged with three runs per arm, and the owner agrees tuning prompts is chasing the
+tail. Deterministic fixes for specific, checkable errors (bylines §75, "I'd" here) remain worth doing.
+The cascade kinds seen, for any future work: twins confused across long exchanges; a relationship label
+("The Narrator's Mother") splitting an established person; a label ("The Wolf") claiming the "I".

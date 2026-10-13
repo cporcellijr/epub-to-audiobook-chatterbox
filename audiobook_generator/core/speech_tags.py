@@ -66,6 +66,13 @@ NOT_NAMES = frozenset({
     "Even", "Suddenly", "Quietly", "Softly", "Later", "Once", "One", "Another", "Somewhere", "What",
     "Who", "Why", "How", "Where", "Which", "Not", "Never", "Always", "All", "Both", "Each", "None",
 })
+# A pronoun's contraction is that pronoun, never a name: '"...," I'd said.' told in a flashback gave a
+# novel a character called "I'd" (WORKLOG §76).
+_CONTRACTION = re.compile(r"['’](?:d|ll|ve|m|re)$")
+
+
+def _not_name(word: str) -> bool:
+    return word in NOT_NAMES or _CONTRACTION.sub("", word) in NOT_NAMES
 
 
 
@@ -98,7 +105,7 @@ _WORD = r"[A-Z][a-zA-Z'’\-]*"
 _TITLE = "(?:" + "|".join(re.escape(t) for t in sorted(TITLES, key=len, reverse=True)) + ")"
 _NAME = rf"(?:{_TITLE}\s+)*{_WORD}(?:\s+{_WORD}){{0,2}}"
 _ADVERB = r"(?:\s+\w+ly)?"
-_PRONOUN = r"(?:he|she|they|I|we|you)"
+_PRONOUN = r"(?:he|she|they|I|we|you)(?:['’]d)?"
 
 # Narration right after the quotation: ' said Tom.' / ' Tom said quietly.'
 _AFTER_VERB_NAME = re.compile(rf"^\s*[,;]?\s*{_VERB}{_ADVERB}\s+(?P<name>{_NAME})")
@@ -115,7 +122,7 @@ def clean_name(raw: str) -> Optional[str]:
     """The captured name if it really is a name, else None: no pronoun or sentence word, no
     possessive (said Tom's mother), and a title only as a prefix unless it is a family word."""
     words = raw.split()
-    while words and words[0] in NOT_NAMES:
+    while words and _not_name(words[0]):
         words.pop(0)  # a sentence word caught in front of the name ("Then Tom said")
     while words and words[-1] in TITLES and words[-1] not in STANDALONE:
         words.pop()  # a title with no name after it ("said Old")
@@ -123,7 +130,7 @@ def clean_name(raw: str) -> Optional[str]:
         return None
     if any(w.endswith(("'s", "’s")) for w in words):
         return None
-    if any(w in NOT_NAMES for w in words):
+    if any(_not_name(w) for w in words):
         return None
     if all(w in TITLES for w in words) and not (len(words) == 1 and words[0] in STANDALONE):
         return None
@@ -170,12 +177,12 @@ def has_speech_tag(before: str, after: str) -> bool:
 
 
 # First-person tags: '"...," I said.' / '"...," said I.' / 'I told her, "..."'
-_AFTER_I = re.compile(rf"^\s*[,;]?\s*(?:{_VERB}{_ADVERB}\s+I\b|I{_ADVERB}\s+{_ANY_VERB}\b)")
-_BEFORE_I = re.compile(rf"(?:^|[.!?]\s+|\s)I{_ADVERB}\s+{_ANY_VERB}\b[^\"“”.!?]{{0,20}}[,:]\s*$")
+_AFTER_I = re.compile(rf"^\s*[,;]?\s*(?:{_VERB}{_ADVERB}\s+I\b|I(?:['’]d)?{_ADVERB}\s+{_ANY_VERB}\b)")
+_BEFORE_I = re.compile(rf"(?:^|[.!?]\s+|\s)I(?:['’]d)?{_ADVERB}\s+{_ANY_VERB}\b[^\"“”.!?]{{0,20}}[,:]\s*$")
 
 
 # Someone else speaking in the narration between two quotations ('"...," I said, and he repeated "...').
-_SOMEONE_SPEAKS = re.compile(rf"\b(?:he|she|they){_ADVERB}\s+{_ANY_VERB}\b", re.I)
+_SOMEONE_SPEAKS = re.compile(rf"\b(?:he|she|they)(?:['’]d)?{_ADVERB}\s+{_ANY_VERB}\b", re.I)
 
 
 def first_person_tagged(paragraphs: List[List[Segment]]) -> List[int]:
@@ -251,7 +258,7 @@ def keeps_speaker(narration: str, speaker: str) -> bool:
     own = set(speaker.split())
     for word in re.findall(_WORD, narration):
         word = re.sub(r"['’]s$", "", word)
-        if word not in own and word not in NOT_NAMES and word not in TITLES:
+        if word not in own and not _not_name(word) and word not in TITLES:
             return False
     return True
 
