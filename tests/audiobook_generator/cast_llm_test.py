@@ -3,7 +3,8 @@ all with a scripted stand-in for the chat endpoint."""
 import json
 import logging
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from audiobook_generator.core import cast_llm as cast_llm_module, cast_review
 from audiobook_generator.core.cast_llm import (
@@ -816,6 +817,11 @@ class TestReview(unittest.TestCase):
         self.assertEqual(stats["review_requests"], 2)
         self.assertIn('[William] "Me,"', chat.prompts[2][1]["content"])
         self.assertEqual(roster.characters["william"]["lines"], 3)
+        # the second group's header names him too, not the merged-away "The Narrator"
+        header = chat.prompts[2][1]["content"].split("Passage.")[0]
+        self.assertIn("William", header.splitlines()[1])
+        self.assertIn("the narrator is William", header)
+        self.assertNotIn("The Narrator", header)
 
 
 class TestReviewIsAccountable(unittest.TestCase):
@@ -1187,3 +1193,21 @@ class TestSourceReviewedIdentities(unittest.TestCase):
         self.assertTrue(paragraphs[1][0].continues)
         lines, _ = attribute_chapter(paragraphs, Roster(), ScriptedChat(_reply({1: "Leon"})), {})
         self.assertEqual(lines, {1: "leon", 2: "miles"})
+
+
+class TestChatClient(unittest.TestCase):
+    def _call(self, usage):
+        client = cast_llm_module.ChatClient.__new__(cast_llm_module.ChatClient)
+        client.client, client.model, client.json_mode = Mock(), "m", True
+        client.client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))], usage=usage)
+        with patch.dict("os.environ", {"GPU_COORDINATOR_URL": ""}), \
+                self.assertLogs(cast_llm_module.logger, "WARNING") as logs:
+            cast_llm_module.logger.warning("marker")
+            self.assertEqual(client([{"role": "user", "content": "x"}]), "{}")
+        return [line for line in logs.output if "marker" not in line]
+
+    def test_a_prompt_near_the_context_is_logged(self):
+        self.assertIn("3900-token prompt", self._call(SimpleNamespace(prompt_tokens=3900))[0])
+        self.assertEqual(self._call(SimpleNamespace(prompt_tokens=3000)), [])
+        self.assertEqual(self._call(None), [])  # servers that report no usage

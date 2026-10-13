@@ -34,6 +34,9 @@ WINDOW_MAX_CHARS = 6000    # passage text per request (about 1,500 tokens): a 7-
 CONTEXT_PARAGRAPHS = 6     # paragraphs repeated before a window, with their known speakers, for context
 LLM_TIMEOUT_SECONDS = 300  # one request; a small local model on a busy GPU can be slow
 LLM_TEMPERATURE = 0.0
+# Ollama's default context (its log: n_ctx_slot = 4096, n_keep = 4): a longer prompt silently
+# loses the instructions at its start, so prompts nearing it are logged.
+LLM_CONTEXT_TOKENS = 4096
 
 # Ask the LLM to guess each line's delivery mood alongside its speaker (adaptive delivery, see
 # core.delivery). Measured against the labelled multivoice fixture 2026-09-28 (WORKLOG #14):
@@ -279,6 +282,10 @@ class ChatClient:
             self.json_mode = False
             kwargs.pop("response_format", None)
             response = self.client.chat.completions.create(**kwargs)
+        used = getattr(getattr(response, "usage", None), "prompt_tokens", None) or 0
+        if used >= LLM_CONTEXT_TOKENS * 0.9:
+            logger.warning(f"Cast: a {used}-token prompt is near the model's {LLM_CONTEXT_TOKENS}-token context; "
+                           "past it the server cuts the prompt's start")
         return (response.choices[0].message.content or "") if response.choices else ""
 
 
@@ -1177,15 +1184,17 @@ def review_lines(paragraphs: List[List[Segment]], result: Dict[int, Optional[str
     if not flags:
         return
     narrator_key = roster.chapter_narrator or cast_review.narrator_by_tags(paragraphs, result)
-    narrator_line = ""
-    if narrator_key and narrator_key in roster.characters:
-        name = roster.characters[narrator_key]["name"]
-        narrator_line = (PROMPTS["narrator_unnamed"].format(name=name) if normalize_name(name) == "i"
-                         else PROMPTS["narrator"].format(name=name, aliases=""))
-    names = roster.names_for_prompt()
     genders = _tag_genders(paragraphs)
     for start, end, ids in cast_review.groups(paragraphs, list(flags)):
         _follow_merges(result, roster)  # an earlier group's reply may have named the "I"
+        # ...or added someone: the header follows the merges as the passage labels do
+        narrator_key = roster.canonical_key(narrator_key) if narrator_key else None
+        narrator_line = ""
+        if narrator_key and narrator_key in roster.characters:
+            name = roster.characters[narrator_key]["name"]
+            narrator_line = (PROMPTS["narrator_unnamed"].format(name=name) if normalize_name(name) == "i"
+                             else PROMPTS["narrator"].format(name=name, aliases=""))
+        names = roster.names_for_prompt()
         certain = {i: roster.prompt_name(result[i]) if result.get(i) else anchors[i] for i in anchors}
         guessed = {i: roster.prompt_name(key) for i, key in result.items()
                    if key and i not in anchors and i not in ids}

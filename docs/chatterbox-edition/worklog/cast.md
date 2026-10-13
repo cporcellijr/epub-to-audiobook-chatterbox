@@ -2,9 +2,9 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73.
 
-## Where things stand (2026-10-07)
+## Where things stand (2026-10-13)
 
 - **The pipeline** (`audiobook_generator/core/`):
   - quotations are split per chapter (`dialogue.py`, §13);
@@ -28,6 +28,9 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - You Like It Darker: 90 wrong and 2 unresolved of 910, every chapter narrator right.
 - **A wider comparison:** the masked-tag set, 600 lines from 27 library books whose tags were
   removed, is for comparing models and prompts (§61.2). qwen2.5:14b gets 376 right.
+- **How a cast is judged** (owner, 2026-10-13, §73.4): consistency within each story. A character keeps
+  one voice and a first-person teller keeps their lines; sharing a voice or a narrator across a
+  collection's stories is fine. `first_person.py` scores it; wrong/unresolved is the second number.
 - **What is left is mostly the model's own reading:** long untagged exchanges, and an addressed name
   taken for the speaker ("..., Vic?") (§44.4, §45.2). Most of these errors are the same in every run
   (§61.1). Prompt changes move the rest by about 15 lines in 900 (§45.3), so judge a prompt change
@@ -2625,3 +2628,88 @@ identity decisions that the pipeline then applies to a whole person or chapter:
   gender's title kept; two stray lines don't join stories but three do). The first and third fail on
   the old code. 1,009 app tests pass.
 - **Not deployed;** the change is in the working tree.
+
+## 73. Reviewing the harness proposals: a fresh review header, a context guard, and judging casts per story (2026-10-13)
+
+Codex reviewed the casting harness and proposed four updates (`data/diagnostics/harness_review_2026-10-13/`):
+refresh the review header after merges, show earlier model answers as tentative `[Name?]`, add following
+context to first-pass windows, and defer roster filtering. Each was checked against the code; the two
+prompt experiments were first checked offline against saved runs, and only the one with support went
+live. Private material: `data/diagnostics/harness_offline_2026-10-13/` (offline evidence) and
+`data/diagnostics/tentative_labels_2026-10-13/` (the live A/B).
+
+### 73.1 Offline evidence before any GPU time
+
+Five saved key-book runs were replayed on frozen copies of the code that made them (every request matched,
+scores reproduced exactly) with the windows, the labels shown and the answers captured. 1,237 asked lines.
+
+- **Wrong earlier answers in the window (for `[Name?]`):** first-pass lines erred 22% with a wrong non-tag
+  label in their window against 14% without. 38-47% of first-pass wrong lines had one, and 28 of 77 copied
+  it exactly. Confounded with position (later windows hold more labels) and almost all from You Like It
+  Darker. Weak to moderate support: tested live (§73.5).
+- **End of window (for following context):** no penalty. Lines in a window's last paragraph erred 16%,
+  second-to-last 14%, earlier 17%. Of 17 wrong lines in the last two paragraphs, the true speaker is named
+  just after the window for 1. Not done.
+- **Stale review header:** 4 of 30 review groups were sent a character list that a merge earlier in the same
+  review had made stale; the narrator header never was. Their 12 lines show no harm either way.
+
+### 73.2 The review header follows merges
+
+`review_lines` built the character list and narrator header once, before its group loop, while each
+group's reply can merge or add people; the passage labels already followed merges (§60). Both are now
+rebuilt per group after `_follow_merges`, the narrator key canonicalised (not re-voted, which could flip the
+narrator mid-review). A correctness fix: no request is added and no accuracy gain is claimed. Live, the
+base arm of §73.5 scored the same as 2026-10-10's 14B at size 20 (9+2, 2, 77).
+
+### 73.3 Prompts near the context limit are logged
+
+No context length is set anywhere: the OpenAI-compatible endpoint serves Ollama's default, and its own log
+shows `n_ctx_slot = 4096, n_keep = 4`, so an overflowing prompt would keep 4 tokens and lose the
+instructions. The largest prompt seen is 3,909 tokens (§61.3); none since the 2026-10-12 restart passed
+3,134 or was truncated. `ChatClient` now warns when the reply reports `prompt_tokens` at 90% of
+`LLM_CONTEXT_TOKENS` (4096); a server reporting no usage is ignored. No §73.5 run warned. Any change that
+lengthens prompts (following context, a larger roster) must watch this first.
+
+### 73.4 How casts are judged: consistency within a story
+
+The owner (2026-10-13): a cast member keeps one voice through the whole story, whether the book is one
+story or a collection; first-person narration stays with its teller. Sharing across stories is fine: two
+characters of different stories on one voice, or one narrator for two stories (each story *may* have its
+own narrator, first or third person, its own "vibe", but needn't).
+
+The scorer's global counts mix this up. A collection story joined to the previous one (§72.2's failure)
+costs about 80 "wrong" lines, yet the listener hears a consistent teller; and a person split under a
+nickname the alias list knows costs nothing, yet changes voice mid-story. `first_person.py` (in the A/B
+folder) scores per story:
+
+- **teller lines lost** (the teller's lines not on the chapter's narrator key, whatever its name) and
+  **others voiced as teller**;
+- **off-voice lines**: a character's lines off their main key within the story, unresolved included;
+- **merged**: two people in one story sharing a key.
+
+Wrong/unresolved stays as the second number.
+
+### 73.5 Tentative labels, live
+
+Two frozen arms on qwen2.5:14b: base (HEAD + §73.2-73.3) and tentative (base + earlier model answers shown
+as `[Name?]`, tags still `[Name]`, the window prompt explaining both, a trailing "?" stripped from answers
+so `@key?` still resolves). The three key books at request sizes 16/20/24 per arm.
+
+| Size | Teller errors, base / tent | Off-voice lines | Scorer wrong+unresolved |
+|---|---|---|---|
+| 16 | 61 / 53 | 80 / 81 | 84 / 158 |
+| 20 | 65 / 59 | 89 / 124 | 90 / 83 |
+| 24 | 58 / 37 | 89 / 67 | 82 / 59 |
+
+- **Teller consistency improved at every size on both first-person books** (184 against 149 over the
+  three sizes; Apex Prey 3 and You Like It Darker).
+- **Size 16, scorer 158:** the tentative arm gave Andy Pelley exactly 3 lines in chapter 17, enough
+  (`STORY_LINK_MIN_LINES`, §72) to join "The Dreamers" to Rattlesnakes, and Vic Trenton took that story's
+  "I". Its teller lines stayed together (74 of 81 on the narrator key), so by §73.4 this is no defect.
+- **Size 20, off-voice 124:** Andy Pelley split in two, "Super Gramp" (63) and "Pelley" (37). In the same
+  window both arms declared one person under both names; base made "Andy Pelley" the name and "Super Gramp"
+  the alias, the tentative arm the reverse, and later bare "Pelley" answers matched nobody. A coin flip any
+  prompt change can tip, landing on a roster weakness (a bare surname isn't looked up through a nickname
+  display name's aliases), not the label's meaning.
+- Base splits Alita Bell as "Allie Bell"/"Alita Bell" (12 lines) in every run; "Allie" is not in
+  `_NICKNAMES` and can't safely be (Alison, Alice, Alexandra).
