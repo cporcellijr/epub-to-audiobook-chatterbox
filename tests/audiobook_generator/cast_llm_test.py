@@ -974,9 +974,20 @@ class TestTaggedLines(unittest.TestCase):
         chat = ScriptedChat(first, second)
         attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
         second_prompt = chat.prompts[1][1]["content"]
-        self.assertIn('[Tom] "Line 20."', second_prompt)
-        self.assertIn('[Ada] "Line 19."', second_prompt)
+        self.assertIn('[Tom?] "Line 20."', second_prompt)  # the model's answers are shown as guesses
+        self.assertIn('[Ada?] "Line 19."', second_prompt)
         self.assertIn('[#21] "Line 21."', second_prompt)
+
+    def test_a_tagged_line_stays_certain_beside_guesses(self):
+        text = M.join([f'"Line {n}."' for n in range(1, 21)] + ['"Line 21," said Ada.', '"Line 22."', '"Line 23."'])
+        first = _reply({n: ("Ada" if n % 2 else "Tom") for n in range(1, 21)})
+        second = _reply({22: "Tom?", 23: "Ada"})  # a copied mark still names the person
+        chat = ScriptedChat(first, second)
+        lines, _ = attribute_chapter(chapter_segments(text), Roster(), chat, {}, self.log)
+        second_prompt = chat.prompts[1][1]["content"]
+        self.assertIn('[Ada] "Line 21," said Ada.', second_prompt)
+        self.assertIn('[Tom?] "Line 20."', second_prompt)
+        self.assertEqual((lines[22], lines[23]), ("tom", "ada"))
 
     def test_a_chapter_where_every_line_is_tagged_needs_no_request(self):
         text = f'"Hello," said Ada.{M}"Hello yourself," Tom said.'
@@ -1089,6 +1100,14 @@ class TestSourceReviewedIdentities(unittest.TestCase):
         self.assertEqual(lines, {1: "hee haw 2", 2: "hee haw 2", 3: "hee haw", 4: "hee haw 2"})
         self.assertIn("Alice = Hee Haw (female; aliases: Alice)", chat.prompts[0][1]["content"])
         self.assertIn("[#4]", chat.prompts[0][1]["content"])
+        self.assertEqual(len(roster.characters), 2)
+
+    def test_a_copied_guess_mark_keeps_the_identity_token(self):
+        text = f'"Enough," she said.{M}"No," he said.'
+        roster = self.roster()
+        lines, _ = attribute_chapter(chapter_segments(text), roster,
+                                     ScriptedChat(_reply({1: "@hee haw 2?", 2: "@hee haw?"})), {})
+        self.assertEqual(lines, {1: "hee haw 2", 2: "hee haw"})
         self.assertEqual(len(roster.characters), 2)
 
     def test_bare_shared_names_use_a_pronoun_without_inventing_a_character(self):

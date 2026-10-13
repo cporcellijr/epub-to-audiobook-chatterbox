@@ -97,4 +97,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 70 | 2026-10-09 | Reopening 14B training: bounded memory trials and an exclusive GPU reservation | [cast](worklog/cast.md) |
 | 71 | 2026-10-10 | Inspecting the 14B regression and testing saved checkpoint 200 | [cast](worklog/cast.md) |
 | 72 | 2026-10-10 | The adapter served unmerged, and guards against one wrong name spreading | [cast](worklog/cast.md) |
-| 73 | 2026-10-13 | Harness proposals reviewed: a fresh review header, a context guard, judging casts per story | [cast](worklog/cast.md) |
+| 73 | 2026-10-13 | Harness proposals reviewed: a fresh review header, a context guard, judging casts per story, tentative labels | [cast](worklog/cast.md) |

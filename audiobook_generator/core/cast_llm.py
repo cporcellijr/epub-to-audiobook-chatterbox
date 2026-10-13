@@ -3,8 +3,8 @@
 A chapter's dialogue lines (from core.dialogue) are sent in windows: WINDOW_LINES numbered lines
 with the narration around them and the preceding paragraphs for context, plus the running list of
 characters already met. Lines a speech tag already names (core.speech_tags: "said Tom") are not
-asked; they, and every line decided in earlier windows, are shown to the model as [Name] "..." so
-it can follow the turn-taking of the untagged lines. The model answers with JSON mapping each line id to a speaker and
+asked; they are shown to the model as [Name] "...", and every line decided in earlier windows as
+[Name?] "..." (an answer that may be wrong, §73), so it can follow the turn-taking of the untagged lines. The model answers with JSON mapping each line id to a speaker and
 listing new characters (gender, rough age, aliases). Every reply is validated strictly; a window
 whose reply is unusable is asked once more, then its lines are left unknown (they get the
 dialogue voice). Lines the text says need another look (core.cast_review: no speaker, "she said"
@@ -134,7 +134,7 @@ def _local_reference(name: str) -> bool:
     words = [word for word in words if word not in _REFERENCE_FILLER]
     return bool(words) and all(word in _LOCAL_REFERENCE_WORDS for word in words)
 
-CAST_GUIDANCE_VERSION = "2026-10-06.1"
+CAST_GUIDANCE_VERSION = "2026-10-13.1"
 # Names the guidance below uses as examples; a model can copy them into a cast (WORKLOG §67).
 PROMPT_EXAMPLE_NAMES = frozenset({"shirley", "squirrelly", "toni", "tony", "phil"})
 
@@ -163,8 +163,9 @@ PROMPTS = {
         "{roster}\n\n"
         "{narrator}"
         "Passage. Lines to attribute are marked like [#N] in front of the quotation, N being the line's id. "
-        "Lines shown as [Name] in front of the quotation already have a known speaker: use them to follow "
-        "who is talking, but do not answer for them. Quotations without a mark need no answer:\n\n"
+        "Lines shown as [Name] or [Name?] in front of the quotation are already decided: [Name] is certain, "
+        "from a speech tag; [Name?] is an earlier answer and may be wrong. Use them to follow who is talking, "
+        "but do not answer for them. Quotations without a mark need no answer:\n\n"
         "{passage}\n\n"
         "Reply with exactly this shape, one entry per id:\n"
         "{{\"speakers\": {{\"N\": \"Full Name\"}}{moods_shape}, "
@@ -406,7 +407,7 @@ def _speaker_or_none(value) -> Optional[str]:
         return None
     if not isinstance(value, str):
         raise AttributionError(f"speaker is not a name: {value!r}")
-    name = display_name(_one_person(value))
+    name = display_name(_one_person(value).rstrip("?"))  # "[Name?]" context copied into an answer
     return None if not normalize_name(name) or normalize_name(name) in UNKNOWN_SPEAKER_WORDS else name
 
 
@@ -1242,8 +1243,8 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
     """Attribute every dialogue line of one chapter: ({line id: character key or None},
     {line id: mood}).
 
-    Lines a speech tag names are not asked (core.speech_tags); the model sees them, and every line
-    decided so far, as [Name] "...". Each window is asked once and, when its reply fails
+    Lines a speech tag names are not asked (core.speech_tags); the model sees them as [Name] "..."
+    and every other line decided so far as [Name?] "...". Each window is asked once and, when its reply fails
     validation, once more; a second failure leaves its lines unknown. New names become roster characters (aliases merged). A line that
     continues the previous paragraph's quotation takes the previous line's speaker (and, for moods,
     the previous line's final mood).
@@ -1285,9 +1286,11 @@ def attribute_chapter(paragraphs: List[List[Segment]], roster: Roster, chat: Cha
     started = time.monotonic()
 
     def known_now() -> Dict[int, str]:
-        """Tag names, overridden by the display name of whoever each decided line resolved to."""
+        """Tag names, overridden by the display name of whoever each decided line resolved to; a line
+        only the model decided is shown as a guess ("Name?")."""
         known = dict(anchors)
-        known.update({line_id: roster.prompt_name(key) for line_id, key in result.items() if key})
+        known.update({line_id: roster.prompt_name(key) + ("" if line_id in anchors else "?")
+                      for line_id, key in result.items() if key})
         return known
 
     for number, window in enumerate(windows, 1):

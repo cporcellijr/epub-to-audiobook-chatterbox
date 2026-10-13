@@ -9,8 +9,8 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
 - **The pipeline** (`audiobook_generator/core/`):
   - quotations are split per chapter (`dialogue.py`, §13);
   - a line a speech tag names is an anchor and is never asked (`speech_tags.py`, §27, §30);
-  - the other lines go to the local LLM, 20 at a time, with the speakers known so far shown
-    (`cast_llm.py`, §13);
+  - the other lines go to the local LLM, 20 at a time, with the speakers known so far shown, earlier
+    answers marked as guesses (`cast_llm.py`, §13, §73);
   - lines the text contradicts are asked once more (`cast_review.py`, §28);
   - identity rules merge one person's names and keep different people apart (§29-§31, §42-§43, §59);
   - a narrator is chosen per chapter and per story (§18, §22, §40, §44, §46-§47, §49);
@@ -2713,3 +2713,23 @@ so `@key?` still resolves). The three key books at request sizes 16/20/24 per ar
   display name's aliases), not the label's meaning.
 - Base splits Alita Bell as "Allie Bell"/"Alita Bell" (12 lines) in every run; "Allie" is not in
   `_NICKNAMES` and can't safely be (Alison, Alice, Alexandra).
+
+### 73.6 Masked set, and the decision
+
+- **Masked set** (27 library books, 600 lines): base 376, tentative 373. They differ on 29 lines (13 only
+  base wrong, 16 only tentative wrong); 211 are wrong in both. Speaker choice in breadth is unchanged.
+  Base had one window unusable twice; the tentative arm none.
+- **Kept.** By §73.4 the first-person result decides it: teller consistency improved in all six
+  comparisons (three sizes, both first-person books), speaker choice in breadth is neutral, and the one
+  in-story regression (Andy Pelley, size 20) is a display-name coin flip any prompt change can tip.
+  `CAST_GUIDANCE_VERSION` is now 2026-10-13.1. Not deployed.
+- **Risks kept in view:** two key books carry the teller result, You Like It Darker most of it; the model
+  could copy the "?" into an answer (stripped in `_speaker_or_none`, tested for names and `@key`).
+- **Tests:** the later-window test now expects `[Name?]`; new: a tagged line stays `[Ada]` beside guesses,
+  and copied marks still resolve to the person and to the exact `@key`. 1,014 app tests pass.
+- **Open:**
+  - a nickname made the display name ("Super Gramp", alias "Andy Pelley") leaves a bare surname answer
+    matching nobody: one person, two voices in one story;
+  - "Allie Bell"/"Alita Bell" split in every base run;
+  - the first masked attempt failed when a Strata task held the GPU longer than the reservation wait
+    (HTTP 503 on acquire). A cast job from the app waits the same way, so a long Strata batch can fail it.
