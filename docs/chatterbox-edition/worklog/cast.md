@@ -58,6 +58,7 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - a narrator split under two names that both get "I said" votes (§49.4);
   - an editor merge doesn't survive a re-analysis (§30);
   - casts analysed before a narrator fix keep their old narrators until re-analysed (§49.4).
+  - a narrator name born late in a novel ("Aurora" for Rory, "The Wolf") can take chapters; guard planned (§76.5).
   - on Apex Prey 3 the model sometimes labels the narrator by a description ("the girl"); a description
     declared with a new name now becomes that person (§64), but the model's own label errors remain.
 
@@ -2907,3 +2908,26 @@ changes can't be judged with three runs per arm, and the owner agrees tuning pro
 tail. Deterministic fixes for specific, checkable errors (bylines §75, "I'd" here) remain worth doing.
 The cascade kinds seen, for any future work: twins confused across long exchanges; a relationship label
 ("The Narrator's Mother") splitting an established person; a label ("The Wolf") claiming the "I".
+
+### 76.5 Next (planned, not started): a narrator born in the chapters it takes
+
+The sanity run of the deployed code (509b996, size 20: 193 wrong, no "I'd" character) still changed the
+narrator inside the novel: Rory tells chapters 4-15, a separate key "Aurora" (her full name, used by
+others late in the book, never linked to "Rory") tells 16-18. With "The Wolf" (§76.2) that is two
+narrator changes in seven novel runs, none in the three base runs.
+
+- **The path.** `cast_profiles.addressed_tellers` gives a chapter to the addressed teller unless its "I
+  said" votes went to another named person (`told_by`); `chapter_narrators` then makes that person the
+  chapter's narrator. The rule is for real point-of-view chapters (Monster Girl Islands: "Nora's PoV").
+  In both failures the other person was born in the chapters they took ("The Wolf" 17-18, "Aurora" 16-18,
+  no lines anywhere before).
+- **The guard.** A vote counts as another point of view only if that person speaks in the story's other
+  chapters. Otherwise the chapter stays the teller's, and the vote's key becomes its `narrator_reference`,
+  so `reconcile_lines` gives those lines to the teller (as for a description narrator today).
+- **Check by replay, no GPU** (the change is after attribution, so saved runs answer every attribution
+  question): every Such Sharp Teeth run (`runs_w16/20/24` base and current, `runs_w20` final), the other
+  keys' saved runs, and Monster Girl Islands (`monster_girls_2026-10-02`, truth: ch6 Nora, ch7 Yuki,
+  else Markus). Ship only if the two failures are fixed and no chapter narrator changes anywhere else.
+  Tone questions the old runs never asked come back unanswered; count them.
+- **Tests:** a character first seen in the chapters it would tell can't take them from the teller; a
+  point-of-view character who speaks elsewhere still can.
