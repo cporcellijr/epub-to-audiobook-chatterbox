@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74.
 
 ## Where things stand (2026-10-13)
 
@@ -26,6 +26,7 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - Six Wakes: 1 wrong of 504 lines.
   - Apex Prey 3: 6 wrong and 4 unresolved of 269.
   - You Like It Darker: 90 wrong and 2 unresolved of 910, every chapter narrator right.
+  - A fourth key (§74): Steamy Screams, 21 stories, 773 lines, eight first-person tellers.
 - **A wider comparison:** the masked-tag set, 600 lines from 27 library books whose tags were
   removed, is for comparing models and prompts (§61.2). qwen2.5:14b gets 376 right.
 - **How a cast is judged** (owner, 2026-10-13, §73.4): consistency within each story. A character keeps
@@ -2733,3 +2734,56 @@ so `@key?` still resolves). The three key books at request sizes 16/20/24 per ar
   - "Allie Bell"/"Alita Bell" split in every base run;
   - the first masked attempt failed when a Strata task held the GPU longer than the reservation wait
     (HTTP 503 on acquire). A cast job from the app waits the same way, so a long Strata batch can fail it.
+
+## 74. A fourth answer key: the Steamy Screams anthology (2026-10-13)
+
+The owner asked for a new collection to get more feedback on §73. *Steamy Screams* (Jack Burton, 2011)
+holds 21 stories by different authors in chapters 5-25: 775 dialogue lines, eight stories first person.
+Private material in `data/diagnostics/steamy_screams_2026-10-13/` (chapter exports, labels, key, runs).
+
+### 74.1 The key
+
+- `export.py` wrote each story with the app's own line ids; two Sonnet labellers per story worked
+  independently (`labels/`), each file checked complete by `check_labels.py`.
+- They agreed on 758 of 775 lines (97.8%) and on the narration of 20 of 21 stories. 17 lines were
+  adjudicated by reading the passages: 9 were naming variants, 4 an off-by-one alternation in story 20
+  (one labeller had scripted it), 4 real readings. Story 24 (third person with first-person zombie
+  interludes) gets no teller.
+- `merge_labels.py --build` wrote `expected_speakers_source_linked.json` (773 lines, 2 not speech) and
+  `aliases.json`; an unnamed teller is `ch<N> narrator`, so stories' nameless "I"s stay apart.
+- Tellers: 8 May, 11 Vivienne, 12 Melissa, 14 unnamed, 17 Ray, 18 unnamed, 21 Elaine, 23 unnamed.
+
+### 74.2 Tentative labels on a book they were never tuned on
+
+Arms as §73.5 (base 72e827f, tentative c3ffc8b), sizes 16/20/24, summed:
+
+| | Base | Tentative |
+|---|---|---|
+| Teller errors (lost + others as teller) | 100 | 86 |
+| Off-voice lines within a story | 326 | 294 |
+| Merged within a story | 17 | 13 |
+| Scorer wrong / unresolved | 446 / 31 | 387 / 58 |
+
+The kept change holds up: fewer wrong lines and better in-story consistency. Teller errors were mixed by
+size (15 against 35 at 16, even at 20, 37 against 31 at 24). The extra unresolved lines are story 19
+at size 16: for two characters the text never names, the model answered "he" and "she", which the
+roster rightly refuses as names.
+
+### 74.3 What is still wrong, by the owner's priorities
+
+- **A teller split from their own name (first priority).** Story 11: at size 16 Vivienne narrates; at
+  20 and 24 two "I said" lines make an unnamed "The Narrator" the chapter's narrator while Vivienne's
+  other 13 lines stay on her named key, so her narration and her speech take two voices. Story 21 the
+  same (The Narrator 11, Elaine 5). `addressed_tellers` links an unnamed "I" to a name only after 3
+  addresses by name; Vivienne's name appears 3 times in her whole story. 61 teller lines lost over
+  the three sizes, 51 of them in stories 11 and 21.
+- **Unnamed characters.** Story 19's two leads are never named: one woman became "the girl" and "the
+  girl 2", or "he"/"she" answers left 29 lines unresolved. Story 20's Coco/Eel alternation drifts.
+- **The author as a character.** Every story opens with a title paragraph and a byline paragraph. In
+  story 21 the model gave the unnamed "I" the byline's name, "Jenny Corvette" (5-6 lines, every run).
+  The byline also makes the name "written in the book", which §67's invented-name guard accepts.
+- **A parser continuation error.** Story 22 line 42 is marked as continuing the previous quotation
+  but is the other person's reply, so it always takes the wrong speaker.
+- **Cross-story narrators** (stories 12 and 18 sharing 11's and 17's narrator) are fine by §73.4.
+
+Nothing in the app changed here.
