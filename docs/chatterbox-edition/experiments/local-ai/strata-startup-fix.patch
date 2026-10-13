@@ -1,0 +1,68 @@
+--- a/local-ai/gpu_coordinator.py
++++ b/local-ai/gpu_coordinator.py
+@@ -61,10 +61,13 @@
+         if engine == "strata":
+             release_docker_cache()
+             deadline = time.monotonic() + 180
+-            while free_ram_mib() < 16384:
++            # The budgeted engine shrinks its expert cache to fit RAM, keeping 4 GiB headroom.
++            while free_ram_mib() < 8192:
+                 if time.monotonic() >= deadline:
+-                    raise RuntimeError("Strata needs 16 GB free system RAM; close memory-heavy applications and retry")
++                    raise RuntimeError(f"Strata needs at least 8 GiB free system RAM to start; "
++                                       f"{free_ram_mib() / 1024:.1f} GiB available")
+                 time.sleep(2)
++            log.info("Starting budgeted Strata with %.1f GiB free system RAM", free_ram_mib() / 1024)
+             self.tools.strata_start(model="coder-iq1_m", wait_seconds=600)
+             if not api("http://127.0.0.1:8080/health").get("loaded"):
+                 raise RuntimeError("Strata failed to load")
+@@ -210,6 +213,9 @@
+                 self.reply(200, {"token": token})
+             except (ValueError, KeyError, TypeError):
+                 self.reply(400, {"error": "Invalid or expired reservation"})
++            except RuntimeError as e:
++                log.exception("GPU operation failed")
++                self.reply(503, {"error": str(e)})
+             except Exception:
+                 log.exception("GPU operation failed")
+                 self.reply(503, {"error": "GPU switch failed; check coordinator.log"})
+--- a/local-ai/test_gpu_coordinator.py
++++ b/local-ai/test_gpu_coordinator.py
+@@ -117,9 +117,18 @@
+                 patch("gpu_coordinator.release_docker_cache"), patch("gpu_coordinator.free_ram_mib", return_value=2000), \
+                 patch("gpu_coordinator.time.monotonic", side_effect=[0, 181]), \
+                 patch.object(driver.tools, "strata_start") as start:
+-            with self.assertRaisesRegex(RuntimeError, "16 GB free"):
++            with self.assertRaisesRegex(RuntimeError, "8 GiB free.*2.0 GiB available"):
+                 driver.prepare("strata")
+         start.assert_not_called()
++
++    def test_budgeted_strata_can_start_below_the_old_ram_floor(self):
++        driver = Driver()
++        with patch.object(driver, "unload"), patch("gpu_coordinator.free_vram", return_value=10000), \
++                patch("gpu_coordinator.release_docker_cache"), patch("gpu_coordinator.free_ram_mib", return_value=13312), \
++                patch("gpu_coordinator.api", return_value={"loaded": True}), \
++                patch.object(driver.tools, "strata_start") as start:
++            driver.prepare("strata")
++        start.assert_called_once_with(model="coder-iq1_m", wait_seconds=600)
+ 
+     def test_a_failed_unload_prevents_loading_breeze(self):
+         driver = Driver()
+--- a/strata/strata-coder-iq1_m.json
++++ b/strata/strata-coder-iq1_m.json
+@@ -25,7 +25,7 @@
+     "int8",
+     "--resident-experts",
+     "--resident-budget-gib",
+-    "8"
++    "4"
+   ],
+   "cwd": "C:\\Server\\stacks\\strata",
+   "tokenizer": "C:\\Server\\stacks\\Strata-data\\packs\\coder-iq1_m\\tokenizer",
+@@ -37,4 +37,4 @@
+   "port": 8080,
+   "gpu": 0,
+   "gpus_asked": true
+-}
+\ No newline at end of file
++}

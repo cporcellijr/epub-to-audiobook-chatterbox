@@ -74,9 +74,17 @@ def session(engine):
                 break
             except HTTPError as e:
                 if e.code == 409:
+                    e.close()
                     time.sleep(1)
                     continue
-                raise RuntimeError(f"HTTP {e.code} on acquire") from None
+                try:
+                    detail = json.loads(e.read(4096)).get("error")
+                except (ValueError, AttributeError, OSError):
+                    detail = None
+                finally:
+                    e.close()
+                suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+                raise RuntimeError(f"HTTP {e.code} on acquire{suffix}") from None
             except (URLError, TimeoutError, OSError):
                 raise RuntimeError("GPU coordinator is unavailable") from None
 

@@ -1,5 +1,6 @@
 import unittest
 import os
+import io
 from unittest.mock import patch
 from urllib.error import HTTPError
 from audiobook_generator.core.gpu_reservation import session
@@ -34,6 +35,25 @@ class TestGpuReservation(unittest.TestCase):
                     self.fail("Should not acquire")
         self.assertEqual([c.args[0] for c in post.call_args_list], ["/acquire", "/release"])
         self.assertEqual(post.call_args_list[0].args[1]["token"], post.call_args_list[1].args[1]["token"])
+
+    def test_startup_error_keeps_the_reason_and_cancels_the_reservation(self):
+        body = io.BytesIO(b'{"error": "Strata needs at least 8 GiB free system RAM"}')
+        error = HTTPError("http://x", 503, "unavailable", {}, body)
+        with patch("audiobook_generator.core.gpu_reservation._post", side_effect=[error, {}]) as post:
+            with self.assertRaisesRegex(RuntimeError, "503 on acquire: Strata needs at least 8 GiB"):
+                with session("strata"):
+                    self.fail("Should not acquire")
+        self.assertTrue(body.closed)
+        self.assertEqual([c.args[0] for c in post.call_args_list], ["/acquire", "/release"])
+
+    def test_unusable_error_bodies_keep_the_http_status(self):
+        for raw in (b'not JSON', b'[]', b'{"error": 5}'):
+            with self.subTest(raw=raw):
+                error = HTTPError("http://x", 503, "unavailable", {}, io.BytesIO(raw))
+                with patch("audiobook_generator.core.gpu_reservation._post", side_effect=[error, {}]):
+                    with self.assertRaisesRegex(RuntimeError, "^HTTP 503 on acquire$"):
+                        with session("strata"):
+                            self.fail("Should not acquire")
 
     def test_nested_llm_requests_reuse_the_cast_reservation_without_waiting(self):
         def post(path, body, timeout=600):
