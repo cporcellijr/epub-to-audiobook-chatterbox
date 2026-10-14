@@ -101,3 +101,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 74 | 2026-10-13 | A fourth answer key: the Steamy Screams anthology | [cast](worklog/cast.md) |
 | 75 | 2026-10-13 | An anthology's author bylines are hidden from the model | [cast](worklog/cast.md) |
 | 76 | 2026-10-13 | A whole novel as the main test; tentative labels reverted; "I'd" is the narrator | [cast](worklog/cast.md) |
+| 77 | 2026-10-14 | Strata removed; the reservation client drops its engine; coding goes through the Omni bridge | [app](worklog/app.md) |

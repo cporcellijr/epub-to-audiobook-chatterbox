@@ -22,7 +22,7 @@ class TestGpuReservation(unittest.TestCase):
             return {"token": body["token"]}
         with patch("audiobook_generator.core.gpu_reservation._post", post), \
                 patch("audiobook_generator.core.gpu_reservation.time.sleep") as sleep:
-            with session("strata"):
+            with session("ollama"):
                 pass
         self.assertEqual([c[0] for c in calls], ["/acquire", "/acquire", "/release"])
         self.assertEqual(len({c[1] for c in calls}), 1)
@@ -31,17 +31,17 @@ class TestGpuReservation(unittest.TestCase):
     def test_interrupted_acquire_cancels_pending_token_and_preserves_interrupt(self):
         with patch("audiobook_generator.core.gpu_reservation._post", side_effect=[KeyboardInterrupt(), {}]) as post:
             with self.assertRaises(KeyboardInterrupt):
-                with session("strata"):
+                with session("ollama"):
                     self.fail("Should not acquire")
         self.assertEqual([c.args[0] for c in post.call_args_list], ["/acquire", "/release"])
         self.assertEqual(post.call_args_list[0].args[1]["token"], post.call_args_list[1].args[1]["token"])
 
     def test_startup_error_keeps_the_reason_and_cancels_the_reservation(self):
-        body = io.BytesIO(b'{"error": "Strata needs at least 8 GiB free system RAM"}')
+        body = io.BytesIO(b'{"error": "Another process holds GPU memory; close it before retrying"}')
         error = HTTPError("http://x", 503, "unavailable", {}, body)
         with patch("audiobook_generator.core.gpu_reservation._post", side_effect=[error, {}]) as post:
-            with self.assertRaisesRegex(RuntimeError, "503 on acquire: Strata needs at least 8 GiB"):
-                with session("strata"):
+            with self.assertRaisesRegex(RuntimeError, "503 on acquire: Another process holds GPU memory; close it before retrying"):
+                with session("ollama"):
                     self.fail("Should not acquire")
         self.assertTrue(body.closed)
         self.assertEqual([c.args[0] for c in post.call_args_list], ["/acquire", "/release"])
@@ -52,7 +52,7 @@ class TestGpuReservation(unittest.TestCase):
                 error = HTTPError("http://x", 503, "unavailable", {}, io.BytesIO(raw))
                 with patch("audiobook_generator.core.gpu_reservation._post", side_effect=[error, {}]):
                     with self.assertRaisesRegex(RuntimeError, "^HTTP 503 on acquire$"):
-                        with session("strata"):
+                        with session("ollama"):
                             self.fail("Should not acquire")
 
     def test_nested_llm_requests_reuse_the_cast_reservation_without_waiting(self):
@@ -74,12 +74,12 @@ class TestGpuReservation(unittest.TestCase):
             return {"token": body["token"]}
         with patch("audiobook_generator.core.gpu_reservation._post", post):
             with self.assertRaisesRegex(RuntimeError, "GPU release failed"):
-                with session("strata"):
+                with session("ollama"):
                     pass
 
     def test_unconfigured_bypass(self):
         with patch.dict(os.environ, {}, clear=True):
-            with session("strata") as gpu:
+            with session("ollama") as gpu:
                 self.assertIsNone(gpu)
 
     def test_unsupported_engine_bypass(self):
@@ -87,11 +87,18 @@ class TestGpuReservation(unittest.TestCase):
             with session("unsupported_engine") as gpu:
                 self.assertIsNone(gpu)
 
+    def test_strata_is_unsupported_engine_bypass(self):
+        with patch.dict(os.environ, {"GPU_COORDINATOR_URL": "http://x", "GPU_COORDINATOR_TOKEN": "t"}, clear=True):
+            with patch("audiobook_generator.core.gpu_reservation._post") as mock_post:
+                with session("strata") as gpu:
+                    self.assertIsNone(gpu)
+                mock_post.assert_not_called()
+
     def test_missing_token_refuses_before_network(self):
         with patch.dict(os.environ, {"GPU_COORDINATOR_URL": "http://x"}, clear=True):
             with patch("audiobook_generator.core.gpu_reservation._post") as mock_post:
                 with self.assertRaises(RuntimeError):
-                    with session("strata") as gpu:
+                    with session("ollama") as gpu:
                         pass
                 mock_post.assert_not_called()
 
@@ -101,7 +108,7 @@ class TestGpuReservation(unittest.TestCase):
                 mock_uuid.return_value.hex = "abc"
                 with patch("audiobook_generator.core.gpu_reservation._post") as mock_post:
                     mock_post.side_effect = [{"token": "abc"}, {}]
-                    with session("strata") as gpu:
+                    with session("ollama") as gpu:
                         self.assertEqual(gpu, "abc")
                     self.assertEqual([c[0][0] for c in mock_post.call_args_list], ["/acquire", "/release"])
 
@@ -123,7 +130,7 @@ class TestGpuReservation(unittest.TestCase):
                 with patch("audiobook_generator.core.gpu_reservation._post") as mock_post:
                     mock_post.side_effect = [{"token": "abc"}, RuntimeError("release failed")]
                     with self.assertRaises(ValueError) as cm:
-                        with session("strata") as gpu:
+                        with session("ollama") as gpu:
                             raise ValueError("original error")
                     self.assertEqual(str(cm.exception), "original error")
 

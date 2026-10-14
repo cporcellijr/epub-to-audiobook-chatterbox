@@ -35,7 +35,7 @@ def session(engine):
     if not configured():
         yield
         return
-    if engine not in ("breeze", "ollama", "strata", "chatterbox", "training"):
+    if engine not in ("breeze", "ollama", "chatterbox", "training"):
         yield
         return
 

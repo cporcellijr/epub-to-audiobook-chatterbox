@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §1, §4, §5, §6, §7, §8, §9, §10, §11, §32.
+Sections here: §1, §4, §5, §6, §7, §8, §9, §10, §11, §32, §77.
 
 ## Where things stand (2026-10-07)
 
@@ -265,3 +265,40 @@ new dependency or model request was added.
 The earlier five cast fixes (§31) and this parser fix are committed separately. No services were
 rebuilt or restarted, and existing saved casts, ebooks and audio were not rewritten. Books without
 usable contents boundaries still use their original document boundaries.
+
+## 77. Strata removed; the reservation client drops its engine; coding goes through the Omni bridge (2026-10-14)
+
+### 77.1 What changed
+
+- The native Strata coding model was deleted from the host, both its repository and its 86 GB of
+  models, because it was too slow and too weak to be worth its GPU turns. Its chat proxy and
+  scheduled task are gone too.
+- The shared GPU coordinator (`C:/Server/stacks/local-ai/gpu_coordinator.py`) stays, because Breeze,
+  Ollama casting and training still need it. It used to run on Strata's virtual environment and import
+  Strata's helper. It is now standard-library only and runs on the system Python 3.13. It no longer
+  knows a `strata` engine and answers one with 400 "Unknown engine". Its own tests went from 14 to 12
+  (the two Strata start-up RAM tests went with the engine).
+- `gpu_reservation.session()` no longer accepts `strata`. A request for it now bypasses the
+  coordinator like any unsupported engine, instead of being sent to be refused. The tests that used
+  `strata` as their sample engine now use `ollama`, with each test's intent kept. One new test pins
+  the bypass.
+- `GPU_COORDINATOR.md` and the Compose comment no longer describe Strata as a client.
+- Coding help moved from Strata to the Omni bridge: OpenCode on FreeLLMAPI, a local free-tier
+  router. See `AGENTS.md`. This change was its first task here. It took two implementation calls
+  (code and tests, then documentation) and two narrow review fixes. The first pass lost the
+  indentation of three test lines. The second left one sentence still pointing at "the documented
+  helper". Each run took about 10 minutes, because the free providers it was routed to were slow.
+
+### 77.2 Evidence
+
+- Reservation tests: 12 before, 13 after. The 19 reservation unit and integration tests pass in the
+  app image.
+- The full suite in the app image passes: 1,020 tests, 1 skipped.
+- Coordinator status after the switch to system Python: idle, 0 active, 0 waiting. Its log shows
+  "GPU coordinator ready on port 8765".
+
+### 77.3 Not verified
+
+- The running app container still has the old client until the next rebuild. Nothing calls
+  `session("strata")`, so the difference is inert until then.
+
