@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76, §78.
 
 ## Where things stand (2026-10-13)
 
@@ -2931,3 +2931,27 @@ narrator changes in seven novel runs, none in the three base runs.
   Tone questions the old runs never asked come back unanswered; count them.
 - **Tests:** a character first seen in the chapters it would tell can't take them from the teller; a
   point-of-view character who speaks elsewhere still can.
+
+## 78. FreeLLMAPI as the cast LLM: no complete run (2026-10-14)
+
+Written first as a second "§77"; renumbered on 2026-10-15, since §77 is the Strata removal (app.md).
+
+The owner asked to try the FreeLLMAPI chains (`auto:vscode`, then `auto:smart`) as the cast LLM on the real
+benchmark books. Production stayed on qwen2.5:14b.
+
+- **Setup.** Production attribution and the answer-key scorer on the five keys (Apex Prey 3, Six Wakes, You
+  Like It Darker, Such Sharp Teeth, Steamy Screams; 5,760 lines a pass), request sizes 20/16/24, profiles
+  skipped, no local GPU reservation. Strict API JSON mode excluded usable providers, so JSON was asked for in
+  the prompt only; the parser still validated every reply.
+- **`auto:vscode`: 0 of 15 runs completed** (4 upstream HTTP 502 or timeouts, 11 HTTP 429 pool exhaustion).
+- **`auto:smart`, prompted JSON: 0 of 5 size-20 runs completed** (HTTP 502 on four, 429 on one; 34 replies in
+  all). The other sizes were not attempted.
+- No complete cloud cast exists, so there is no accuracy comparison, and provider availability changed during
+  the runs: this says nothing about the models' reading. The local 14B's matching Such Sharp Teeth run took
+  868 s.
+- **Kept:** the scorer breaks an unnamed narrator's equal-vote tie by name, so repeated scoring is
+  deterministic (`cast_audit_eval._load_predictions`, one test); baseline counts are unchanged.
+- **Not kept (2026-10-15):** the harness (`benchmark_freellm.py`, its test, a request-metadata hook in
+  `evaluate_cast.py`) moved out of the repository to `data/diagnostics/freellm_harness_2026-10-14/`, since no
+  run completed and the cast LLM stays local. Private runs and the report: `data/diagnostics/freellm_*_2026-10-14/`
+  and `freellm_comparison_2026-10-14.md`.

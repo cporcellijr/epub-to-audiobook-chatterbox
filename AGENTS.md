@@ -18,7 +18,8 @@ claims. Edit directly only when Omni is unavailable or spent, and say so.
   launches OpenCode in this directory. OpenCode uses the git-excluded
   `opencode.json` here, which routes to FreeLLMAPI, a local free-tier router
   (Docker stack `C:/Server/stacks/freellmapi`, `http://localhost:3001/v1`, model
-  `freellmapi/auto:smart`). Claude loads it from
+  `freellmapi/auto:vscode`, the user's curated FreeLLMAPI chain; do not go back to
+  `auto:smart`, a global sort that sent most calls to a weak preview model). Claude loads it from
   `C:/Server/stacks/epub-to-audiobook/.mcp.json` and Codex from
   `C:/Server/stacks/epub-to-audiobook/.codex/config.toml`. Both set
   `OMNI_BRIDGE_REPO_ROOT` to this `src/`.
@@ -27,6 +28,27 @@ claims. Edit directly only when Omni is unavailable or spent, and say so.
   run, because a cut-off run can corrupt existing code.
 - Omni sends repository code to free cloud models, so never point it at book text,
   `.env` files, or credentials.
+- `omni_research` can test code that is not checked out (a PR, another branch) in a
+  throwaway worktree under `C:/Users/cporc/AppData/Local/Temp/omni-review/<name>`.
+  This repository has no `.venv`; its test command, pointed at the worktree, is
+  `python -m unittest discover -s C:/Users/cporc/AppData/Local/Temp/omni-review/<name>/tests -t C:/Users/cporc/AppData/Local/Temp/omni-review/<name> -p "*test*.py"`
+  (ffmpeg required). For a review, ask it for the with-fix and fix-reverted runs. Its
+  memo labels each claim confirmed (with file:line or command output) or hypothesis;
+  verify confirmed claims that matter before acting on them.
+- **When Omni falls short, look for a local fix before working around it.** It is
+  local tooling the user wants improved:
+  - a blocked command → the agent's `permission.bash` allowlist in this `opencode.json`
+    (keep new rules confined to a path or an exact command; never a bare `*` on the
+    read-only researcher);
+  - running out of steps → `steps` on the agent in `opencode.json`, or smaller phases;
+  - a recurring wrong behaviour (re-reading docs, wrong language, unverified claims,
+    invented symbol names, weakening tests) → the prompt builders in
+    `C:/Server/stacks/abs-kosync-enhanced/scripts/omni_bridge/omni_mcp_server.py`,
+    which BookBridge shares, so a prompt fix there applies to both repositories;
+  - weak answers → the `model` argument per call, or `OMNI_BRIDGE_MODEL`.
+  Say what fell short and the fix. A small, reversible config or prompt change can be
+  made and smoke-tested in the same session; anything bigger, ask first. Prompt edits
+  load only after the MCP server restarts; `opencode.json` is read on every run.
 
 Do not pause containers or directly start/load a GPU model to bypass the
 coordinator.

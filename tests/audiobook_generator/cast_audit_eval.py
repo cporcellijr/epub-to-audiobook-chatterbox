@@ -243,7 +243,8 @@ def _load_predictions(path, reference, aliases=None):
             theirs = [expected[k]["speaker_id"] for k in (_key(r["document"], r["line"]) for r in rows
                                                           if r["speaker"] == key) if k in expected]
             if theirs:
-                speaker_aliases[str(key).casefold()] = max(set(theirs), key=theirs.count)
+                # Equal-vote identities must score the same in separate processes.
+                speaker_aliases[str(key).casefold()] = max(set(theirs), key=lambda name: (theirs.count(name), name))
     return rows, canonical_routes, speaker_aliases
 
 

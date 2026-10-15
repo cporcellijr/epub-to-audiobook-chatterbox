@@ -126,6 +126,18 @@ class TestEvaluator(unittest.TestCase):
         self.assertEqual(evaluator.summary(result), "wrong 1 of 5, unresolved 0, split pairs 0, merged pairs 2, "
                                                     "wrong chapter narrators 0 of 2, wrong voice routes 0")
 
+    def test_anonymous_narrator_vote_ties_have_a_stable_identity(self):
+        reference = {"narrator_speaker_id": None, "lines": [_row(1, 1, "rob"), _row(1, 2, "wren")]}
+        prediction = {"characters": {"anonymous": {"name": "The Narrator"}},
+                      "chapters": {"a": {"number": 1, "lines": {}}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cast.json"
+            for lines in ({"1": "anonymous", "2": "anonymous"}, {"2": "anonymous", "1": "anonymous"}):
+                prediction["chapters"]["a"]["lines"] = lines
+                path.write_text(json.dumps(prediction), encoding="utf-8")
+                _, _, aliases = evaluator._load_predictions(path, reference)
+                self.assertEqual(aliases["anonymous"], "wren")
+
 
 if __name__ == "__main__":
     unittest.main()
