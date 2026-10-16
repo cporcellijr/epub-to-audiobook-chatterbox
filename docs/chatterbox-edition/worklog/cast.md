@@ -33,7 +33,8 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
 - **Decoding experiments (§79, 2026-10-15):** constraining each answer to the speakers the prompt shows
   fails on books (Such Sharp Teeth 1,004 wrong + unresolved against 285), and the 14B's own answer
   probability flags wrong lines no better than model agreement: a third of the wrong lines are answered at
-  0.999 or more.
+  0.999 or more. A 30B mixture-of-experts model (qwen3 30B-A3B) run natively, half in system RAM, tied the
+  14B on the masked set and lost every book (novel 544 against 285); the 14B stays.
 - **A wider comparison:** the masked-tag set, 600 lines from 27 library books whose tags were
   removed, is for comparing models and prompts (§61.2). qwen2.5:14b gets 376 right.
 - **How a cast is judged** (owner, 2026-10-13, §73.4): consistency within each story. A character keeps
@@ -3074,4 +3075,31 @@ Narrator lines lost on Such Sharp Teeth: 132 observe, 314 decision. System RAM i
   weights partly on the CPU). One request: a 2,239-token prompt read in 17.6 s (127 tokens/s), generation
   ~44 tokens/s; about five times the 14B's time per request.
 
-**Results:** running.
+- **A runaway, capped.** Uncapped, some replies never ended (Ollama shifts a full context and keeps
+  generating) until the client's 300 s timeout; the first size-20 attempt was stopped. The model kept listing
+  every noun phrase as a character ("The summer", "the Boston ad agency"). The 14B's longest reply in the
+  observe and decision arms was 471 tokens, so a derived model `qwen3-30b-a3b-cast:q4_K_M` sets
+  `num_predict 1024` (Modelfile only; prompts and request unchanged). A capped reply fails the parser and is
+  asked again, as any unusable reply. On the keys 43 replies hit the cap; 18 windows stayed unusable twice.
+
+**Results (request size 20; wrong + unresolved, off voice, wrong chapter narrators):**
+
+| Model | Masked (of 600) | Apex Prey 3 | Six Wakes | You Like It Darker | Such Sharp Teeth | Minutes | Peak VRAM / system RAM |
+|---|---|---|---|---|---|---|---|
+| qwen2.5:14b (Docker; 79.2's observe arm) | 377 | 6 + 3, 9 off | 1 + 0, 1 off | 92 + 0, 135 off, 0 of 4 | 270 + 15, 239 off, 0 of 15 | 46.4 | 11.2 / 27.0 GiB |
+| qwen3 30B-A3B (native, capped) | 377 | 18 + 4, 15 off | 130 + 0, 27 off | 357 + 57, 352 off, 2 of 4 | 326 + 218, 515 off, 1 of 15 | 80.8 | 10.7 / 29.9 GiB |
+
+Narrator lines lost on Such Sharp Teeth: 132 (14B), 355 (MoE). VRAM is the whole card, desktop included; the
+MoE's 9.7 GB on the card plus 8.15 GB of pinned RAM. At its peak the system had 1.8 GiB of RAM left.
+
+- **It ties the 14B on the masked set and loses every book.** The errors are identity cascades, the kind the
+  taught 7Bs made (§66-§72): Six Wakes merges Detective Lo into Joanna Glass (103 lines); You Like It Darker
+  gives Vic Trenton's lines to Henry Bell and Andy Pelley (225) and splits off a "Deputy Pelley" (40); the novel
+  gives the narrator Rory's lines to Mia, Scarlett, Ian and Matty (193). Counting wrong lines only, it still
+  loses everywhere (novel 326 against 270).
+- **Verdict by the switch rule (whole-novel key first): keep qwen2.5:14b.** The novel is 544 against 285,
+  outside the 14B's own 211-364 range across request sizes (§76.2), so sizes 16 and 24 were not run.
+- **Cost if it had won:** about 1.75 times the 14B's time, 18 GB of model kept on the NVMe (from the D: USB disk
+  it can't load in time), and a RAM margin under 2 GiB with the Docker VM and the desktop running.
+- The native install stays in `D:\ollama-native` (Ollama 0.40.5 and the model, nothing starts with Windows); a
+  run needs the model store copied to the NVMe first. `run_a.py` holds the procedure.
