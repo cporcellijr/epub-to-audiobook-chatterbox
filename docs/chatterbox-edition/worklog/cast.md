@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76, §78, §79.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76, §78, §79, §80.
 
 ## Where things stand (2026-10-13)
 
@@ -53,6 +53,9 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   doubled the full pipeline's errors (202 against 86). Teaching has stopped there; the 14B stays. The 14B
   itself can now be taught on this card (§70), but its adapter at full strength did far worse
   (books 152 against 86, §72); guards now stop one borrowed name spreading to a whole person or story.
+- **A name born late can no longer take a novel's chapters (§80):** a chapter's "I said" votes for someone
+  first heard there go to the teller the others address by name, and a stray second entry under the
+  teller's name no longer blocks finding them.
 - **Tried and not kept:**
   - evidence written before the answer (§14, §41.4);
   - re-asking unnamed-"I" chapters with only their own people listed (§44.3);
@@ -63,7 +66,6 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - a narrator split under two names that both get "I said" votes (§49.4);
   - an editor merge doesn't survive a re-analysis (§30);
   - casts analysed before a narrator fix keep their old narrators until re-analysed (§49.4).
-  - a narrator name born late in a novel ("Aurora" for Rory, "The Wolf") can take chapters; guard planned (§76.5).
   - on Apex Prey 3 the model sometimes labels the narrator by a description ("the girl"); a description
     declared with a new name now becomes that person (§64), but the model's own label errors remain.
 
@@ -3103,3 +3105,68 @@ MoE's 9.7 GB on the card plus 8.15 GB of pinned RAM. At its peak the system had 
   it can't load in time), and a RAM margin under 2 GiB with the Docker VM and the desktop running.
 - The native install stays in `D:\ollama-native` (Ollama 0.40.5 and the model, nothing starts with Windows); a
   run needs the model store copied to the NVMe first. `run_a.py` holds the procedure.
+
+## 80. A narrator born in the chapters it takes; one name, one rival (2026-10-16)
+
+§76.5's planned guard, measured by replay before shipping. The failure: on Such Sharp Teeth a chapter's "I said"
+votes went to a name the model coined late ("The Wolf" in chapters 17-18 of the tentative-label run; "Aurora",
+Rory's full name, in 16-18 of the deployed code's sanity run), and that name became those chapters' narrator,
+the narration voice changing inside one novel. Private material: `data/diagnostics/narrator_guard_2026-10-16/`.
+
+### 80.1 What the replay showed first
+
+§76.5 assumed the novel had an addressed teller (Rory) that the guard could hand the chapters back to. It had
+none, in both failing runs: the cast held two entries named Rory, `rory` (about 1,300 lines) and a stray `rory 2`
+(2 lines). Both match every "..., Rory" address, so they tie, and the teller needs twice the next person's
+addresses. And "heard nowhere else in the story" was the wrong test: Aurora also had 53 lines in chapter 18,
+whose votes went to an unnamed narrator. What separates the cases is when a person is first heard:
+
+| Person | Takes chapters | Lines before them |
+|---|---|---|
+| Aurora (failure) | 16-18 | none |
+| The Wolf (failure) | 17-18 | none |
+| Nora (Monster Girl Islands, real point of view) | 6 | 72, in chapters 2-5 |
+| Yuki (same) | 7 | 8, in chapters 4-5 |
+
+### 80.2 The change (`cast_profiles.addressed_tellers`, `chapter_narrators`)
+
+- **One name, one rival.** Before the teller is ranked, cast entries sharing a display name count as one
+  candidate, the entry with the most lines, with the group's highest address count.
+- **Born late.** After a story's teller is found, a chapter whose "I said" votes went to a named person
+  first heard in the chapters they'd take (no line earlier in the story, and not the story's first
+  chapter) goes to the teller, if its narration doesn't name the teller. `chapter_narrators` then makes the
+  teller its narrator with the vote as `narrator_reference`, so the vote's lines in that chapter move to the
+  teller, as already done for a description narrator ("Man").
+- A point-of-view character heard before their chapter keeps it ("Nora's PoV"), and so does a point of view
+  in a story's first chapter (a prologue). Known limit: a character whose first lines are in their own
+  point-of-view chapter, later in a novel with an addressed teller, now loses that chapter to the teller.
+
+### 80.3 Replay check (no GPU)
+
+Every saved run that replays was replayed on its own answers twice, without and with the guard; the older
+runs on their own frozen source plus the same patch. 38 runs: Such Sharp Teeth 10, Steamy Screams 9, the
+three older keys 18 (sizes 16/20/24, and §79's three arms), Monster Girl Islands 1. No request went
+unanswered.
+
+| Run | Chapter narrators changed | Wrong + unresolved | Teller lines lost | Off voice | Wrong chapter narrators |
+|---|---|---|---|---|---|
+| Such Sharp Teeth, deployed code, size 20 ("Aurora") | 16-18 Aurora → Rory | 211 → 211 | 142 → 78 | 369 → 168 | 0 → 0 |
+| Such Sharp Teeth, tentative labels, size 20 ("The Wolf") | 17-18 The Wolf → Rory | 409 → 252 | 127 → 114 | 369 → 212 | 2 → 0 |
+
+- The scorer already counted "Aurora" lines as Rory's, so only the voice measures moved in the first run.
+- **Nothing else changed** in the other 36 runs, except four novel runs:
+  - Chapter 19 (a letter without dialogue) now names Rory, where before it fell back to the book's narrator,
+    also Rory: the same voice (two base runs, and the "Aurora" run above).
+  - The two §79 experiment arms that had a wrong chapter narrator on the novel (decision: Ian Pedretti,
+    chapters 5-6; the 30B model: Mia Russo, 18-19) now have Rory there, toward the key.
+- Monster Girl Islands keeps Nora (6) and Yuki (7); every older key and every Steamy Screams story keeps its
+  narrators and scores.
+- No live run: the guard changes nothing the model is asked, and replaying today's production-equivalent
+  0.40.5 run (§79.2) with it gives the same cast.
+
+### 80.4 Tests
+
+Four new cases in `cast_profiles_test.py`, written to the seen failures: a name born in the chapter it
+would tell doesn't take it; one heard before keeps it; a first-chapter point of view keeps it; a stray
+second entry under the teller's name doesn't block the teller (the first and last fail on the code before).
+Full suite in the app image: 1,036 tests pass (1 skipped).

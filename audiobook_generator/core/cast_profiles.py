@@ -660,9 +660,11 @@ def addressed_tellers(members: List[ChapterText], characters: Dict[str, dict],
     text names STORY_BREAK_MIN_CAST people and none the story so far named; who the model said speaks
     doesn't count (seen live: lines of the next story went to the last one's narrator, joining them
     up). A chapter whose "I said" lines (`votes`) went to another named person is theirs (seen live: a
-    novel's "Nora's PoV" chapters): it neither counts for a teller nor gets one. Measured over 13
-    stories of eight books: 9 named right, 4 left alone, none wrong; looser thresholds named wrong
-    people (a collection story's other lead)."""
+    novel's "Nora's PoV" chapters): it neither counts for a teller nor gets one, unless that person is
+    first heard in those chapters, after the story's first (seen live: "The Wolf", and "Aurora", a full
+    name used late in a novel, took Rory's last chapters): then they go to the teller, if their narration
+    doesn't name them. Measured over 13 stories of eight books: 9 named right, 4 left alone, none wrong;
+    looser thresholds named wrong people (a collection story's other lead)."""
     from collections import Counter
     votes = votes or {}
 
@@ -694,6 +696,16 @@ def addressed_tellers(members: List[ChapterText], characters: Dict[str, dict],
                         quote, speaker = _quote(segment.text), chapter.lines.get(segment.line_id)
                         counts.update(key for key, pattern in patterns.items()
                                       if key != speaker and owner in (None, key) and pattern.search(quote))
+        # two entries under one name share every address (seen live: "Rory" and a stray second "Rory"
+        # with two lines), so they are not each other's rival; the one with more lines stands for both
+        groups: Dict[str, List[str]] = {}
+        for key in counts:
+            groups.setdefault(normalize_name(characters[key]["name"]), []).append(key)
+        collapsed = {}
+        for keys in groups.values():
+            best = max(keys, key=lambda k: (int(characters[k].get("lines", 0)), -keys.index(k)))
+            collapsed[best] = max(counts[k] for k in keys)
+        counts = Counter(collapsed)
         ranked = [(n, key) for key, n in counts.most_common()
                   if all(could_say_i(chapter, key, characters) for chapter in theirs(key))][:2]
         if ranked and ranked[0][0] >= TELLER_MIN_ADDRESSES and \
@@ -703,6 +715,21 @@ def addressed_tellers(members: List[ChapterText], characters: Dict[str, dict],
             found.update({chapter.number: key for chapter in told})
             log.info(f"Cast: {len(told)} chapters from {told[0].number} to {told[-1].number} told by {key}, "
                      f"addressed by name {ranked[0][0]} times (next {ranked[1][0] if len(ranked) > 1 else 0})")
+            rescued: Dict[str, List[int]] = {}
+            for chapter in story:
+                if chapter.number in found:
+                    continue
+                vote = told_by(chapter)
+                if not vote or not could_say_i(chapter, key, characters):
+                    continue
+                first = next(i for i, c in enumerate(story) if votes.get(c.number) == vote)
+                earlier = story[:first]
+                if earlier and not any(vote in c.lines.values() for c in earlier):
+                    found[chapter.number] = key
+                    rescued.setdefault(vote, []).append(chapter.number)
+            for vote, numbers in rescued.items():
+                log.info(f"Cast: chapters {numbers} go to {key}: their \"I said\" votes went to {vote}, "
+                         f"first heard there")
     return found
 
 
@@ -751,10 +778,11 @@ def chapter_narrators(cast: dict, chapters: List[ChapterText], book_tone: Option
             book_narrator = teller or (single_run_tone if fits(single_run_tone) else None)
             found = own[i]
             tone = None
-            if teller and (found is None or _is_description(characters.get(found) or {})):
+            if teller and found != teller:
                 # The others call this chapter's "I" by name: they tell it, and the lines the model gave
                 # the "I" under a label are theirs (seen live: a novel's narrator labelled "Man" in most
-                # chapters, read in another voice than his own name's).
+                # chapters, read in another voice than his own name's), or its "I said" lines went to a
+                # name first heard in this chapter's run of them (addressed_tellers).
                 narrators[chapter.number] = {"point_of_view": "first", "narrator": teller}
                 if found and found != teller:
                     narrators[chapter.number]["narrator_reference"] = found

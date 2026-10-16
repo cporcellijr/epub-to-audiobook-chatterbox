@@ -476,6 +476,55 @@ class TestChapterNarrators(unittest.TestCase):
         self.assertEqual([dict(c.lines) for c in chapters[:3]], [{1: "bettie", 2: "oliver", 3: "oliver"}] * 3)
         self.assertNotIn("man", cast["characters"])
 
+    def _born_late(self, at=4, earlier=False, stray=False):
+        """Oliver tells chapters 1-4 (the others call him by name); chapter `at`'s "I said" lines went to
+        "Aurora", a name the story gives no other line, unless `earlier` gives her one in chapter 2;
+        `stray` adds a second cast entry named Oliver with one line (seen live: a stray second "Rory")."""
+        cast = self._cast(1, 2, 3, 4)
+        cast["characters"]["aurora"] = {"name": "Aurora", "aliases": [], "gender": "female", "age": "adult",
+                                        "lines": 2}
+        if stray:
+            cast["characters"]["oliver 2"] = {"name": "Oliver", "aliases": [], "gender": "male", "lines": 1}
+        lines = [{1: "bettie", 2: "oliver", 3: "oliver"} for _ in range(4)]
+        lines[at - 1] = {1: "bettie", 2: "aurora", 3: "aurora"}
+        if earlier:
+            lines[1][1] = "aurora"
+        chapters = [_story(n, _FIRST_PERSON, dict(own)) for n, own in zip((1, 2, 3, 4), lines)]
+        for chapter in chapters:
+            cast["chapters"][f"h{chapter.number}"]["lines"] = {str(k): v for k, v in chapter.lines.items()}
+        return cast, chapters
+
+    def test_a_name_born_in_the_chapter_it_would_tell_does_not_take_it_from_the_teller(self):
+        # Seen live (WORKLOG §76): "The Wolf", and "Aurora" (the narrator's full name, used late in the
+        # novel), got the last chapters' "I said" lines and became their narrator: the voice changed mid-book.
+        cast, chapters = self._born_late()
+        found = chapter_narrators(cast, chapters, None)
+        self.assertEqual([found[n]["narrator"] for n in (1, 2, 3, 4)], ["oliver"] * 4)
+        self.assertEqual(found[4].get("narrator_reference"), "aurora")
+        apply_chapter_narrators(cast, chapters, found)
+        self.assertEqual(dict(chapters[3].lines), {1: "bettie", 2: "oliver", 3: "oliver"})
+        self.assertEqual(cast["chapters"]["h4"]["lines"], {"1": "bettie", "2": "oliver", "3": "oliver"})
+        self.assertNotIn("aurora", cast["characters"])
+
+    def test_a_point_of_view_heard_before_its_chapter_keeps_it(self):
+        cast, chapters = self._born_late(earlier=True)
+        found = chapter_narrators(cast, chapters, None)
+        self.assertEqual([found[n]["narrator"] for n in (1, 2, 3, 4)], ["oliver", "oliver", "oliver", "aurora"])
+        self.assertNotIn("narrator_reference", found[4])
+
+    def test_a_point_of_view_in_the_storys_first_chapter_is_not_born_late(self):
+        cast, chapters = self._born_late(at=1)
+        found = chapter_narrators(cast, chapters, None)
+        self.assertEqual([found[n]["narrator"] for n in (1, 2, 3, 4)], ["aurora", "oliver", "oliver", "oliver"])
+
+    def test_a_stray_second_entry_under_the_tellers_name_is_not_their_rival(self):
+        # Seen live: a second "Rory" with two lines matched every address to Rory, tying the count, so the
+        # novel had no teller and the guard against a late-born narrator could not act.
+        cast, chapters = self._born_late(stray=True)
+        found = chapter_narrators(cast, chapters, None)
+        self.assertEqual([found[n]["narrator"] for n in (1, 2, 3, 4)], ["oliver"] * 4)
+        self.assertEqual(found[4].get("narrator_reference"), "aurora")
+
     def test_a_teller_needs_three_addresses_twice_anyone_elses_and_a_narration_that_never_names_them(self):
         def story(*extra):
             text = _FIRST_PERSON + "".join(M + line for line in extra)
