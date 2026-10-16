@@ -103,3 +103,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 76 | 2026-10-13 | A whole novel as the main test; tentative labels reverted; "I'd" is the narrator | [cast](worklog/cast.md) |
 | 77 | 2026-10-14 | Strata removed; the reservation client drops its engine; coding goes through the Omni bridge | [app](worklog/app.md) |
 | 78 | 2026-10-14 | FreeLLMAPI as the cast LLM: no complete run | [cast](worklog/cast.md) |
+| 79 | 2026-10-15 | A 30B mixture-of-experts model outside Docker; the model's own probability as a flag | [cast](worklog/cast.md) |

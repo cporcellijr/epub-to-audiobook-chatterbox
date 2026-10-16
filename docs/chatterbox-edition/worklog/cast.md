@@ -2,7 +2,7 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76, §78.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76, §78, §79.
 
 ## Where things stand (2026-10-13)
 
@@ -30,6 +30,10 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - The main key since §76: Such Sharp Teeth, a whole first-person novel, 3,304 lines. On it one identity
     cascade per run (twins confused, a person split, a label taking the "I") swings 100-270 lines, so
     the same code ranges 211-364 wrong lines between request sizes.
+- **Decoding experiments (§79, 2026-10-15):** constraining each answer to the speakers the prompt shows
+  fails on books (Such Sharp Teeth 1,004 wrong + unresolved against 285), and the 14B's own answer
+  probability flags wrong lines no better than model agreement: a third of the wrong lines are answered at
+  0.999 or more.
 - **A wider comparison:** the masked-tag set, 600 lines from 27 library books whose tags were
   removed, is for comparing models and prompts (§61.2). qwen2.5:14b gets 376 right.
 - **How a cast is judged** (owner, 2026-10-13, §73.4): consistency within each story. A character keeps
@@ -2955,3 +2959,119 @@ benchmark books. Production stayed on qwen2.5:14b.
   `evaluate_cast.py`) moved out of the repository to `data/diagnostics/freellm_harness_2026-10-14/`, since no
   run completed and the cast LLM stays local. Private runs and the report: `data/diagnostics/freellm_*_2026-10-14/`
   and `freellm_comparison_2026-10-14.md`.
+
+## 79. A 30B mixture-of-experts model outside Docker, and the model's own probability as a flag (2026-10-15)
+
+The owner asked for two measured experiments on attribution, changing nothing in production:
+- **A:** a 30B mixture-of-experts model, split between the GPU and system RAM by a native Windows Ollama,
+  outside the 16 GB Docker VM (§61 had skipped these models for that limit).
+- **B, "decision scoring":** the same 14B and the same prompts, reading the model's probability for each
+  answer, with and without constraining answers to the speakers the prompt shows. The question: does a low
+  probability flag the wrong lines, where §61 found model agreement doesn't?
+
+Private material for both: `data/diagnostics/cast_decision_2026-10-15/` (`run_b.py`, `run_a.py`, `labels.py`).
+
+### 79.1 Shared setup
+
+- **Source** frozen at 96a5022 plus `experiments/cast_decision/decision_client.py`, mounted read-only.
+- **Runner:** §61's masked-tag runner with Such Sharp Teeth added to its keys: the masked set and four keys
+  (Apex Prey 3, Six Wakes, You Like It Darker, Such Sharp Teeth), profiles skipped as before.
+- **GPU:** every stage holds an "ollama" coordinator reservation and checks the queue before each book. Peak
+  VRAM and system RAM are sampled every 15 s. Incomplete casts are refused before scoring.
+- **Library change found:** one masked-set book, Town The World Forgot, had moved to another library folder
+  (same sha256). The private runner maps the old path to the new one, and it was run on its own into the
+  observe arm.
+- **Ollama 0.40.5 changed the 14B's answers.** The production Ollama container was recreated with 0.40.5 on
+  2026-10-15 at 16:35; no update check is recorded (0.40.1 was the last version checked, on 10-08). Against
+  §76's sanity run (509b996, the same casting code), the novel's second request, byte-identical, now gets
+  "narrator" instead of "Rory" for its five lines: the same person to the pipeline, but later prompts diverge. Today's production-equivalent run (79.2)
+  serves as the update check: masked 377 (376-378 before), Apex Prey 3 9, Six Wakes 1, You Like It Darker
+  92, all as before; Such Sharp Teeth 285 against 193 in one run each, inside the 211-364 that one code
+  spans across request sizes (§76.2).
+
+### 79.2 B: decision scoring
+
+- Ollama 0.40.5 returns token logprobs on its OpenAI endpoint (`logprobs`, 20 alternatives per token), in
+  JSON mode and under a JSON-schema constraint, so B ran on the production server and model file. No llama.cpp
+  was needed (its image had been removed).
+- **observe:** the production request plus logprobs. On the smoke book all 12 replies were byte-identical to a
+  plain production run, and so was the cast.
+- **decision:** each asked line's answer is constrained (a JSON-schema enum) to the candidates the prompt
+  itself shows: the known-characters list (an `@key` entry answers as its key), the chapter narrator, every
+  `[Name]`/`[Name?]` label in the passage, "I" and "unknown". A new speaker can still be declared under
+  "characters" but can't be given a line in that window.
+- **Confidence per answer:** `p_seq`, the probability of the answer's own tokens; `p_decision`, the same
+  renormalised over the tokens that continue some candidate. The model's last answer for a line counts (the
+  review pass's, if it re-asked).
+- **Baselines:**
+  - masked set and the three older keys: §61's four-model agreement. A line is flagged when the four models'
+    named answers are not one person; this reproduces §61's 259 unanimous masked lines (81% right).
+  - Such Sharp Teeth, which §61 never ran: whether §76's base arm agreed with itself across request sizes 16/20/24.
+
+**Results (qwen2.5:14b, request size 20; wrong + unresolved, off voice, wrong chapter narrators):**
+
+| Decoding | Masked (of 600) | Apex Prey 3 | Six Wakes | You Like It Darker | Such Sharp Teeth | Minutes | Peak VRAM / system RAM |
+|---|---|---|---|---|---|---|---|
+| observe (= production) | 377 | 6 + 3, 9 off | 1 + 0, 1 off | 92 + 0, 135 off, 0 of 4 | 270 + 15, 239 off, 0 of 15 | 46.4 | 11.2 / 27.0 GiB |
+| decision (constrained) | 381 | 88 + 6, 62 off | 37 + 0, 38 off | 341 + 3, 90 off, 1 of 4 | 964 + 40, 762 off, 1 of 15 | 46.2 | 10.7 / 27.3 GiB |
+
+Narrator lines lost on Such Sharp Teeth: 132 observe, 314 decision. System RAM includes Windows and the Docker VM.
+
+- **The decision format fails on books.** It wins 4 masked lines and loses everywhere else, by 3.5 to 37 times: a
+  speaker who is not yet on the list can't be named, so the model forces the line onto someone known, and
+  identity cascades follow (both chapter-narrator errors are new). The masked set alone overrates it again.
+- **A low probability does flag some wrong lines, but no better than agreement, which §61 already found
+  wanting.** Observe arm, `p_seq`, last answer:
+
+| Set | Wrong lines the model answered | AUROC | Below 0.9: flagged / wrong caught / right flagged | Baseline flags: wrong caught / right flagged | Probability at the same budget |
+|---|---|---|---|---|---|
+| Masked set | 223 | 0.70 | 175 / 102 / 73 | 341: 175 / 166 | 161 / 180 |
+| Apex Prey 3 | 9 | 0.77 | 26 / 3 / 23 | 70: 7 / 63 | 8 / 62 |
+| Six Wakes | 1 | 0.79 | 20 / 0 / 20 | 37: 1 / 36 | 0 / 37 |
+| You Like It Darker | 91 | 0.80 | 74 / 28 / 46 | 327: 60 / 267 | 59 / 268 |
+| Such Sharp Teeth | 280 | 0.70 | 228 / 77 / 151 | 486 (sizes disagree): 199 / 287 | 142 / 344 |
+| All four keys | 381 | 0.73 | 348 / 108 / 240 | 920: 267 / 653 | 216 / 704 |
+
+- About a third of the keys' wrong lines (136 of 381; 104 of 280 on the novel) were answered with probability
+  0.999 or more. Those are the identity cascades: the model is sure, and wrong, about who a name or the "I" is.
+- `p_decision` is no better (AUROC 0.65-0.75), nor is the first-pass answer instead of the last. Under the
+  constrained decoding, the probabilities are worse (AUROC 0.57-0.71).
+- **Routing low-probability lines to the review pass would not pay:** below 0.9 on the novel, 228 lines are
+  re-asked to reach 77 wrong ones, and the review would still have to get them right; the cascades sit above
+  the threshold. No follow-up proposal.
+- **The Colibri "decision models"** (github.com/JustVugg/colibri, not installed): Laya and GLiNER2.5-Decide are
+  small English CPU classifiers that choose from a fixed label list, the format the decision arm shows failing
+  on real books, and they are different models; no context limits or calibration are published. Clef is a
+  52 GB Qwen-27B with a decision head, 20 s per request on a CPU and 19 GB of RAM at int4. None applies.
+- **Tools:** `experiments/cast_decision/decision_client.py` (client, prompt parsing, confidences) and
+  `analyse_confidence.py` (thresholds, AUROC, flags at the baseline's budget); 11 tests in
+  `tests/audiobook_generator/cast_decision_test.py`.
+
+### 79.3 A: a 30B mixture-of-experts model on a native Ollama
+
+**Feasibility (measured 2026-10-15).**
+- The card has 12,282 MiB; the Windows desktop keeps ~2 GB, so ~9.5-10 GB is usable, not 12.
+- Windows and its apps use ~12.5 GB of the 31.7 GB of RAM; the Docker VM ~3-4 GB idle (up to ~13 GB with the
+  Docker 14B cached; cap 16 GB). With the VM's cache dropped, ~15 GB is free for a native model.
+- Within 10 GB of RAM, Ollama's library offers `qwen3:30b-a3b-instruct-2507-q4_K_M` (19 GB, non-thinking),
+  `glm-4.7-flash:q4_K_M` (19 GB, thinking) and `gemma4:26b-a4b-it-q4_K_M` (18 GB; its 12B broke first-person
+  identity in §61). `qwen3.6:35b-a3b-q4_K_M` (24 GB with vision), `qwen3.5:35b-a3b` (22 GB) and
+  `nemotron-3.5-lightning:30b-a3b` (25 GB) need 12-15 GB of RAM. A 17.7 GB Qwen3.6 IQ4_XS from Hugging Face
+  fits but reportedly needs llama.cpp (Ollama rejects that architecture's outside GGUFs).
+- **The owner chose the Ollama zip and the Qwen3 30B-A3B instruct model.**
+
+**Setup.**
+- Ollama 0.40.5's standalone zip (not the installer, whose tray app would start a server on 11434) in
+  `D:\ollama-native`, run only for a stage on 127.0.0.1:11435; containers reach it as host.docker.internal.
+- **Models on the C: NVMe.** D: is a USB disk (~40 MB/s): the 18.5 GB load outran Ollama's 5-minute load
+  timeout, and the smoke book failed. From C: it loads in 54 s; `run_a.py` loads it before the runner's first
+  request and sets `OLLAMA_LOAD_TIMEOUT=20m`.
+- **GPU.** `run_a.py` holds one "ollama" reservation for the native server's life; the container runs without
+  a coordinator URL, so it can't wait behind a queued book while the host holds the lease. After a stage it
+  unloads the model, kills the server and its runners, and checks that VRAM is back at baseline before
+  releasing; available RAM below 1.5 GiB stops the run.
+- **The split:** 9.74 GB on the GPU and 8.15 GB in pinned system RAM (all 49 layers on the GPU, the expert
+  weights partly on the CPU). One request: a 2,239-token prompt read in 17.6 s (127 tokens/s), generation
+  ~44 tokens/s; about five times the 14B's time per request.
+
+**Results:** running.
