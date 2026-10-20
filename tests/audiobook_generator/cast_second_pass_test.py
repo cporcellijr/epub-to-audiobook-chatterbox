@@ -33,6 +33,20 @@ def build_fixture():
     chapters = [ChapterText(1, paragraphs, lines_map)]
     return cast, chapters, characters, lines_map
 
+def long_window_fixture(continued=False):
+    text = [f'"Line {i}."' for i in range(1, 20)]
+    text.extend(['"The speech starts here', '"and ends here."'] if continued else
+                ['"Line 20."', '"Line 21."'])
+    paragraphs = chapter_segments(M.join(text))
+    lines = {i: ("ada" if i == 1 else "ben") for i in range(1, 22)}
+    characters = {"ada": {"name": "Ada", "aliases": [], "lines": 1},
+                  "ben": {"name": "Ben", "aliases": [], "lines": 20},
+                  "cara": {"name": "Cara", "aliases": [], "lines": 5}}
+    cast = {"characters": characters,
+            "chapters": {"h": {"number": 1, "lines": {str(k): v for k, v in lines.items()}}}}
+    return cast, [ChapterText(1, paragraphs, dict(lines))]
+
+
 class FakeChat:
     def __init__(self, mapping=None, fail_times=0, raise_exc=None):
         self.mapping = mapping or {}
@@ -197,6 +211,33 @@ class TestCastSecondPass(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             cast_second_pass.second_pass(cast, chapters, FailsInChapterTwo(mapping={2: "Ada"}), "model")
         self.assertEqual(cast["chapters"]["h1"]["lines"]["2"], "ben")
+
+    def test_continuation_outside_every_window_follows_changed_opener(self):
+        cast, chapters = long_window_fixture(continued=True)
+        windows = cast_llm.build_windows(chapters[0].paragraphs)
+        self.assertEqual(len(windows), 1)
+        self.assertNotIn(21, windows[0].continued)
+        self.assertTrue(chapters[0].paragraphs[-1][0].continues)
+        responses = {i: ("Ada" if i in (1, 20) else "Ben") for i in range(1, 21)}
+        cast_second_pass.second_pass(cast, chapters, FakeChat(mapping=responses), "model")
+        self.assertEqual(cast["chapters"]["h"]["lines"]["20"], "ada")
+        self.assertEqual(cast["chapters"]["h"]["lines"]["21"], "ada")
+        self.assertEqual(chapters[0].lines[21], "ada")
+
+    def test_later_window_shows_only_accepted_or_first_pass_speakers(self):
+        cast, chapters = long_window_fixture()
+        responses = {i: ("Ada" if i in (1, 19) else "Cara" if i == 20 else "Ben")
+                     for i in range(1, 22)}
+        chat = FakeChat(mapping=responses)
+        cast_second_pass.second_pass(cast, chapters, chat, "model")
+        self.assertEqual(len(chat.prompts), 2)
+        second = chat.prompts[1][1]["content"]
+        self.assertIn('[Ada] "Line 19."', second)
+        self.assertIn('[Ben] "Line 20."', second)
+        self.assertNotIn('[Cara] "Line 20."', second)
+        self.assertEqual(cast["chapters"]["h"]["lines"]["19"], "ada")
+        self.assertEqual(cast["chapters"]["h"]["lines"]["20"], "ben")
+        self.assertEqual(cast["second_pass"]["asked"], 21)
 
     def test_model_available(self):
         class Resp:

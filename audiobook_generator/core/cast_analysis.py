@@ -18,7 +18,8 @@ from audiobook_generator.core import cast_second_pass
 from audiobook_generator.core.cast_llm import CAST_GUIDANCE_VERSION, ChatClient, Chat, Roster, attribute_chapter, \
     llm_api_key, llm_base_url, llm_model
 from audiobook_generator.core.cast_profiles import ChapterText, describe_book, profile_cast, turn_taking
-from audiobook_generator.core.dialogue import NARRATION, PARAGRAPH_MARK, Segment, chapter_segments
+from audiobook_generator.core.dialogue import DIALOGUE, NARRATION, PARAGRAPH_MARK, Segment, chapter_segments
+from audiobook_generator.core.speech_tags import tagged_speakers
 from audiobook_generator.utils.log_handler import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -75,11 +76,27 @@ def drop_empty_placeholders(cast: dict) -> None:
     """Remove the unnamed "The Narrator" and chapter-local descriptions that ended with no lines (their
     lines went to who they turned out to be), so they don't take a voice; an owner's pick keeps them."""
     pov = (cast.get("book_tone") or {}).get("pov_key")
+    narrators = {entry.get("narrator") for entry in cast.get("chapters", {}).values()}
     for key, character in list(cast["characters"].items()):
         placeholder = character.get("name") == "The Narrator" or character.get("reference_scope") == "chapter"
         owned = character.get("voice_picked") or (character.get("voice_design") or {}).get("status") == "done"
-        if placeholder and not character.get("lines") and not owned and key != pov:
+        if placeholder and not character.get("lines") and not owned and key != pov and key not in narrators:
             del cast["characters"][key]
+
+
+def _follow_continuations(chapter: ChapterText, entry: dict) -> None:
+    """Keep untagged continued speech with its opener in both chapter maps."""
+    tagged = tagged_speakers(chapter.paragraphs, include_continued=True)
+    saved = entry.get("lines", {})
+    for paragraph in chapter.paragraphs:
+        for segment in paragraph:
+            if segment.kind != DIALOGUE or not segment.continues or segment.line_id in tagged:
+                continue
+            if segment.line_id - 1 in chapter.lines:
+                speaker = chapter.lines[segment.line_id - 1]
+                chapter.lines[segment.line_id] = speaker
+                if str(segment.line_id) in saved:
+                    saved[str(segment.line_id)] = speaker
 
 
 def follow_turns(cast: dict, chapters: List[ChapterText]) -> None:
@@ -93,6 +110,7 @@ def follow_turns(cast: dict, chapters: List[ChapterText]) -> None:
             chapter.lines[line_id] = speaker
             if str(line_id) in entry.get("lines", {}):
                 entry["lines"][str(line_id)] = speaker
+        _follow_continuations(chapter, entry)
         changed += len(fixes)
     cast.setdefault("stats", {})["turn_fixes"] = changed
 
@@ -117,6 +135,7 @@ def reconcile_lines(cast: dict, chapters: List[ChapterText]) -> None:
                 chapter.lines[line] = None
                 if str(line) in entry.get("lines", {}):
                     entry["lines"][str(line)] = None
+        _follow_continuations(chapter, entry)
     cast["issues"] = sorted(issues, key=lambda issue: (issue["chapter"], issue["line"], issue["reason"]))
 
 

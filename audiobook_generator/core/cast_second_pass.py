@@ -20,6 +20,7 @@ from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core.cast import normalize_name
 from audiobook_generator.core.cast_llm import AttributionError, Chat, parse_reply, render_window
 from audiobook_generator.core.cast_profiles import ChapterText
+from audiobook_generator.core.dialogue import DIALOGUE
 from audiobook_generator.core.speech_tags import contradicted, first_person_tagged, quoted_terms, tagged_speakers
 
 logger = logging.getLogger(__name__)
@@ -203,7 +204,10 @@ def second_pass(
         for window in windows:
             cast["second_pass"]["windows"] += 1
             known = dict(anchors)
-            known.update({i: a for i, a in answers.items() if a})
+            for line_id in answers:
+                key = replaced.get(line_id) or entry.get("lines", {}).get(str(line_id))
+                if key in characters:
+                    known[line_id] = characters[key]["name"]
             content = template.format(
                 roster=roster_text,
                 narrator=narrator_line,
@@ -239,9 +243,10 @@ def second_pass(
                     # brought in from elsewhere spread over a whole scene (Six Wakes ch. 28, WORKLOG §81).
                     if key and (local.get(key) or key == narrator_key):
                         replaced[line_id] = key
-            for line_id in window.continued:
-                if line_id - 1 in replaced:
-                    replaced[line_id] = replaced[line_id - 1]
+        for paragraph in paragraphs:
+            for segment in paragraph:
+                if segment.kind == DIALOGUE and segment.continues and segment.line_id - 1 in replaced:
+                    replaced[segment.line_id] = replaced[segment.line_id - 1]
 
         chapter_replacements[chapter.number] = replaced
         cast["second_pass"]["done"] += 1

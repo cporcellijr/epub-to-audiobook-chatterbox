@@ -106,3 +106,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 79 | 2026-10-15 | A 30B mixture-of-experts model outside Docker; the model's own probability as a flag | [cast](worklog/cast.md) |
 | 80 | 2026-10-16 | A narrator born in the chapters it takes; one name, one rival | [cast](worklog/cast.md) |
 | 81 | 2026-10-19 | A trained 7B second pass with the finished cast fixed | [cast](worklog/cast.md) |
+| 82 | 2026-10-20 | Second-pass review fixes: tellers kept, speeches kept whole, rejected answers out of view | [cast](worklog/cast.md) |

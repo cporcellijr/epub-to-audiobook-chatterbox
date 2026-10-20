@@ -10,7 +10,8 @@ from unittest.mock import patch
 from ebooklib import epub
 
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import chatterbox_control
+from audiobook_generator.core import cast_analysis, cast_review, chatterbox_control
+from audiobook_generator.core.cast_profiles import ChapterText
 from audiobook_generator.core.cast_analysis import analyse_book, drop_empty_placeholders, hide_bylines, run_cast_analysis
 from audiobook_generator.core.dialogue import PARAGRAPH_MARK as M, chapter_segments
 
@@ -274,6 +275,57 @@ class TestAnalyseBook(unittest.TestCase):
         # If turn-taking reverts, the changed count is still recorded from the second pass.
 
     @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 1000)
+    def test_full_analysis_preserves_chapter_narrators_and_continuations(self):
+        import re
+        paragraphs = ['I remember that afternoon.']
+        paragraphs.extend(f'"Line {i}."' for i in range(1, 20))
+        paragraphs.extend(['"The speech starts here', '"and finishes here."',
+                           '"Fine," said Ada.', '"Indeed," said Ben.'])
+        _write_epub(self.book, [("One", paragraphs)])
+        self.settings["chapter_selection"] = [1]
+        seen_chapters = []
+        real_second_pass = cast_analysis.second_pass
+
+        def capture_second_pass(cast, chapters, *args, **kwargs):
+            seen_chapters.extend(chapters)
+            return real_second_pass(cast, chapters, *args, **kwargs)
+
+        class FirstChat:
+            def __call__(self, messages):
+                ids = re.findall(r"\[#(\d+)\]", messages[1]["content"])
+                if ids:
+                    return json.dumps({"speakers": {i: "Ben" for i in ids}})
+                return json.dumps({"tone": "quiet", "point_of_view": "third", "narrator_gender": "female"})
+
+        class SecondChat:
+            def __call__(self, messages):
+                ids = re.findall(r"\[#(\d+)\]", messages[1]["content"])
+                return json.dumps({"speakers": {i: "Ada" if i == "20" else "Ben" for i in ids}})
+
+        with patch("audiobook_generator.core.cast_analysis.second_pass", side_effect=capture_second_pass), \
+             patch("audiobook_generator.core.cast_profiles.chapter_narrators",
+                   return_value={1: {"point_of_view": "first", "narrator": "ada"}}):
+            cast = analyse_book(self.settings, chat=FirstChat(), second_chat=SecondChat())
+
+        saved = cast_store.load_cast(self.settings["cast_file"])
+        self.assertEqual(len(seen_chapters), 1)
+        self.assertEqual(cast["status"], "done")
+        self.assertEqual(cast["second_pass"]["changed"], 2)
+        for result in (cast, saved):
+            for entry in result["chapters"].values():
+                if entry.get("narrator"):
+                    self.assertIn(entry["narrator"], result["characters"])
+            entry = next(iter(result["chapters"].values()))
+            self.assertEqual(entry["narrator"], "ada")
+            self.assertEqual(entry["lines"]["20"], "ada")
+            self.assertEqual(entry["lines"]["21"], entry["lines"]["20"])
+        for chapter in seen_chapters:
+            for paragraph in chapter.paragraphs:
+                for segment in paragraph:
+                    if segment.kind == "dialogue" and segment.continues:
+                        self.assertEqual(chapter.lines[segment.line_id], chapter.lines[segment.line_id - 1])
+
+    @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 1000)
     def test_second_pass_off_skips_second_chat(self):
         import re
         settings = dict(self.settings, second_pass=False)
@@ -346,6 +398,43 @@ class TestDropEmptyPlaceholders(unittest.TestCase):
         }}
         drop_empty_placeholders(cast)
         self.assertEqual(sorted(cast["characters"]), ["ada", "guy", "narrator 2", "narrator 3"])
+
+    def test_zero_line_chapter_narrator_survives_cleanup(self):
+        cast = {"book_tone": {"pov_key": "other"},
+                "characters": {"teller": {"name": "The Narrator", "lines": 0},
+                               "other": {"name": "Ada", "lines": 3},
+                               "unused": {"name": "The Narrator", "lines": 0}},
+                "chapters": {"h1": {"number": 1, "narrator": "teller", "lines": {"1": "other"}},
+                             "h2": {"number": 2, "narrator": "teller", "lines": {}}}}
+        drop_empty_placeholders(cast)
+        self.assertIn("teller", cast["characters"])
+        self.assertNotIn("unused", cast["characters"])
+
+
+class TestContinuationCleanup(unittest.TestCase):
+    @staticmethod
+    def fixture():
+        paragraphs = chapter_segments(f'"A long speech that carries on{M}"still speaking{M}"and ends."')
+        lines = {1: "ben", 2: "ben", 3: "ben"}
+        cast = {"characters": {"ada": {"name": "Ada", "gender": "female"},
+                               "ben": {"name": "Ben", "gender": "male"}},
+                "chapters": {"h": {"number": 1, "lines": {str(i): k for i, k in lines.items()}}}}
+        return cast, [ChapterText(1, paragraphs, lines)]
+
+    def test_turn_taking_carries_an_opener_change_through_all_continuations(self):
+        cast, chapters = self.fixture()
+        with patch("audiobook_generator.core.cast_analysis.turn_taking", return_value={1: "ada"}):
+            cast_analysis.follow_turns(cast, chapters)
+        self.assertEqual(chapters[0].lines, {1: "ada", 2: "ada", 3: "ada"})
+        self.assertEqual(cast["chapters"]["h"]["lines"], {"1": "ada", "2": "ada", "3": "ada"})
+
+    def test_gender_reconciliation_carries_none_through_continuations(self):
+        cast, chapters = self.fixture()
+        with patch("audiobook_generator.core.cast_analysis.cast_review.flag_lines",
+                   return_value={1: [cast_review.GENDER]}):
+            cast_analysis.reconcile_lines(cast, chapters)
+        self.assertEqual(chapters[0].lines, {1: None, 2: None, 3: None})
+        self.assertEqual(cast["chapters"]["h"]["lines"], {"1": None, "2": None, "3": None})
 
 
 class TestHideBylines(unittest.TestCase):

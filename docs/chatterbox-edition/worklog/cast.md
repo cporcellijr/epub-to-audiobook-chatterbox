@@ -2,9 +2,9 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76, §78, §79, §80, §81.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76, §78, §79, §80, §81, §82.
 
-## Where things stand (2026-10-19)
+## Where things stand (2026-10-20)
 
 - **The pipeline** (`audiobook_generator/core/`):
   - quotations are split per chapter (`dialogue.py`, §13);
@@ -17,11 +17,11 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - two-person turn-taking is repaired (§45);
   - profiles and measured voice matching pick the voices (§15-§16);
   - then a trained 7B asks every request again with the finished cast fixed, keeping an answer only for
-    someone already speaking in that chapter, and turn-taking and the gender check run again (§81).
+    someone already speaking in that chapter, and turn-taking and the gender check run again (§81, §82).
 - **The models** are qwen2.5:14b through Ollama, at temperature 0, and for the second pass
   `qwen2.5-cast6:7b` (the round-six fine-tune merged at Q8_0, §81.4). Over the five keys at three request
-  sizes the second pass took wrong + unresolved lines from 1,526 to 1,080 and off-voice lines from 1,248 to
-  731, most of it on the novel (§81.2). On 2026-10-01 the owner decided to
+  sizes the second pass took wrong + unresolved lines from 1,526 to 1,046 and off-voice lines from 1,248 to
+  700, most of it on the novel (§81.2, §82). On 2026-10-01 the owner decided to
   keep the cast LLM local: hosted models' content filters would likely refuse many of the books.
   Newer models that fit the card (gemma4:12b, qwen3.5:9b, qwen3:14b) did no better, and a vote across
   models gained little (§61).
@@ -3278,3 +3278,41 @@ size 20, against the offline numbers of §81.2:
   line, the model check), four wiring cases in `cast_analysis_test.py` and the progress text in
   `chatterbox_ui_test.py`; mutation checks: dropping the 0-line rule or applying changes per chapter each fail
   them. Full suite in the app image: 1,055 tests pass (1 skipped).
+
+## 82. Second-pass review fixes: tellers kept, speeches kept whole, rejected answers kept out of view (2026-10-20)
+
+Two outside reviews of §81 found three faults, confirmed in the code; a fourth of the same kind was found
+alongside. GPT (Codex) wrote the fixes and tests from a written brief; reviewed here, one test decorator put back.
+
+- **A chapter's teller was deleted.** `drop_empty_placeholders` removed a 0-line "The Narrator" or chapter-scoped
+  description even when a chapter named it as its `narrator`, so that story fell back to the book's narrator
+  voice, left the story-tellers list, and the second pass resolved "I" to nobody. It already ran before the second
+  pass, so the hole predates §81; the pass made it likelier. Now any key a chapter names as narrator stays.
+- **A continuation could miss its opener's change.** The pass copied a new speaker only to continuations inside a
+  window; `build_windows` makes no window for a stretch with no asked lines, so a continuation after a chapter's
+  last asked line kept the old speaker. Now copied over the whole chapter, as the first pass does (§13).
+- **Rejected answers were shown as fact.** Every raw answer, including names the guard refused, went into later
+  windows as an established speaker. Earlier lines now show the speaker they will keep: the accepted answer, else
+  the first pass's, else nothing.
+- **Turn-taking and the gender check could split a speech.** Both change single lines; a changed opener now carries
+  to its untagged continuations (`cast_analysis._follow_continuations`). On the five keys this changes no 14B-only
+  line: the first pass already keeps them together.
+
+The production `cast_analysis.second_pass` (with its turn-taking and gender check) on §81's saved 14B casts,
+live `qwen2.5-cast6:7b`, one run each (`hybrid_2026-10-19/fix_check.py`, `prod_check.py`); §81 reproduced exactly:
+
+| Wrong + unresolved / off voice, sizes 16 / 20 / 24 | §81 | With the fixes |
+|---|---|---|
+| Such Sharp Teeth | 138/102, 137/89, 147/107 | 130/94, 137/92, 146/110 |
+| Apex Prey 3 | 5/5 at every size | 5/5 at every size |
+| You Like It Darker | 57/44, 58/45, 73/61 | 46/33, 56/43, 62/51 |
+| Six Wakes | 11/11, 5/5, 4/4 | 11/11, 5/5, 4/4 |
+| Steamy Screams | 137/87, 150/83, 148/78 | 133/72, 154/88, 147/82 |
+| **All five keys** (14B alone: 1,526 / 1,248) | **1,080 / 731** | **1,046 / 700** |
+
+- Narrator lines lost: 158 → 140 in all (the novel 34 / 19 / 29 → 23 / 18 / 22; You Like It Darker at 24 18 → 23).
+- Six Wakes is unchanged: its regressions are the 7B's own misreads, not the shown context. Time unchanged.
+- **Tests:** six new (a named teller survives the cleanup; a continuation in no window; the context of a rejected
+  answer; turn-taking and the gender check carrying to continuations; an `analyse_book` invariant that every
+  chapter narrator exists and every continuation has its opener's speaker), each seen failing without its fix.
+  Full suite in the app image: 1,061 pass (1 skipped).
