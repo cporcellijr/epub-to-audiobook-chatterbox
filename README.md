@@ -72,7 +72,7 @@ The repo holds the whole stack:
   needed. *Cast* asks a local LLM (any OpenAI-compatible chat endpoint: Ollama, llama.cpp, LM Studio;
   book text never leaves the machine) who speaks each line: **Analyse selected chapters** queues the pass as a job
   of its own, Chatterbox's model is unloaded from the GPU while it runs and reloaded after, and the
-  result is an editable cast table (character, lines, gender, voice, sample button). To help pick
+  result is an editable cast table (character, lines, gender, voice, sample button). When the LLM server also has the trained 7B model (`CAST_SECOND_PASS_MODEL`, default `qwen2.5-cast6:7b`), a second pass asks every request again with the finished cast held fixed and keeps an answer only when it names someone already speaking in that chapter: on the five hand-labelled test books it cut wrong lines by more than a quarter and wrong-voice lines by two fifths, for about two thirds more analysis time (the test novel, 3,300 dialogue lines: 14 → 23 minutes). To help pick
   voices, the same analysis writes a short profile of each of the most-spoken characters from the
   book's own passages (role, who they are, relationships, a "sounds like" casting note, and the kind
   of voice that fits: pitch, huskiness, liveliness), shown in the table and under it when you click a
@@ -189,6 +189,7 @@ Settings the app reads (the compose file sets them):
 | `LLM_MODEL` | Chat model name for cast analysis |
 | `LLM_API_KEY` | Key for that endpoint, if it wants one |
 | `LLM_UNLOAD_CHATTERBOX` | `on` (default) frees Chatterbox's GPU memory during a cast analysis and reloads it after; `off` leaves it loaded |
+| `CAST_SECOND_PASS_MODEL` | Ollama model for the cast's second pass (default `qwen2.5-cast6:7b`, the round-six fine-tune merged at 8-bit). Skipped when the server doesn't have it; set it empty to turn the pass off |
 | `SPEECH_CHECK_MODEL` | Folder for the Whisper small model (compose default `/app/models/faster-whisper-small`; downloaded there once, about 480 MB). With it, every Chatterbox line of 25 characters or less is spoken after a short lead-in that is cut off again, and Whisper checks the take says its text: a mismatch is redone with a new seed. Each clip's score is `match` in the book's `.clips.json`, and a clip still in doubt is `flagged`. Set it empty to turn this off |
 
 Books are written to `audiobook_output/<title>/` inside the container; mount your audiobook library there.

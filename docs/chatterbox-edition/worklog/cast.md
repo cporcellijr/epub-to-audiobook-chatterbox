@@ -2,9 +2,9 @@
 
 Part of the project work log. Sections keep the numbers they were written with; [WORKLOG.md](../WORKLOG.md) lists every section and which file holds it.
 
-Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76, §78, §79, §80.
+Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31, §33, §40, §41, §42, §43, §44, §45, §46, §47, §49, §59, §60, §61, §62, §63, §64, §65, §66, §67, §68, §69, §70, §71, §72, §73, §74, §75, §76, §78, §79, §80, §81.
 
-## Where things stand (2026-10-13)
+## Where things stand (2026-10-19)
 
 - **The pipeline** (`audiobook_generator/core/`):
   - quotations are split per chapter (`dialogue.py`, §13);
@@ -15,8 +15,13 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   - identity rules merge one person's names and keep different people apart (§29-§31, §42-§43, §59);
   - a narrator is chosen per chapter and per story (§18, §22, §40, §44, §46-§47, §49);
   - two-person turn-taking is repaired (§45);
-  - profiles and measured voice matching pick the voices (§15-§16).
-- **The model** is qwen2.5:14b through Ollama, at temperature 0. On 2026-10-01 the owner decided to
+  - profiles and measured voice matching pick the voices (§15-§16);
+  - then a trained 7B asks every request again with the finished cast fixed, keeping an answer only for
+    someone already speaking in that chapter, and turn-taking and the gender check run again (§81).
+- **The models** are qwen2.5:14b through Ollama, at temperature 0, and for the second pass
+  `qwen2.5-cast6:7b` (the round-six fine-tune merged at Q8_0, §81.4). Over the five keys at three request
+  sizes the second pass took wrong + unresolved lines from 1,526 to 1,080 and off-voice lines from 1,248 to
+  731, most of it on the novel (§81.2). On 2026-10-01 the owner decided to
   keep the cast LLM local: hosted models' content filters would likely refuse many of the books.
   Newer models that fit the card (gemma4:12b, qwen3.5:9b, qwen3:14b) did no better, and a vote across
   models gained little (§61).
@@ -53,6 +58,7 @@ Sections here: §13, §15, §16, §17, §18, §22, §27, §28, §29, §30, §31,
   doubled the full pipeline's errors (202 against 86). Teaching has stopped there; the 14B stays. The 14B
   itself can now be taught on this card (§70), but its adapter at full strength did far worse
   (books 152 against 86, §72); guards now stop one borrowed name spreading to a whole person or story.
+  Since §81 the round-six 7B does what it is good at, choosing among the 14B's finished cast, as a second pass.
 - **A name born late can no longer take a novel's chapters (§80):** a chapter's "I said" votes for someone
   first heard there go to the teller the others address by name, and a stray second entry under the
   teller's name no longer blocks finding them.
@@ -3170,3 +3176,105 @@ Four new cases in `cast_profiles_test.py`, written to the seen failures: a name 
 would tell doesn't take it; one heard before keeps it; a first-chapter point of view keeps it; a stray
 second entry under the teller's name doesn't block the teller (the first and last fail on the code before).
 Full suite in the app image: 1,036 tests pass (1 skipped).
+
+## 81. A trained 7B second pass with the finished cast fixed (2026-10-19)
+
+The owner's idea, after reading a third-party review of this log: §68.1 found the taught 7B better at choosing
+among known people and the 14B better at finding who they are, so use each for its own job. The 14B analyses the
+book as before; then the round-six 7B (§69) asks every first-pass window again, with the finished cast listed
+under §68.1's closed header ("every speaker is one of these"). Private material:
+`data/diagnostics/hybrid_2026-10-19/` (casts, logs, per-line answers; `frozen.py` is the diagnostic pass).
+
+### 81.1 The test
+
+- Such Sharp Teeth at request sizes 16/20/24 on the deployed code: the 14B's cast, then a second pass that
+  replaces a line only when the answer names exactly one cast entry ("I" = the chapter's narrator); tags, "I said"
+  anchors and quoted terms are never asked, exactly as in the first pass. Chapter narrators are kept.
+- Served as llama.cpp `server-cuda-b11515` with the adapter converted to GGUF, unmerged, on Ollama's own
+  `qwen2.5:7b-instruct-q8_0` blob. Calibration on §68.1's fixed-cast test: 1,195 of 1,237 (round six's 8-bit
+  merge: 1,202).
+- A fake model answering with the 14B's own speakers changed 2 of 2,226 asked lines (duplicate labels only).
+
+| Such Sharp Teeth, sizes 16 / 20 / 24 | Wrong + unresolved | Narrator lines lost | Off voice |
+|---|---|---|---|
+| 14B, deployed | 354 / 211 / 280 | 196 / 78 / 146 | 320 / 168 / 255 |
+| + the 14B's own second pass (control) | 245 / 215 / 221 | 78 / 70 / 84 | 208 / 169 / 184 |
+| + the 7B's second pass | 151 / 156 / 167 | 40 / 23 / 36 | 111 / 108 / 127 |
+
+- **The 7B does the work, not the freezing:** the 14B gains at two sizes and nothing at 20.
+- **Not memorised:** chapters 6 and 8 of this novel were in round four's training selection. On the other 14
+  chapters (2,903 lines) wrong + unresolved goes 327 / 186 / 255 → 140 / 142 / 155.
+
+### 81.2 The other four keys, and a guard
+
+Apex Prey 3 and You Like It Darker improved, but Six Wakes went 2 → 30 at size 20: in chapter 28, a two-person
+scene between Wolfgang and Joanna, 25 of Joanna's lines went to Captain Katrina de la Cruz. The pass shows its
+own earlier answers in later windows, so one wrong name ran on through the scene. Katrina has no line in that
+chapter in the 14B's cast.
+
+- **Guard:** a change is kept only when its new speaker already speaks in that chapter in the 14B's cast, or is
+  the chapter's narrator. Measured offline on the saved answers: Six Wakes size 20 30 → 5; everything else within
+  one line (Such Sharp Teeth size 16 151 → 152). "Rory 2" → Rory, the change that matters most on the novel, is
+  untouched (Rory speaks in every chapter).
+- **Then turn-taking and the gender check again** (`follow_turns`, `reconcile_lines`, §45, §28): measured the
+  same way, the novel gains another 14-20 lines a size; the other books move by 0-1.
+
+| Sizes 16 / 20 / 24, wrong + unresolved / off voice | 14B, deployed | 14B + guarded 7B pass + turn-taking and gender check |
+|---|---|---|
+| Such Sharp Teeth (3,304 lines) | 354/320, 211/168, 280/255 | 138/102, 137/89, 147/107 |
+| Apex Prey 3 (269) | 12/12, 11/11, 11/11 | 5/5, 5/5, 5/5 |
+| You Like It Darker (910) | 67/63, 77/76, 70/77 | 57/44, 58/45, 73/61 |
+| Six Wakes (504) | 5/5, 2/2, 1/1 | 11/11, 5/5, 4/4 |
+| Steamy Screams (773, an anthology) | 146/82, 149/86, 130/79 | 137/87, 150/83, 148/78 |
+| **All five keys** | **1,526 / 1,248** | **1,080 / 731** |
+
+- Narrator lines lost on the novel: 196 / 78 / 146 → 34 / 19 / 29. No chapter narrator changes, except the
+  scorer's majority judgement of one unnamed Steamy Screams teller (chapter 14) at two sizes.
+- **Where it costs:** Six Wakes, scattered single lines (Maria → Joanna, Wolfgang → Paul; the 7B was weaker
+  there in §68.2 too), and the anthology at size 24 (130 → 148 wrong, off voice level). Judged novel first
+  (§76), then the rest, it is kept.
+
+### 81.3 Tried alongside and dropped: a cloud identity review
+
+One FreeLLMAPI request per finished cast listing its entries with excerpts, asking which are one person, merged
+with the editor's own merge (`data/diagnostics/cloud_identity_2026-10-19/`). Ceiling with the key's own merges:
+the novel 132 → 67 narrator lines lost, You Like It Darker 135 → 82 off voice. gpt-oss-120b matched the ceiling
+on You Like It Darker, missed "Rory 2" on the novel and merged two people on Apex Prey 3 (9 → 20 wrong);
+qwen3.5-397b kept failing upstream. The owner dropped it.
+
+### 81.4 In production
+
+- **Model:** Ollama 0.40.5 refuses adapters ("LoRA adapters are no longer supported"), so the round-six adapter
+  is merged into Qwen2.5-7B-Instruct at full precision and quantized Q8_0 (a 4-bit merge loses training, §66):
+  `qwen2.5-cast6:7b`. Recipe without Unsloth: `hybrid_2026-10-19/merge.sh` (finetune6's `merge_lora.py`,
+  `convert_hf_to_gguf.py`, `llama-quantize`, `ollama create` with qwen2.5's own template).
+- **Code:** `core/cast_second_pass.py` (roster, resolver, the pass) and `cast_analysis.second_pass`, called after
+  `drop_empty_placeholders` and before the profiles, which see the corrected lines. The pass applies its
+  changes only after its last chapter, so a server error leaves the first pass's lines; like the profiles it
+  never fails an analysis (`cast["second_pass"]["error"]`). On when `CAST_SECOND_PASS_MODEL` (default
+  `qwen2.5-cast6:7b`) is on the LLM server; empty turns it off. `OLLAMA_MAX_LOADED_MODELS=1` swaps the
+  models inside the job's existing GPU reservation. The cast panel shows "Second pass: n of m chapters".
+- **Port check:** the saved per-line answers replayed through the production module reproduce the diagnostic
+  pass exactly (0 differing lines at all three sizes).
+- **Not done:** no Advanced checkbox (the environment variable is the off switch; `settings["second_pass"] =
+  False` is honoured if a form ever sets it); the roster spans every story of an anthology.
+
+### 81.5 The production gate, live
+
+The merged model through Ollama and the real code path (`cast_decision_2026-10-15/run_models.py`, no profiles),
+size 20, against the offline numbers of §81.2:
+
+| Size 20 | 14B alone | Expected (offline) | Live |
+|---|---|---|---|
+| Such Sharp Teeth: wrong + unresolved / narrator lost / off voice | 211 / 78 / 168 | 137 / 19 / 89 | 136 / 18 / 91 |
+| Apex Prey 3 | 11 / 6 / 11 | 5 / 3 / 5 | 5 / 3 / 5 |
+| Six Wakes | 2 / 0 / 2 | 5 / 0 / 5 | 6 / 0 / 6 |
+| You Like It Darker | 77 / 17 / 76 | 58 / 11 / 45 | 59 / 11 / 49 |
+
+- §68.1's fixed-cast test with `qwen2.5-cast6:7b`: 1,202 of 1,237, round six's own score.
+- No unusable reply and no error; Ollama swapped 14B → 7B by itself.
+- **Time:** the novel 867 s → 1,393 s (+61%); Apex Prey 3 +70%, You Like It Darker +78%, Six Wakes +87%.
+- **Tests:** `cast_second_pass_test.py` (14: the resolver, the guard, unusable replies, a server error leaving every
+  line, the model check), four wiring cases in `cast_analysis_test.py` and the progress text in
+  `chatterbox_ui_test.py`; mutation checks: dropping the 0-line rule or applying changes per chapter each fail
+  them. Full suite in the app image: 1,055 tests pass (1 skipped).

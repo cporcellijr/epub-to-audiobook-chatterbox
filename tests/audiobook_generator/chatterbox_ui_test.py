@@ -1568,6 +1568,25 @@ class TestCastPanel(unittest.TestCase):
         _, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
         self.assertIn("Writing character profiles**: 3 of 4", status)
 
+    def test_running_analysis_shows_second_pass_progress(self):
+        cast = self._save("k", self.cast_store.STATUS_RUNNING, {})
+        cast.update(chapters_done=2, chapters_total=2)
+        cast["second_pass"] = {"done": 1, "total": 2, "error": ""}
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        _, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertIn("Second pass**: 1 of 2", status)
+        cast["second_pass"]["error"] = "down"
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        _, _, status_err, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertIn("Analysing cast", status_err)
+        self.assertNotIn("Second pass", status_err)
+        cast["second_pass"]["error"] = ""
+        cast["profiles_total"] = 4
+        cast["profiles_done"] = 1
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        _, _, status_prof, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertIn("Writing character profiles", status_prof)
+
     def _measure(self, pitches):
         for voice, f0 in pitches.items():
             chatterbox_ui.voice_measure.save_features(voice, {"f0_median": f0, "f0_range": 8.0, "hnr": 11.0})

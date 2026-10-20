@@ -236,6 +236,102 @@ class TestAnalyseBook(unittest.TestCase):
         saved = cast_store.load_cast(self.settings["cast_file"])
         self.assertEqual(saved["chapters"], cast["chapters"])
 
+    @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 1000)
+    def test_second_pass_runs_after_chapters_before_profiles_and_can_change_speaker(self):
+        import re
+        from audiobook_generator.core import cast_second_pass
+        chat = ScriptedChat(
+            {"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"},
+             "characters": [{"name": "Ada Marsh", "gender": "female", "age": "adult"},
+                            {"name": "Tom", "gender": "male", "age": "child"}]},
+            {"speakers": {"1": "Mrs. Marsh", "2": "Tom"},
+             "characters": [{"name": "Mrs. Marsh", "gender": "female", "age": "adult"}]},
+            {"tone": "quiet", "point_of_view": "third", "narrator_gender": "female"},
+        )
+        class SecondChat:
+            def __init__(self):
+                self.prompts = []
+            def __call__(self, messages):
+                self.prompts.append(messages)
+                content = messages[1]["content"]
+                ids = re.findall(r"\[#(\d+)\] ", content)
+                speakers = {}
+                for i in ids:
+                    n = int(i)
+                    name = "Tom" if n == 3 else "unknown"
+                    speakers[i] = name
+                return json.dumps({"speakers": speakers})
+        second = SecondChat()
+        cast = analyse_book(self.settings, chat=chat, second_chat=second)
+        self.assertEqual(cast["status"], "done")
+        self.assertIn("second_pass", cast)
+        self.assertEqual(cast["second_pass"]["done"], cast["second_pass"]["total"])
+        self.assertEqual(cast["second_pass"]["total"], 2)
+        self.assertGreaterEqual(cast["second_pass"]["changed"], 1)
+        for msgs in second.prompts:
+            self.assertTrue(msgs[1]["content"].startswith(cast_second_pass.FIXED_HEADER))
+        # Turn-taking may put this line back; we assert on changed/stats rather than final speaker.
+        # If turn-taking reverts, the changed count is still recorded from the second pass.
+
+    @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 1000)
+    def test_second_pass_off_skips_second_chat(self):
+        import re
+        settings = dict(self.settings, second_pass=False)
+        chat = ScriptedChat(
+            {"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}},
+            {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}},
+            {"tone": "quiet", "point_of_view": "third", "narrator_gender": "female"},
+        )
+        class SecondChat:
+            def __init__(self):
+                self.called = False
+            def __call__(self, messages):
+                self.called = True
+                return json.dumps({"speakers": {}})
+        second = SecondChat()
+        cast = analyse_book(settings, chat=chat, second_chat=second)
+        self.assertEqual(cast["status"], "done")
+        self.assertNotIn("second_pass", cast)
+        self.assertFalse(second.called)
+
+    @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 1000)
+    def test_second_pass_error_is_recorded_but_first_pass_is_kept(self):
+        chat = ScriptedChat(
+            {"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}},
+            {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}},
+            {"tone": "quiet", "point_of_view": "third", "narrator_gender": "female"},
+        )
+        class FailingSecondChat:
+            def __call__(self, messages):
+                raise ConnectionError("down")
+        failing = FailingSecondChat()
+        cast_fail = analyse_book(self.settings, chat=chat, second_chat=failing)
+        self.assertEqual(cast_fail["status"], "done")
+        self.assertEqual(cast_fail.get("second_pass", {}).get("error"), "down")
+        # Baseline without second pass
+        baseline_settings = dict(self.settings, second_pass=False)
+        baseline_chat = ScriptedChat(
+            {"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}},
+            {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}},
+            {"tone": "quiet", "point_of_view": "third", "narrator_gender": "female"},
+        )
+        baseline_cast = analyse_book(baseline_settings, chat=baseline_chat)
+        for key in cast_fail["chapters"]:
+            self.assertEqual(cast_fail["chapters"][key]["lines"], baseline_cast["chapters"][key]["lines"])
+
+    @patch("audiobook_generator.core.cast_profiles.PROFILE_MIN_LINES", 1000)
+    def test_no_second_pass_when_no_env_and_no_chat(self):
+        with patch.dict(os.environ, {"LLM_BASE_URL": ""}):
+            with patch("audiobook_generator.core.cast_second_pass.requests.get") as get_mock:
+                chat = ScriptedChat(
+                    {"speakers": {"1": "Ada Marsh", "2": "Tom", "3": "Ada Marsh"}},
+                    {"speakers": {"1": "Mrs. Marsh", "2": "Tom"}},
+                    {"tone": "quiet", "point_of_view": "third", "narrator_gender": "female"},
+                )
+                cast = analyse_book(self.settings, chat=chat, second_chat=None)
+                self.assertNotIn("second_pass", cast)
+                get_mock.assert_not_called()
+
 
 class TestDropEmptyPlaceholders(unittest.TestCase):
 

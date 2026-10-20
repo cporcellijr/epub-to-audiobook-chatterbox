@@ -1376,8 +1376,11 @@ def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional
     if cast.get("status") == cast_store.STATUS_RUNNING:
         done, total = cast_store.analysis_progress(cast)
         profiled, to_profile = cast_store.profile_progress(cast)
+        second = cast.get("second_pass") or {}
         if to_profile and done >= total:
             text = f"⏳ **Writing character profiles**: {profiled} of {to_profile} done."
+        elif second.get("done", 0) < second.get("total", 0) and not second.get("error"):
+            text = f"⏳ **Second pass**: {second['done']} of {second['total']} chapters checked by the trained model."
         else:
             text = f"⏳ **Analysing cast**: {done} of {total} chapters done, {len(cast['characters'])} characters so far."
         return gr.update(value=None, visible=False), [], text, stamp

@@ -14,6 +14,7 @@ from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core import chatterbox_control, engine_gpu, gpu_reservation
 from audiobook_generator.core import cast_review
+from audiobook_generator.core import cast_second_pass
 from audiobook_generator.core.cast_llm import CAST_GUIDANCE_VERSION, ChatClient, Chat, Roster, attribute_chapter, \
     llm_api_key, llm_base_url, llm_model
 from audiobook_generator.core.cast_profiles import ChapterText, describe_book, profile_cast, turn_taking
@@ -119,7 +120,37 @@ def reconcile_lines(cast: dict, chapters: List[ChapterText]) -> None:
     cast["issues"] = sorted(issues, key=lambda issue: (issue["chapter"], issue["line"], issue["reason"]))
 
 
-def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logger = logger) -> dict:
+def second_pass(cast: dict, chapters: List[ChapterText], settings: dict, chat: Optional[Chat],
+                save: Callable[[], None], log: logging.Logger = logger) -> None:
+    """WORKLOG §81: the trained 7B asks every first-pass window again with the finished cast fixed
+    (core.cast_second_pass), then turn-taking and the gender check run again over its changes. On
+    when CAST_SECOND_PASS_MODEL names a model the LLM server has (default qwen2.5-cast6:7b) and
+    settings["second_pass"] isn't False. Like the profiles it never fails an analysis: on an error
+    the first pass's lines stay and cast["second_pass"]["error"] says why."""
+    model = cast_second_pass.second_pass_model()
+    if settings.get("second_pass") is False:
+        log.info("Cast: second pass off for this analysis")
+        return
+    if chat is None:
+        if not model or not cast_second_pass.model_available(llm_base_url(), model):
+            return
+        chat = ChatClient(llm_base_url(), model, llm_api_key())
+    try:
+        cast_second_pass.second_pass(cast, chapters, chat, model or "injected", log, save)
+    except Exception as e:
+        cast.setdefault("second_pass", {})["error"] = str(e) or type(e).__name__
+        log.warning(f"Cast: second pass stopped ({cast['second_pass']['error']}); the first pass's lines are kept")
+        save()
+        return
+    follow_turns(cast, chapters)
+    reconcile_lines(cast, chapters)
+    cast_store.refresh_cast_counts(cast)
+    drop_empty_placeholders(cast)
+    save()
+
+
+def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logger = logger,
+                 second_chat: Optional[Chat] = None) -> dict:
     """Analyse the selected chapters of one book and write the cast to settings["cast_file"].
 
     settings: input_file, chapter_selection, the parser options (title_mode, newline_mode,
@@ -127,6 +158,8 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
     narrator), cast_file. The cast file is rewritten after every chapter, so the UI can show
     progress and a crash keeps what was done; the final write marks it done (or failed). Character
     profiles are written after the last chapter; a profile problem never fails the analysis.
+
+    second_chat: the second pass's model, for tests; by default built from CAST_SECOND_PASS_MODEL.
     """
     if chat is None:
         chat = ChatClient(llm_base_url(), llm_model(), llm_api_key())
@@ -183,6 +216,7 @@ def analyse_book(settings: dict, chat: Optional[Chat] = None, log: logging.Logge
         reconcile_lines(cast, analysed)
         cast_store.refresh_cast_counts(cast)
         drop_empty_placeholders(cast)
+        second_pass(cast, analysed, settings, second_chat, lambda: cast_store.save_cast(path, cast), log)
         profile_cast(cast, analysed, chat, log, save=lambda: cast_store.save_cast(path, cast))
         cast["status"] = cast_store.STATUS_DONE
     except Exception as e:
