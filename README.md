@@ -179,6 +179,7 @@ Settings the app reads (the compose file sets them):
 | `OPENAI_API_KEY` | Any non-empty value (Chatterbox has no auth) |
 | `TTS_VOICES_DIR` | Chatterbox's voices folder (writable, for the Voice lab) |
 | `BREEZE_BASE_URL` | Breeze TTS 2 server, default `http://breeze:8005`. Set it blank to disable Breeze. |
+| `RESEMBLE_BASE_URL` | Resemble Enhance server (`./resemble`), default `http://resemble:8006`: cleans newly designed voices after each design run (Breeze is unloaded for it). Set it blank to keep them raw. |
 | `OPENAI_DEFAULT_VOICE` | Voice selected by default |
 | `CHATTERBOX_CONFIG` | Chatterbox's `config.yaml` (read-only), for the Voice lab sliders |
 | `CHATTERBOX_URL` | Chatterbox root URL, if it isn't `OPENAI_BASE_URL` minus `/v1` |

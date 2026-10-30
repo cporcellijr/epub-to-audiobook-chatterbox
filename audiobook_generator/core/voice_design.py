@@ -19,7 +19,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from pydub import AudioSegment
 
-from audiobook_generator.core import breeze_client, speech_check, voice_measure, voice_transcripts
+from audiobook_generator.core import breeze_client, speech_check, voice_clean, voice_measure, voice_transcripts
 from audiobook_generator.core import cast as cast_store
 from audiobook_generator.core.cast_profiles import PROFILE_MIN_LINES
 from audiobook_generator.tts_providers.openai_tts_provider import _BAD_CLIP_SILENCE_MS, _long_silence_ms, _new_seed
@@ -335,13 +335,15 @@ def _designed_clip_exists(character: dict) -> bool:
 
 
 def design_pending_voices(cast_file: str, saved_path: Optional[str] = None,
-                          designer: Callable[..., Tuple[str, dict]] = design_voice) -> int:
+                          designer: Callable[..., Tuple[str, dict]] = design_voice,
+                          cleaner: Callable[[List[str]], object] = voice_clean.clean_voices) -> int:
     """Design every voice the cast marked pending, in the book's own process after Breeze is loaded and
     before the provider reads the cast. The job's snapshot (cast_file) and the saved cast it came from
     (saved_path, default: the snapshot's key in the casts folder) both get the new voice while the same
     request is pending in the saved cast. A failed design leaves the matcher's suggestion as the
     voice (status "failed" and the reason are kept). A voice the saved cast already has designed (an
-    earlier queued book got there first) is adopted, not designed again. Returns how many were designed."""
+    earlier queued book got there first) is adopted, not designed again. The new voices are cleaned
+    (core.voice_clean) once all are designed. Returns how many were designed."""
     cast = cast_store.load_cast(cast_file)
     if not cast:
         return 0
@@ -351,7 +353,7 @@ def design_pending_voices(cast_file: str, saved_path: Optional[str] = None,
     if not pending:
         return 0
     saved_path = saved_path or cast_store.cast_path(cast.get("key", ""))
-    designed = 0
+    designed: List[str] = []
     for key, character in pending:
         request = dict(_design_of(character))
         saved = cast_store.load_cast(saved_path)
@@ -369,11 +371,13 @@ def design_pending_voices(cast_file: str, saved_path: Optional[str] = None,
                 character["voice_design"] = {"status": FAILED, "description": description, "error": str(error)}
             else:
                 _record(character, file_name, description)
-                designed += 1
+                designed.append(file_name)
         cast_store.save_cast(cast_file, cast)
         saved = cast_store.load_cast(saved_path)
         theirs = ((saved or {}).get("characters") or {}).get(key)
         if theirs and not theirs.get("voice_picked") and _design_of(theirs) == request:
             theirs["voice"], theirs["voice_design"] = character["voice"], dict(character["voice_design"])
             cast_store.save_cast(saved_path, saved)
-    return designed
+    if designed:
+        cleaner(designed)
+    return len(designed)

@@ -4,7 +4,7 @@ Part of the project work log. Sections keep the numbers they were written with; 
 
 Sections here: §35, §36, §37, §38, §39, §48, §50, §51, §52, §53, §54, §55, §56, §57, §58.
 
-## Where things stand (2026-10-07)
+## Where things stand (2026-10-30)
 
 - **Breeze TTS 2 (3B) has been the only engine in use since 2026-10-01** (§35). Chatterbox moved to
   the compose profile `chatterbox` and was stopped, and Kokoro was commented out of `.env` (§35). The
@@ -25,6 +25,9 @@ Sections here: §35, §36, §37, §38, §39, §48, §50, §51, §52, §53, §54,
 - **Every line is read plain:** Breeze gets no directed (whispered) lines (§54).
 - **Voices:** voices designed from the cast profiles (§36), and plain-English voice creation in the
   Voice lab (§39).
+- **Clean clips:** Breeze copies a clip's room and colouring into every line, so every library clip
+  was cleaned with Resemble Enhance. A new design is cleaned once its design run ends; Breeze is
+  unloaded for it (§83).
 
 ## 35. Breeze TTS 2 replaces Chatterbox: a batched engine (2026-10-01)
 
@@ -1105,3 +1108,101 @@ lines a chapter since §55, which buried the app's own lines. It is the library'
 - **The app's own per-unit line too:** `Clip chapter-N_..._chunk_K_of_M: chapter a-b s, seed=...` is
   now DEBUG. That is one line per unit, and the clip map (`.clips.json`) keeps the same facts.
 - **Deploy:** the owner stopped Bewitched! for it.
+
+## 83. Voice clips cleaned with Resemble Enhance; designed voices cleaned after each design run (2026-10-30)
+
+Shirley (`Layla.wav`) in *Three Little Pigs* sounded hollow and distant, with an echo.
+
+### 83.1 The echo was in the clip, not in tone matching
+
+- **A review blamed tone matching (§34):** Breeze books get cuts of up to 12 dB from 1.6 kHz up, and a
+  preview gets none. One real finding came out of it: the matcher measures one chapter, not the
+  whole book. `process_chapter` makes a new provider for every chapter, so `_tone` starts empty each
+  time. A voice's cuts therefore vary from chapter to chapter: Layla got none in one chapter of the
+  book and up to 4.7 dB in another. The comments that said "this book" now say "this chapter";
+  nothing else changed.
+- **The owner's listening settled it:**
+  - chapter 13 (no cut) and chapter 16 (3.2 dB from 1.8 kHz) sounded nearly the same;
+  - a Voice lab sample, which is never matched, still echoed;
+  - the raw clip itself had the echo.
+
+  A patch turning tone matching off for Breeze was dropped. `Layla.wav` is one of Chatterbox's 28
+  stock clips, whose origin is undocumented.
+
+### 83.2 Choosing a cleaner
+
+- **De-reverb models, rejected.** audio-separator (0.48.0, then 0.39.1) was tried with five models:
+  - two MelBand RoFormers;
+  - UVR-DeEcho-DeReverb;
+  - Reverb HQ (ONNX);
+  - UVR-De-Echo-Aggressive.
+
+  Every one returned its input unchanged. That held for Layla, for Layla with a 0.5 s room added by
+  hand, and for a RoFormer loaded directly without the tool. The cause was not found.
+- **Adobe Podcast "Enhance Speech":** it made Layla clearly better. It is a web upload, one file at a
+  time and mostly paid, so it was used for `Layla.wav` only.
+- **Resemble Enhance (MIT, runs locally):** it regenerates the speech, as Adobe does.
+  - Denoise only changed nothing (−48 dB difference).
+  - Full enhance at the defaults came close.
+  - The owner compared four variants by ear and chose "8D": nfe 128, the rk4 solver, tau 0.5,
+    lambd 1.0.
+- **The library:** all 56 clips went through 8D in 3 minutes on the GPU, and the owner preferred every
+  cleaned copy to its original. 55 were replaced in place; Layla kept Adobe's version. The originals
+  are in `data/diagnostics/resemble_2026-10-30/batch/in`.
+
+### 83.3 The service
+
+- **`resemble/server.py`:** a FastAPI app built the same way as `breeze/server.py`. Its endpoints:
+  - `POST /enhance`: WAV in, mono 16-bit WAV out, peaking at −1 dBFS;
+  - `POST /api/unload`;
+  - `GET /health`.
+- **Model and memory:** the weights live in the volume `resemble-models` (about 1.6 GB) and load on the
+  first clean. The service unloads when told to, or after 120 s idle. At its peak it holds 3.4 GB
+  allocated and 4.4 GB reserved. A loaded model takes about 2 s per 8 s clip; the first clip takes
+  about 7 s.
+- **Compose:** the service `resemble` has no published port. The app reads `RESEMBLE_BASE_URL`; when
+  it is blank, designed voices are kept as Breeze made them.
+
+### 83.4 When designed voices are cleaned
+
+- **Breeze has to unload first.** Breeze holds up to 10.5 GB of the 12 GB card, so Resemble cannot
+  run beside it. Breeze's next request loads it again, which takes about 40 s. Three options were
+  weighed:
+  - per voice: 40 s more for every voice;
+  - a manual button: nothing automatic;
+  - once per design run: chosen by the owner.
+- **`core/voice_clean.py`:**
+  - It unloads Breeze, cleans each clip, then unloads Resemble.
+  - Each clip keeps its transcript and its measurement, re-stamped with the new file's signature, so
+    nothing is transcribed or measured again.
+  - It runs inside a Breeze GPU reservation, which is re-entrant within a design or a book.
+  - When Breeze will not unload, it cleans nothing, because an overfull GPU spills into Windows RAM
+    (§57).
+  - A clip that fails, or whose length changes by more than 0.5 s, is kept as designed.
+- **Where it runs:**
+  - after a design in the cast editor;
+  - after a Voice lab custom voice;
+  - once at the end of the starter set, but not when a book stops the set;
+  - after a book's pending voices (`design_pending_voices`).
+
+  `breeze_session(load=False)` reserves the GPU for the UI's cleaning step without loading Breeze.
+  Uploaded clips are not cleaned.
+
+### 83.5 Evidence
+
+- **Tests:** 11 new app tests, plus a check in `breeze_test` that cleaning reserves the GPU without
+  loading Breeze. The server has 7 tests. The app suite passes, 1072 tests with 1 skipped. Each of
+  these mutations fails a test:
+  - removing the length guard;
+  - removing the Breeze-unload guard;
+  - removing either re-stamp.
+- **Live:** a throwaway voice went through the real path.
+  - Design took 49 s.
+  - Cleaning took 15 s: Breeze unloaded, Resemble loaded, cleaned and unloaded.
+  - The file's signature changed, and the transcript and the measurement were kept.
+  - Both models were unloaded afterwards.
+
+  The voice was then deleted. The raw and cleaned pair is in
+  `data/diagnostics/resemble_2026-10-30/live`.
+- **Not verified:** a book designing its pending voices live, and listening to a newly designed,
+  cleaned voice.

@@ -88,7 +88,7 @@ def read_clip(path: str, rate: int) -> np.ndarray:
 
 
 class ToneMatcher:
-    """Measures each voice's speech across a book run and works out its cuts against its clip."""
+    """Measures each voice's speech over one chapter (one provider) and works out its cuts against its clip."""
 
     def __init__(self, voices_dir: Optional[str]):
         self.voices_dir = voices_dir

@@ -1415,7 +1415,7 @@ class OpenAITTSProvider(BaseTTSProvider):
 
         Tone matching (Chatterbox and Breeze, on unless the book turned it off): every voice is turned down
         wherever it comes out brighter than its own reference clip, measured over all of that
-        voice's speech so far in this book (core/tone_match.py).
+        voice's speech in this chapter: each chapter gets a new provider (core/tone_match.py).
 
         Peak guard (lossy chapters): any unit still peaking above delivery.PEAK_GUARD_DBFS is turned
         down to it. Chatterbox hands back takes peaking near -0.45 dBFS and AAC decoding overshoots

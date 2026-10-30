@@ -47,7 +47,7 @@ from pydub import AudioSegment
 from audiobook_generator.book_parsers.base_book_parser import get_book_parser
 from audiobook_generator.config.general_config import GeneralConfig
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import breeze_client, delivery, voice_design, voice_measure, voice_transcripts, gpu_reservation
+from audiobook_generator.core import breeze_client, delivery, voice_clean, voice_design, voice_measure, voice_transcripts, gpu_reservation
 from audiobook_generator.core.cast_llm import llm_configured
 from audiobook_generator.core.chapter_selection import preselect_chapters
 from audiobook_generator.core.chatterbox_control import chatterbox_url
@@ -1601,6 +1601,7 @@ def design_character_voice(cast_key: Optional[str], character_key: Optional[str]
             character.get("age", "unknown"))
     except voice_design.DesignError as error:
         raise gr.Error(f"Could not design a voice: {error}")
+    voice_clean.clean_voices([file_name])  # before the sample below plays it
     cast = cast_store.load_cast(cast_file_for(cast_key)) or cast  # edited while Breeze worked
     character = cast["characters"].get(character_key) or character
     character["voice"], character["voice_picked"] = file_name, True
@@ -1616,10 +1617,12 @@ def design_character_voice(cast_key: Optional[str], character_key: Optional[str]
 
 
 def design_starter_voices(jobs: Callable[[], List[dict]],
-                          designer: Callable[..., tuple] = voice_design.design_voice) -> Iterator[str]:
+                          designer: Callable[..., tuple] = voice_design.design_voice,
+                          cleaner: Callable[[List[str]], List[str]] = voice_clean.clean_voices) -> Iterator[str]:
     """Voice lab: design every voice of voice_design.STARTER_VOICES whose file doesn't exist yet, one
-    after another (about 40 s each), yielding progress text. Stops if a book or a cast analysis starts
-    meanwhile: they need the GPU. `jobs` is called before every voice for the queue's current jobs."""
+    after another (about 40 s each), yielding progress text, then clean the new ones together
+    (core.voice_clean). Stops if a book or a cast analysis starts meanwhile: they need the GPU (what was
+    designed by then stays uncleaned). `jobs` is called before every voice for the queue's current jobs."""
     _require_breeze_design(jobs(), books=True)
     folder = os.environ.get("TTS_VOICES_DIR")
     if not folder or not os.path.isdir(folder):
@@ -1629,20 +1632,24 @@ def design_starter_voices(jobs: Callable[[], List[dict]],
     if not todo:
         yield f"All {len(voice_design.STARTER_VOICES)} starter voices are already in the library."
         return
-    made, failed = 0, []
+    made, failed = [], []
     for number, (name, gender, age, description) in enumerate(todo, 1):
         blocker = _design_blocker(jobs(), books=True)
         if blocker:
-            yield f"Designed {made} of {len(todo)}, then stopped. {blocker}"
+            yield f"Designed {len(made)} of {len(todo)}, then stopped. {blocker}"
             return
         yield f"Designing {number} of {len(todo)}: **{name}** (about 40 s each)..."
         try:
-            designer(name, description, gender, age)
-            made += 1
+            made.append(designer(name, description, gender, age)[0])
         except Exception as error:
             logger.warning("Starter voice %s was not designed: %s", name, error)
             failed.append(f"{name} ({error})")
-    message = f"Designed {made} starter voice{'' if made == 1 else 's'}."
+    if made and voice_clean.configured():
+        yield f"Cleaning the {len(made)} new voice{'' if len(made) == 1 else 's'}..."
+    cleaned = cleaner(made) if made else []
+    message = f"Designed {len(made)} starter voice{'' if len(made) == 1 else 's'}."
+    if cleaned:
+        message += f" Cleaned {len(cleaned)} with Resemble Enhance."
     if failed:
         message += f" Couldn't design {'; '.join(failed)}."
     yield message
@@ -2227,9 +2234,9 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
                         if engine in FILE_VOICE_ENGINES else gr.update())
         return message, lab_update, voice_update, gr.update(choices=own_voice_choices(), value=None)
 
-    def breeze_work(action, *args):
+    def breeze_work(action, *args, load: bool = True):
         try:
-            with queue.breeze_session():
+            with queue.breeze_session(load=load):
                 return action(*args)
         except RuntimeError as error:
             raise gr.Error(str(error)) from error
@@ -2267,7 +2274,8 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         return breeze_work(voice_design.design_voice, name, description, gender, age)
 
     def design_starters() -> Iterator[str]:
-        yield from design_starter_voices(queue.jobs, designer=design_one)
+        yield from design_starter_voices(queue.jobs, designer=design_one,
+                                         cleaner=lambda files: breeze_work(voice_clean.clean_voices, files, load=False))
 
     def voice_lists_after_design() -> tuple:
         """New voice files in the Make tab's, the Voice lab's and the delete dropdowns, selections kept."""
@@ -2281,6 +2289,7 @@ def build_ui(queue: Optional[JobQueue] = None) -> gr.Blocks:
         if not (description or "").strip():
             raise gr.Error("Describe the voice first.")
         file_name, _ = design_one(name.strip(), description.strip(), "unknown", "unknown")
+        breeze_work(voice_clean.clean_voices, [file_name], load=False)
         make_update, lab_update, own_update, dialogue_update = voice_lists_after_design()
         lab_update["value"] = file_name
         if engine in FILE_VOICE_ENGINES:

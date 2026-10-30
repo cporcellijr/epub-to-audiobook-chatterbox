@@ -131,8 +131,9 @@ class JobQueue:
             return dict(job) if job else None
 
     @contextmanager
-    def breeze_session(self):
-        """Reserve the GPU without blocking queue controls; Breeze's server serializes requests."""
+    def breeze_session(self, load: bool = True):
+        """Reserve the GPU without blocking queue controls; Breeze's server serializes requests.
+        load=False reserves it for work that needs Breeze out of the way (cleaning voices)."""
         from audiobook_generator.core.engine_gpu import prepare_breeze
         from audiobook_generator.core import gpu_reservation
         with self._lock:
@@ -148,7 +149,7 @@ class JobQueue:
             self._breeze_requests += 1
         try:
             with gpu_reservation.session("breeze"):
-                if not gpu_reservation.configured():
+                if load and not gpu_reservation.configured():
                     prepare_breeze()
                 yield
         finally:

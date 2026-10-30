@@ -107,3 +107,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 80 | 2026-10-16 | A narrator born in the chapters it takes; one name, one rival | [cast](worklog/cast.md) |
 | 81 | 2026-10-19 | A trained 7B second pass with the finished cast fixed | [cast](worklog/cast.md) |
 | 82 | 2026-10-20 | Second-pass review fixes: tellers kept, speeches kept whole, rejected answers out of view | [cast](worklog/cast.md) |
+| 83 | 2026-10-30 | Voice clips cleaned with Resemble Enhance; designed voices cleaned after each design run | [breeze](worklog/breeze.md) |

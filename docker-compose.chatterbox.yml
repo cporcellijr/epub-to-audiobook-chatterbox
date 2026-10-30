@@ -1,5 +1,6 @@
-# The whole stack: the audiobook web UI (repo root) + Breeze TTS 2 (./breeze, idle until used), and
-# Chatterbox (./chatterbox) only on request. Copy .env.example to .env, set the paths, then:
+# The whole stack: the audiobook web UI (repo root) + Breeze TTS 2 (./breeze, idle until used)
+# + Resemble Enhance (./resemble, idle until used) for voice cleaning, and Chatterbox (./chatterbox)
+# only on request. Copy .env.example to .env, set the paths, then:
 #   docker compose -f docker-compose.chatterbox.yml up -d --build
 # Web UI: http://localhost:7860 · Breeze API: http://localhost:8005
 # Chatterbox, retired for Breeze on 2026-10-01: add --profile chatterbox to bring it back
@@ -101,6 +102,37 @@ services:
               capabilities:
                 - gpu
 
+  resemble:
+    # Resemble Enhance for cleaning voice reference clips. Idle until used, unloads after idle.
+    build: ./resemble
+    image: resemble-enhance:local
+    container_name: resemble
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-UTC}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    volumes:
+      - resemble-models:/usr/local/lib/python3.10/site-packages/resemble_enhance/model_repo  # ~1.6 GB of weights, downloaded on first load
+    networks:
+      - tts
+    healthcheck:
+      # Answers while the model is unloaded, so "healthy" means the server is up, not the model.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+
   epub-to-audiobook:
     build: .
     image: epub_to_audiobook:local
@@ -126,6 +158,8 @@ services:
       - KOKORO_DEFAULT_VOICE=${KOKORO_DEFAULT_VOICE:-}
       # Breeze is the default engine; set BREEZE_BASE_URL blank in .env to disable it.
       - BREEZE_BASE_URL=${BREEZE_BASE_URL-http://breeze:8005}
+      # Cleans designed voices with Resemble Enhance after each design run; set it blank in .env to keep them raw.
+      - RESEMBLE_BASE_URL=${RESEMBLE_BASE_URL-http://resemble:8006}
       # Optional local LLM (OpenAI-compatible chat endpoint) for multi-voice cast analysis. Leave
       # LLM_BASE_URL unset (the default) to hide the Cast voice mode entirely.
       - LLM_BASE_URL=${LLM_BASE_URL:-}
@@ -153,6 +187,8 @@ services:
 volumes:
   breeze-models:
     name: ${BREEZE_MODELS_VOLUME:-breeze-models}  # set to breeze-bakeoff-models to reuse downloaded weights (mounted at /models)
+  resemble-models:
+    name: ${RESEMBLE_MODELS_VOLUME:-resemble-models}
   hf-cache:
     # Reuse an existing model cache by naming it here (avoids re-downloading several GB of models).
     name: ${HF_CACHE_VOLUME:-chatterbox-hf-cache}

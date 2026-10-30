@@ -14,7 +14,8 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 
 from audiobook_generator.core import cast as cast_store
-from audiobook_generator.core import breeze_client, engine_gpu, speech_check, voice_design, voice_measure, voice_transcripts
+from audiobook_generator.core import (breeze_client, engine_gpu, speech_check, voice_clean, voice_design, voice_measure,
+                                      voice_transcripts)
 from audiobook_generator.core.audiobook_generator import AudiobookGenerator
 from audiobook_generator.ui import chatterbox_ui
 
@@ -68,7 +69,8 @@ class Workspace(unittest.TestCase):
         os.makedirs(self.voices)
         self.path = lambda name: os.path.join(self.tmp.name, name)
         for p in (patch.dict(os.environ, {"TTS_VOICES_DIR": self.voices, "BREEZE_BASE_URL": "http://breeze:8005",
-                                          "LLM_BASE_URL": "http://llm:11434/v1", "LLM_MODEL": "m"}),
+                                          "LLM_BASE_URL": "http://llm:11434/v1", "LLM_MODEL": "m",
+                                          "RESEMBLE_BASE_URL": ""}),  # the app container has the real one
                   patch.object(voice_measure, "VOICE_FEATURES_FILE", self.path("features.json")),
                   patch.object(voice_transcripts, "VOICE_TRANSCRIPTS_FILE", self.path("transcripts.json")),
                   patch("audiobook_generator.core.cast.VOICE_GENDERS_FILE", self.path("genders.json")),
@@ -405,6 +407,20 @@ class TestDesignPendingVoices(Workspace):
                              {"status": "done", "description": "A emera.", "file": "Emera (designed).wav"})
             self.assertEqual(characters["anna"]["voice"], "Ada.wav")
 
+    def test_the_new_voices_are_cleaned_together_at_the_end(self):
+        cleaned = []
+        with self.assertLogs("audiobook_generator.core.voice_design", "WARNING"):
+            voice_design.design_pending_voices(self.snapshot, self.saved_path, self._designer(fail=("Emera",)),
+                                               cleaner=lambda files: cleaned.append(list(files)))
+        self.assertEqual(cleaned, [["Bea (designed).wav"]])
+
+    def test_nothing_designed_means_nothing_to_clean(self):
+        cleaned = []
+        with self.assertLogs("audiobook_generator.core.voice_design", "WARNING"):
+            voice_design.design_pending_voices(self.snapshot, self.saved_path, self._designer(fail=("Emera", "Bea")),
+                                               cleaner=cleaned.append)
+        self.assertEqual(cleaned, [])
+
     def test_a_failed_design_keeps_the_suggested_voice_and_the_book_goes_on(self):
         with self.assertLogs("audiobook_generator.core.voice_design", "WARNING"):
             count = voice_design.design_pending_voices(self.snapshot, self.saved_path, self._designer(fail=("Emera",)))
@@ -482,6 +498,110 @@ class TestDesignPendingVoices(Workspace):
             voice_design.design_pending_voices(self.snapshot, designer=self._designer())
         self.assertEqual(cast_store.load_cast(self.path("casts/k.json"))["characters"]["emera"]["voice"],
                          "Emera (designed).wav")
+
+
+class FakeResemble:
+    """Stands in for requests.post to the Resemble service: /enhance answers the clip 6 dB quieter and
+    100 ms longer, so the file's signature changes (or whatever `answer(call_number, clip_bytes)`
+    returns); /api/unload is counted."""
+
+    def __init__(self, answer=None):
+        self.enhanced, self.unloads, self.answer = [], 0, answer
+
+    def __call__(self, url, data=None, json=None, headers=None, timeout=None):
+        ok = SimpleNamespace(content=b"", raise_for_status=lambda: None)
+        if url == "http://resemble:8006/api/unload":
+            self.unloads += 1
+            return ok
+        assert url == "http://resemble:8006/enhance", url
+        self.enhanced.append(data)
+        if self.answer:
+            return self.answer(len(self.enhanced), data)
+        buffer = io.BytesIO()
+        clip = AudioSegment.from_file(io.BytesIO(data))
+        (clip - 6 + AudioSegment.silent(100, frame_rate=clip.frame_rate)).export(buffer, format="wav")
+        return SimpleNamespace(content=buffer.getvalue(), raise_for_status=lambda: None)
+
+
+def _failed(*_):
+    def boom():
+        raise voice_clean.requests.HTTPError("500 Server Error")
+    return SimpleNamespace(content=b"", raise_for_status=boom)
+
+
+class TestCleanVoices(Workspace):
+
+    def setUp(self):
+        super().setUp()
+        self.resemble = FakeResemble()
+        for p in (patch.dict(os.environ, {"RESEMBLE_BASE_URL": "http://resemble:8006"}),
+                  patch.object(voice_clean.requests, "post", side_effect=lambda *a, **k: self.resemble(*a, **k)),
+                  patch.object(breeze_client, "loaded", return_value=True)):
+            p.start()
+            self.addCleanup(p.stop)
+        unload = patch.object(breeze_client, "unload", return_value=True)
+        self.breeze_unload = unload.start()
+        self.addCleanup(unload.stop)
+
+    def _bytes(self, name):
+        with open(os.path.join(self.voices, name), "rb") as f:
+            return f.read()
+
+    def test_unconfigured_cleans_nothing(self):
+        self.add_voice("Mara.wav")
+        with patch.dict(os.environ, {"RESEMBLE_BASE_URL": ""}):
+            self.assertEqual(voice_clean.clean_voices(["Mara.wav"]), [])
+        self.assertEqual((self.resemble.enhanced, self.resemble.unloads), ([], 0))
+        self.breeze_unload.assert_not_called()
+
+    def test_a_clip_is_replaced_and_keeps_its_words_and_measurement(self):
+        self.add_voice("Mara.wav", f0=300.0)
+        voice_transcripts.remember("Mara.wav", "Hello there.", self.voices)
+        before = self._bytes("Mara.wav")
+        self.assertEqual(voice_clean.clean_voices(["Mara.wav"]), ["Mara.wav"])
+        self.assertNotEqual(self._bytes("Mara.wav"), before)
+        self.breeze_unload.assert_called_once()  # Breeze was loaded: it gives the GPU up first
+        self.assertEqual(self.resemble.unloads, 1)
+        # Re-stamped, not stale: no Whisper is available here, so a stale transcript would be None.
+        self.assertEqual(voice_transcripts.transcript("Mara.wav", self.voices), "Hello there.")
+        path = os.path.join(self.voices, "Mara.wav")
+        self.assertEqual(voice_measure.voices_to_measure({"Mara.wav": path}, voice_measure.load_features()), [])
+        self.assertEqual(voice_measure.load_features()["Mara.wav"]["f0_median"], 300.0)
+
+    def test_a_clip_that_comes_back_a_different_length_is_kept(self):
+        self.add_voice("Mara.wav")
+        before = self._bytes("Mara.wav")
+        buffer = io.BytesIO()
+        _tone(3000).export(buffer, format="wav")
+        self.resemble.answer = lambda *_: SimpleNamespace(content=buffer.getvalue(), raise_for_status=lambda: None)
+        with self.assertLogs("audiobook_generator.core.voice_clean", "WARNING"):
+            self.assertEqual(voice_clean.clean_voices(["Mara.wav"]), [])
+        self.assertEqual(self._bytes("Mara.wav"), before)
+        self.assertEqual(self.resemble.unloads, 1)
+
+    def test_one_failure_does_not_stop_the_others(self):
+        self.add_voice("Mara.wav")
+        self.add_voice("Tom.wav")
+        fine = FakeResemble()
+        self.resemble.answer = lambda number, data: _failed() if number == 1 else fine(
+            "http://resemble:8006/enhance", data)
+        before = self._bytes("Mara.wav")
+        with self.assertLogs("audiobook_generator.core.voice_clean", "WARNING"):
+            self.assertEqual(voice_clean.clean_voices(["Mara.wav", "Tom.wav"]), ["Tom.wav"])
+        self.assertEqual(self._bytes("Mara.wav"), before)
+
+    def test_nothing_is_cleaned_while_breeze_keeps_the_gpu(self):
+        self.add_voice("Mara.wav")
+        self.breeze_unload.return_value = False
+        with self.assertLogs("audiobook_generator.core.voice_clean", "WARNING"):
+            self.assertEqual(voice_clean.clean_voices(["Mara.wav"]), [])
+        self.assertEqual(self.resemble.enhanced, [])
+
+    def test_an_unloaded_breeze_is_left_alone(self):
+        self.add_voice("Mara.wav")
+        with patch.object(breeze_client, "loaded", return_value=False):
+            self.assertEqual(voice_clean.clean_voices(["Mara.wav"]), ["Mara.wav"])
+        self.breeze_unload.assert_not_called()
 
 
 class TestBookStartHook(unittest.TestCase):
@@ -756,6 +876,31 @@ class TestDesignHandlers(Workspace):
         made.clear()
         list(chatterbox_ui.design_starter_voices(lambda: [], designer))
         self.assertEqual(made, [starters[1][0]])
+
+    def test_starter_voices_are_cleaned_together_at_the_end(self):
+        batches = []
+
+        def cleaner(files):
+            batches.append(list(files))
+            return files[:-1]
+
+        with patch.dict(os.environ, {"RESEMBLE_BASE_URL": "http://resemble:8006"}):
+            progress = list(chatterbox_ui.design_starter_voices(lambda: [], self.fake_ok, cleaner))
+        made = [voice_design.file_name_for(n) for n, *_ in voice_design.STARTER_VOICES]
+        self.assertEqual(batches, [made])
+        self.assertEqual(progress[-2], f"Cleaning the {len(made)} new voices...")
+        self.assertIn(f"Cleaned {len(made) - 1} with Resemble Enhance.", progress[-1])
+
+    def test_a_designed_voice_is_cleaned_before_its_sample_plays(self):
+        with patch.object(chatterbox_ui.voice_clean, "clean_voices") as clean:
+            self._design()
+        clean.assert_called_once_with(["Emera (designed).wav"])
+
+    def test_a_custom_voice_is_cleaned_before_its_sample_plays(self):
+        handler = self._handler("design_custom")
+        with patch.object(chatterbox_ui.voice_clean, "clean_voices") as clean, patch.object(engine_gpu, "prepare_breeze"):
+            handler("Mara", "A mechanic, warm and low.", "breeze")
+        clean.assert_called_once_with(["Mara (designed).wav"])
 
     def test_starter_voices_all_there_already(self):
         for name, *_ in voice_design.STARTER_VOICES:

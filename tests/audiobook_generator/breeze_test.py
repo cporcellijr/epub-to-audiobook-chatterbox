@@ -423,6 +423,7 @@ class TestBreezeInTheUi(unittest.TestCase):
                     patch.object(chatterbox_ui, "design_character_voice", side_effect=speech), \
                     patch.object(chatterbox_ui.voice_design, "design_voice", side_effect=speech), \
                     patch.object(chatterbox_ui.voice_design, "STARTER_VOICES", [("Ada", "female", "adult", "A woman.")]), \
+                    patch.object(chatterbox_ui.voice_clean, "clean_voices", side_effect=lambda files: [speech()]), \
                     patch.object(chatterbox_ui, "measure_voices", side_effect=lambda measure: measure("Ada.wav")), \
                     patch.object(chatterbox_ui, "add_voice", side_effect=lambda *a, measurer: measurer("Ada.wav")):
                 self.assertEqual(handlers["make_sample"]("breeze", "Ada.wav", 1), "speech")
@@ -431,7 +432,7 @@ class TestBreezeInTheUi(unittest.TestCase):
                 self.assertEqual(handlers["add_one"]("sample", "Ada", False, False, "breeze"), "speech")
                 self.assertEqual(handlers["design_for_character"]("k", "ada", "A woman.", "breeze"), "speech")
                 self.assertIn("Designed 1 starter voice", list(handlers["design_starters"]())[-1])
-                self.assertEqual(prepare.call_count, 6)
+                self.assertEqual(prepare.call_count, 6)  # cleaning reserved the GPU without loading Breeze
                 self.assertEqual(queue._breeze_requests, 0)
                 queue.add("Cast", {}, 1, 1, "Ada.wav", kind=job_queue.CAST)
                 queue.tick()
