@@ -972,6 +972,8 @@ DELIVERY_CHOICES = [("from the profile", "auto"), ("a little more even", "even")
 # narrator voice the book is queued with. Never stored as a voice; saving it clears the character's own.
 NARRATOR_VOICE = "__narrator__"
 NARRATOR_VOICE_CHOICE = ("(the narrator's voice)", NARRATOR_VOICE)
+# The cast table's key for its narrator row (cast_rows): not a character, so nothing to edit there.
+NARRATOR_ROW = "__narrator_row__"
 VOICE_GENDER_CHOICES = [("not set", ""), ("female", "female"), ("male", "male"), ("neutral (fits anyone)", "neutral")]
 
 
@@ -1076,17 +1078,37 @@ def engine_voice_choices(engine: str) -> list:
     return kokoro_voices_and_default()[0] if engine == "kokoro" else openai_voice_choices()
 
 
-def cast_rows(cast: dict, engine: str) -> Tuple[list, list]:
+def _narrator_row(cast: dict, voice_label: str) -> list:
+    """The cast table's row for a narrator who isn't one of the characters: who reads everything
+    outside the quotes, in which voice, and what the book's tone asks of that voice."""
+    tone = cast.get("book_tone") or {}
+    wants = tone.get("narrator") or {}
+    pov = tone.get("point_of_view")
+    voice_words = ", ".join(w for w in (f"{wants['pitch']} pitch" if wants.get("pitch") else "",
+                                        wants.get("quality") or "", wants.get("delivery") or "") if w)
+    book_words = ", ".join(w for w in (tone.get("tone") or "", f"{tone['pace']} pace" if tone.get("pace") else "") if w)
+    return ["Narrator", f"tells the story ({pov} person)" if pov else "tells the story", None,
+            wants.get("gender") if wants.get("gender") in ("female", "male") else "", "", voice_label,
+            " · ".join(w for w in (voice_words, book_words) if w), ""]
+
+
+def cast_rows(cast: dict, engine: str, narrator_voice: Optional[str] = None) -> Tuple[list, list]:
     """(table rows, character keys in row order), most lines first. Role and "Sounds like" come
-    from the character's profile and are blank for characters without one."""
+    from the character's profile and are blank for characters without one. Unless a first-person
+    narrator reads the narration as a character, the narrator comes first (key NARRATOR_ROW).
+    narrator_voice is the Make tab's Voice, which reads the narration; unknown, the row says so."""
     rows, keys = [], []
     labels = dict((value, label) for label, value in engine_voice_choices(engine))
     narrating = cast_store.narrating_character(cast)
+    narrator = labels.get(narrator_voice, narrator_voice) if narrator_voice else ""
+    if not narrating:
+        rows.append(_narrator_row(cast, narrator or "(the Voice setting)"))
+        keys.append(NARRATOR_ROW)
     for key, character in cast_store.ranked_characters(cast):
         voice = character.get("voice") or ""
         profile = character.get("profile") or {}
         role = profile.get("role", "")
-        shown = ("(narrator's voice)" if key == narrating
+        shown = ((f"(narrator's voice: {narrator})" if narrator else "(narrator's voice)") if key == narrating
                  else labels.get(voice, voice) if voice else "(dialogue voice)")
         if voice and key != narrating and (character.get("voice_design") or {}).get("status") == voice_design.PENDING:
             shown += " (a new voice is designed when the book starts)"
@@ -1247,7 +1269,7 @@ def resuggest_cast_voices(cast_key: Optional[str], engine: str, narrator_voice: 
     cast = _fill_missing_voices(cast, path, engine, suggestion["voice"] if suggestion else narrator_voice)
     cast_store.save_cast(path, cast)
     kept = sum(1 for c in cast["characters"].values() if c.get("voice_picked"))
-    rows, keys = cast_rows(cast, engine)
+    rows, keys = cast_rows(cast, engine, suggestion["voice"] if suggestion else narrator_voice)
     message = f"Suggested voices again for {cleared} character{'' if cleared == 1 else 's'}"
     message += f"; kept the {kept} you picked." if kept else "."
     if suggestion:
@@ -1390,7 +1412,7 @@ def cast_overview(cast_key: Optional[str], engine: str, narrator_voice: Optional
                 stamp)
     suggestion = _fill_narrator_suggestion(cast, path, engine, narrator_voice) if auto_pick else None
     cast = _fill_missing_voices(cast, path, engine, suggestion["voice"] if suggestion else narrator_voice)
-    rows, keys = cast_rows(cast, engine)
+    rows, keys = cast_rows(cast, engine, narrator_voice)
     stamp[1] = os.path.getmtime(path)  # the fills may just have saved
     return gr.update(value=rows, visible=True), keys, _cast_summary(cast, auto_pick), stamp
 
@@ -1406,7 +1428,11 @@ def cast_panel_update(cast_key: Optional[str], engine: str, narrator_voice: Opti
     if not (auto_pick and first_sight and stamp and stamp[2] == cast_store.STATUS_DONE):
         return (table, keys, status, stamp, *_narrator_updates(None))
     cast = cast_store.load_cast(stamp[0]) or {}
-    return (table, keys, status, stamp, *_narrator_updates(cast.get("narrator_suggestion")))
+    suggestion = cast.get("narrator_suggestion")
+    if suggestion and "characters" in cast:  # the narrator row shows the Voice it is being set to
+        rows, keys = cast_rows(cast, engine, suggestion["voice"])
+        table, stamp[4] = gr.update(value=rows, visible=True), suggestion["voice"]
+    return (table, keys, status, stamp, *_narrator_updates(suggestion))
 
 
 def select_cast_row(cast_key: Optional[str], keys: list, engine: str, evt: gr.SelectData) -> tuple:
@@ -1416,6 +1442,10 @@ def select_cast_row(cast_key: Optional[str], keys: list, engine: str, evt: gr.Se
     if not cast_key or not (0 <= row < len(keys)):
         return None, "", gr.update(), gr.update(), "", gr.update()
     cast = cast_store.load_cast(cast_file_for(cast_key)) or {"characters": {}}
+    if keys[row] == NARRATOR_ROW:
+        return (None, "**Narrator**: reads everything outside the quotes, in the **Voice** chosen above "
+                      "(Auto-pick sets it from the book's tone).", gr.update(), gr.update(),
+                book_tone_text(cast) if cast.get("book_tone") else "", gr.update())
     character = cast["characters"].get(keys[row])
     if not character:
         return None, "", gr.update(), gr.update(), "", gr.update()

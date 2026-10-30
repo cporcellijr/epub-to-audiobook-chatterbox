@@ -108,3 +108,4 @@ deployed together by `docker-compose.chatterbox.yml` as two containers.
 | 81 | 2026-10-19 | A trained 7B second pass with the finished cast fixed | [cast](worklog/cast.md) |
 | 82 | 2026-10-20 | Second-pass review fixes: tellers kept, speeches kept whole, rejected answers out of view | [cast](worklog/cast.md) |
 | 83 | 2026-10-30 | Voice clips cleaned with Resemble Enhance; designed voices cleaned after each design run | [breeze](worklog/breeze.md) |
+| 84 | 2026-10-30 | The cast table names the narrator | [cast](worklog/cast.md) |

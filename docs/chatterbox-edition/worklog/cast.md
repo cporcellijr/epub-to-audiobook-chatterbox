@@ -3316,3 +3316,33 @@ live `qwen2.5-cast6:7b`, one run each (`hybrid_2026-10-19/fix_check.py`, `prod_c
   answer; turn-taking and the gender check carrying to continuations; an `analyse_book` invariant that every
   chapter narrator exists and every continuation has its opener's speaker), each seen failing without its fix.
   Full suite in the app image: 1,061 pass (1 skipped).
+
+## 84. The cast table names the narrator (2026-10-30)
+
+The owner could see every character after **Analyse cast**, but not who narrates a third-person book.
+A narrator who isn't a character had no row. The summary named the narrator only when Auto-pick had
+suggested one from the book's tone, and it showed that suggestion, not the voice the book would use.
+The owner chose a table row over a summary line.
+
+- **The row:** unless a first-person narrator reads the narration as a character, the table's first
+  row is **Narrator**. It shows:
+  - the role: "tells the story", with the point of view;
+  - the gender the tone asks for;
+  - the voice that reads the narration;
+  - in "Sounds like", the tone's pitch, quality and delivery, plus the book's tone and pace.
+- **The voice shown is the real one:** it is the Make tab's Voice. On the first showing with Auto-pick,
+  it is the suggestion that Voice is being set to. The seen-stamp records that voice, so the next
+  refresh doesn't redraw the table. After an edit, the next 3-second refresh fills the voice in.
+- **First-person books:** the storyteller's row names the voice too ("(narrator's voice: Gabriel)").
+  When the owner gives the storyteller a voice of their own, the narration still needs a reader, so
+  the Narrator row appears ("tells the story (first person)").
+- **Clicking the row:** nothing is selected for editing. The editor says the narrator reads in the
+  **Voice** chosen above, and the profile shows the book's tone line. The row's key, `NARRATOR_ROW`,
+  is never a character key.
+- **Tests:** 1 new test, plus 8 updated for the extra row (indexes shifted, keys start with
+  `NARRATOR_ROW`). The suite passes, 1073 tests with 1 skipped.
+- **Live:** *The Great Fairy Rescue* (third person) leads with Narrator, Elena, "medium pitch, clear,
+  expressive · gritty, fantastical, brisk pace". Its tone asked for no gender, so that cell is blank.
+- **Seen, not changed:** the narrator suggestion only avoids voices the owner picked by hand. A
+  designed character voice (`Jamie McElroy (designed).wav`) was suggested as the narrator of a
+  third-person cast.

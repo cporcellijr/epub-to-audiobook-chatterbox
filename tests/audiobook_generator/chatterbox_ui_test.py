@@ -1458,7 +1458,7 @@ class TestCastPanel(unittest.TestCase):
         self.assertEqual(unchanged, (chatterbox_ui.gr.update(),) * 5)
         _, keys, message, selected, _ = chatterbox_ui.merge_cast_character("k", "hale", "lena", "chatterbox")
         saved = self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))
-        self.assertEqual((list(saved["characters"]), keys), (["lena"], ["lena"]))
+        self.assertEqual((list(saved["characters"]), keys), (["lena"], [chatterbox_ui.NARRATOR_ROW, "lena"]))
         self.assertEqual(saved["chapters"]["h"]["lines"], {"1": "lena", "2": "lena", "3": None})
         kept = saved["characters"]["lena"]
         self.assertEqual((kept["lines"], kept["aliases"], kept["voice"]), (2, ["Dr. Hale"], "Ada.wav"))
@@ -1488,13 +1488,14 @@ class TestCastPanel(unittest.TestCase):
         })
         table, keys, status, seen = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
         self.assertTrue(table["visible"])
-        self.assertEqual(keys, ["anne", "bob"])
+        self.assertEqual(keys, [chatterbox_ui.NARRATOR_ROW, "anne", "bob"])
         rows = table["value"]
-        self.assertEqual([r[0] for r in rows], ["Anne", "Bob"])
-        self.assertEqual(rows[0][5], "Ada")     # first female voice; Elena (the narrator) is never suggested
-        self.assertEqual(rows[1][5], "Cal")
-        self.assertEqual(rows[0][7], "Annie")
-        self.assertEqual((rows[0][1], rows[0][6]), ("", ""))  # no profile: blank role and "sounds like"
+        self.assertEqual([r[0] for r in rows], ["Narrator", "Anne", "Bob"])
+        self.assertEqual(rows[0][1:7], ["tells the story", None, "", "", "Elena", ""])  # no book tone yet
+        self.assertEqual(rows[1][5], "Ada")     # first female voice; Elena (the narrator) is never suggested
+        self.assertEqual(rows[2][5], "Cal")
+        self.assertEqual(rows[1][7], "Annie")
+        self.assertEqual((rows[1][1], rows[1][6]), ("", ""))  # no profile: blank role and "sounds like"
         saved = self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))
         self.assertEqual((saved["characters"]["anne"]["voice"], saved["characters"]["bob"]["voice"]), ("Ada.wav", "Cal.wav"))
         self.assertIn("9 of 10 lines attributed", status)
@@ -1535,8 +1536,8 @@ class TestCastPanel(unittest.TestCase):
         self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
         table, _, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
         rows = table["value"]
-        self.assertEqual((rows[0][1], rows[0][6]), ("protagonist", "calm, low, wry"))
-        self.assertEqual((rows[1][1], rows[1][6]), ("", ""))
+        self.assertEqual((rows[1][1], rows[1][6]), ("protagonist", "calm, low, wry"))
+        self.assertEqual((rows[2][1], rows[2][6]), ("", ""))
         self.assertIn("2 character profiles", status)
         cast["profile_error"] = "LLM down"
         self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
@@ -1598,7 +1599,7 @@ class TestCastPanel(unittest.TestCase):
                      "profile": {"voice_targets": {"pitch": "high"}}},
         })
         table, _, _, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
-        self.assertEqual(table["value"][0][5], "Bea")  # without a profile it would be Ada, the first in the list
+        self.assertEqual(table["value"][1][5], "Bea")  # without a profile it would be Ada, the first in the list
 
     def test_suggest_again_rematches_all_but_the_voices_the_owner_saved(self):
         self._save("k", self.cast_store.STATUS_DONE, {
@@ -1649,7 +1650,7 @@ class TestCastPanel(unittest.TestCase):
                 "k", "chatterbox", "Elena.wav", None, True)
         self.assertEqual((voice["value"], exaggeration["value"], cfg["value"], temperature["value"]),
                          ("Bea.wav", 0.83, 0.55, 0.61))
-        self.assertEqual(table["value"][0][5], "Ada")  # Anne wants low; Bea is the narrator's now
+        self.assertEqual(table["value"][1][5], "Ada")  # Anne wants low; Bea is the narrator's now
         self.assertIn("**Narrator:** Bea, exaggeration 0.83 · CFG 0.55 · temperature 0.61", status)
         self.assertIn("**Book:** third person · wry and warm · brisk pace · dramatic narration", status)
         # The next refresh (the owner may have changed the Voice since) leaves the narrator alone.
@@ -1707,7 +1708,8 @@ class TestCastPanel(unittest.TestCase):
     def test_a_cast_with_issues_still_gets_its_voice_suggestions_and_queues(self):
         self._issued_cast()
         table, keys, status, _, voice, *rest = chatterbox_ui.cast_panel_update("k", "chatterbox", "Elena.wav", None, True)
-        self.assertEqual((keys, voice["value"]), (["anne"], "Bea.wav"))
+        self.assertEqual((keys, voice["value"]), ([chatterbox_ui.NARRATOR_ROW, "anne"], "Bea.wav"))
+        self.assertEqual(table["value"][0][5], "Bea")  # the narrator row shows the Voice it is being set to
         self.assertIn("**Cast ready**", status)
         self.assertIn("1 line left to the dialogue voice because the text contradicts the speaker "
                       "(chapter 1 line 19)", status)
@@ -1768,6 +1770,25 @@ class TestCastPanel(unittest.TestCase):
         self.assertIn("a little more even than the book (exaggeration -0.12) (your setting)",
                       chatterbox_ui.character_profile_text(saved))
 
+    def test_a_third_person_book_shows_its_narrator_first(self):
+        cast = self._save("k", self.cast_store.STATUS_DONE, {
+            "bob": {"name": "Bob", "aliases": [], "gender": "male", "age": "adult", "lines": 3, "voice": "Cal.wav"}})
+        cast["book_tone"] = {"point_of_view": "third", "pov_character": "", "tone": "mysterious tense",
+                             "pace": "measured", "narrator": {"gender": "female", "pitch": "medium",
+                                                              "quality": "clear", "delivery": "even"}}
+        self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
+        table, keys, _, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
+        self.assertEqual(keys, [chatterbox_ui.NARRATOR_ROW, "bob"])
+        self.assertEqual(table["value"][0], ["Narrator", "tells the story (third person)", None, "female", "", "Elena",
+                                             "medium pitch, clear, even · mysterious tense, measured pace", ""])
+        # Clicking it explains where its voice is set; nothing is selected for editing.
+        selected, editing, _, voice, profile, _ = chatterbox_ui.select_cast_row("k", keys, "chatterbox",
+                                                                              MagicMock(index=[0, 0]))
+        self.assertIsNone(selected)
+        self.assertIn("**Voice** chosen above", editing)
+        self.assertEqual(voice, gr.update())
+        self.assertIn("third person", profile)
+
     def test_a_first_person_narrator_shares_the_narrators_voice_unless_given_their_own(self):
         cast = self._save("k", self.cast_store.STATUS_DONE, {
             "me": {"name": "Nora", "aliases": [], "gender": "female", "age": "adult", "lines": 9, "voice": "Ada.wav",
@@ -1777,7 +1798,8 @@ class TestCastPanel(unittest.TestCase):
         cast["book_tone"] = {"point_of_view": "first", "pov_character": "Nora", "pov_key": "me", "tone": "wry"}
         self.cast_store.save_cast(chatterbox_ui.cast_file_for("k"), cast)
         table, keys, status, _ = chatterbox_ui.cast_overview("k", "chatterbox", "Elena.wav", None)
-        self.assertEqual(table["value"][keys.index("me")][5], "(narrator's voice)")
+        self.assertEqual(table["value"][keys.index("me")][5], "(narrator's voice: Elena)")
+        self.assertNotIn(chatterbox_ui.NARRATOR_ROW, keys)  # Nora is the narrator: no row of its own
         self.assertIsNone(self.cast_store.load_cast(chatterbox_ui.cast_file_for("k"))["characters"]["me"]["voice"])
         self.assertIn("Nora tells the story, so their lines are read in the narrator's voice.", status)
         _, _, _, voice, profile, _ = chatterbox_ui.select_cast_row("k", keys, "chatterbox", MagicMock(index=[0, 0]))
@@ -1789,9 +1811,11 @@ class TestCastPanel(unittest.TestCase):
                                            0.73, 0.5, 0.61, "Elena.wav")
         self.assertEqual(preview.call_args.args[:3], ("Elena.wav", '"Hi."', 0.73))
         # Advanced: a voice of her own, then back to the narrator's.
-        table, _, _ = chatterbox_ui.apply_cast_edit("k", "me", "female", "Bea.wav", "chatterbox")
+        table, keys, _ = chatterbox_ui.apply_cast_edit("k", "me", "female", "Bea.wav", "chatterbox")
         self.assertEqual(table["value"][keys.index("me")][5], "Bea")
-        table, _, message = chatterbox_ui.apply_cast_edit("k", "me", "female", chatterbox_ui.NARRATOR_VOICE, "chatterbox")
+        self.assertEqual(keys[0], chatterbox_ui.NARRATOR_ROW)  # her narration still needs a reader: the narrator row
+        self.assertEqual(table["value"][0][1], "tells the story (first person)")
+        table, keys, message = chatterbox_ui.apply_cast_edit("k", "me", "female", chatterbox_ui.NARRATOR_VOICE, "chatterbox")
         self.assertEqual(table["value"][keys.index("me")][5], "(narrator's voice)")
         self.assertIn("narrator's voice", message)
         with self.assertRaises(gr.Error):  # only the narrating character can follow the narrator
@@ -1824,7 +1848,7 @@ class TestCastPanel(unittest.TestCase):
         self._save("k", self.cast_store.STATUS_DONE, {
             "anne": {"name": "Anne", "aliases": [], "gender": "unknown", "age": "adult", "lines": 9, "voice": "Ada.wav"}})
         table, keys, message = chatterbox_ui.apply_cast_edit("k", "anne", "female", "Bea.wav", "chatterbox")
-        self.assertEqual(table["value"][0][3:6], ["female", "adult", "Bea"])
+        self.assertEqual(table["value"][keys.index("anne")][3:6], ["female", "adult", "Bea"])
         self.assertIn("Bea.wav", message)
         with self.assertRaises(gr.Error):
             chatterbox_ui.apply_cast_edit("k", "anne", "female", "af_heart", "chatterbox")
